@@ -1,0 +1,57 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# PostgreSQL extension
+*.so
+*.dylib
+*.dll
+
+# pgrx generated files
+/sql/
+*.control
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Pre-commit
+.pre-commit-config.yaml.bak
+
+# Python (for pre-commit)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.local
+
+# Build artifacts
+/build/
+/dist/
+
+# Test artifacts
+/test_output/

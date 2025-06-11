@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pg: [13, 14, 15, 16, 17]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install cargo-pgrx
+      run: cargo install cargo-pgrx --version "=0.14.3"
+
+    - name: Initialize pgrx
+      run: cargo pgrx init --pg${{ matrix.pg }} download
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all --features pg${{ matrix.pg }} -- -D warnings
+
+    - name: Run tests
+      run: cargo pgrx test --features pg${{ matrix.pg }}
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+    - uses: pre-commit/action@v3.0.0
