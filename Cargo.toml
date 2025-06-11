@@ -2,6 +2,14 @@
 name = "pg_substrait"
 version = "0.1.0"
 edition = "2021"
+license = "PostgreSQL"
+description = "PostgreSQL extension for executing Substrait query plans"
+repository = "https://github.com/PrimeDataConversion/substrait-postgres"
+homepage = "https://github.com/PrimeDataConversion/substrait-postgres"
+documentation = "https://github.com/PrimeDataConversion/substrait-postgres"
+readme = "README.md"
+keywords = ["postgresql", "substrait", "sql", "query", "database"]
+categories = ["database"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -12,11 +20,11 @@ path = "./src/bin/pgrx_embed.rs"
 
 [dependencies]
 pgrx = "=0.14.3"
-substrait = { version = "0.55", features = ["serde"] }
+substrait = { version = "0.57.0", features = ["serde"] }
 prost = "0.13"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+anyhow = "1.0.98"
 
 [dev-dependencies]
 pgrx-tests = "=0.14.3"
