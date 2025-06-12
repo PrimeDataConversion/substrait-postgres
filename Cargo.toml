@@ -39,4 +39,3 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [package.metadata.pgrx]
-module_pathname = "$libdir/pg_substrait"
