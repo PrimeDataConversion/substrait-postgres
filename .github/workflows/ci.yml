@@ -22,14 +22,15 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Install PostgreSQL dependencies
+    - name: Install build dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          postgresql-server-dev-all \
           libreadline-dev \
           pkg-config \
-          build-essential
+          build-essential \
+          libssl-dev \
+          zlib1g-dev
 
     - name: Install cargo-pgrx
       run: cargo install --locked cargo-pgrx --version "=0.14.3"
