@@ -51,7 +51,8 @@ jobs:
           pkg-config \
           build-essential \
           libssl-dev \
-          zlib1g-dev
+          zlib1g-dev \
+          protobuf-compiler
 
     - name: Install cargo-pgrx
       run: cargo install --locked cargo-pgrx --version "=0.14.3"
