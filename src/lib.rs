@@ -181,7 +181,7 @@ unsafe fn create_int4_const(
     (*const_node).consttypmod = -1;
     (*const_node).constcollid = pg_sys::InvalidOid;
     (*const_node).constlen = 4;
-    (*const_node).constvalue = pg_sys::Int32GetDatum(value);
+    (*const_node).constvalue = pg_sys::Datum::from(value);
     (*const_node).constisnull = false;
     (*const_node).constbyval = true;
 
@@ -197,7 +197,7 @@ unsafe fn create_int8_const(
     (*const_node).consttypmod = -1;
     (*const_node).constcollid = pg_sys::InvalidOid;
     (*const_node).constlen = 8;
-    (*const_node).constvalue = pg_sys::Int64GetDatum(value);
+    (*const_node).constvalue = pg_sys::Datum::from(value);
     (*const_node).constisnull = false;
     (*const_node).constbyval = true;
 
@@ -216,7 +216,7 @@ unsafe fn create_text_const(
     (*const_node).consttypmod = -1;
     (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
     (*const_node).constlen = -1;
-    (*const_node).constvalue = pg_sys::PointerGetDatum(text_datum as *mut std::ffi::c_void);
+    (*const_node).constvalue = pg_sys::Datum::from(text_datum as *mut std::ffi::c_void);
     (*const_node).constisnull = false;
     (*const_node).constbyval = false;
 
