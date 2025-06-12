@@ -11,8 +11,8 @@ fn from_substrait(plan_bytes: &[u8]) -> Result<String, Box<dyn std::error::Error
     // Parse the Substrait plan from protobuf binary format
     let plan = Plan::decode(plan_bytes).map_err(|e| format!("Failed to decode protobuf: {}", e))?;
 
-    // Execute the plan using PostgreSQL's engine
-    execute_substrait_plan(plan)
+    // Execute the plan using PostgreSQL's engine and return formatted results
+    execute_substrait_plan_as_table(plan)
 }
 
 #[pg_extern]
@@ -23,8 +23,30 @@ fn from_substrait_json(
     let plan: Plan =
         serde_json::from_str(json_plan).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-    // Execute the plan using PostgreSQL's engine
-    execute_substrait_plan(plan)
+    // Execute the plan using PostgreSQL's engine and return formatted results
+    execute_substrait_plan_as_table(plan)
+}
+
+fn execute_substrait_plan_as_table(
+    plan: Plan,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Validate the plan has exactly one relation
+    if plan.relations.len() != 1 {
+        return Err(format!(
+            "Expected exactly 1 relation, found {}",
+            plan.relations.len()
+        )
+        .into());
+    }
+
+    let relation = &plan.relations[0];
+
+    // Convert Substrait relation to PostgreSQL plan tree and execute
+    unsafe {
+        let plan_tree = convert_relation_to_plan_tree(relation)?;
+        let result = execute_plan_tree_as_table(plan_tree)?;
+        Ok(result)
+    }
 }
 
 fn execute_substrait_plan(plan: Plan) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -262,6 +284,84 @@ unsafe fn execute_plan_tree(
 
     // Execute the plan using PostgreSQL's executor
     execute_planned_stmt(planned_stmt)
+}
+
+unsafe fn execute_plan_tree_as_table(
+    plan: *mut pg_sys::Plan,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if plan.is_null() {
+        return Ok("Table: (null plan)".to_string());
+    }
+
+    match (*plan).type_ {
+        pg_sys::NodeTag::T_Result => {
+            let result_node = plan as *mut pg_sys::Result;
+            let target_list = (*result_node).plan.targetlist;
+
+            if target_list.is_null() {
+                return Ok("Table: (no columns)".to_string());
+            }
+
+            // Format as a table with proper column headers and values
+            format_as_table(target_list)
+        }
+        _ => Ok(format!(
+            "Table: Unsupported plan node type: {:?}",
+            (*plan).type_
+        )),
+    }
+}
+
+unsafe fn format_as_table(
+    target_list: *mut pg_sys::List,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if target_list.is_null() {
+        return Ok("Table: (empty target list)".to_string());
+    }
+
+    let mut column_names = Vec::new();
+    let mut column_values = Vec::new();
+    let list_length = (*target_list).length;
+
+    // Extract column information
+    for i in 0..list_length {
+        let target_entry = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
+        if !target_entry.is_null() {
+            // Get column name
+            let col_name = if !(*target_entry).resname.is_null() {
+                let c_str = std::ffi::CStr::from_ptr((*target_entry).resname);
+                c_str.to_string_lossy().to_string()
+            } else {
+                format!("column_{}", i + 1)
+            };
+            column_names.push(col_name);
+
+            // Get column value
+            let expr = (*target_entry).expr;
+            if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Const {
+                let const_node = expr as *mut pg_sys::Const;
+                let value = format_const_value(const_node)?;
+                column_values.push(value);
+            } else {
+                column_values.push("NULL".to_string());
+            }
+        }
+    }
+
+    // Format as a simple table representation
+    if column_names.is_empty() {
+        Ok("Table: (no columns)".to_string())
+    } else {
+        let header = column_names.join(" | ");
+        let separator = column_names
+            .iter()
+            .map(|name| "-".repeat(name.len()))
+            .collect::<Vec<_>>()
+            .join("-|-");
+        let row = column_values.join(" | ");
+
+        Ok(format!("Table:\n{}\n{}\n{}", header, separator, row))
+    }
 }
 
 unsafe fn create_planned_stmt(
