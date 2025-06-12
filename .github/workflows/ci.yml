@@ -63,10 +63,10 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      run: cargo clippy --all --features pg${{ matrix.pg }} -- -D warnings
+      run: cargo clippy --all --no-default-features --features pg${{ matrix.pg }} -- -D warnings
 
     - name: Run tests
-      run: cargo pgrx test --features pg${{ matrix.pg }}
+      run: cargo pgrx test --no-default-features --features pg${{ matrix.pg }}
 
   pre-commit:
     runs-on: ubuntu-latest
