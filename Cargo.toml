@@ -39,3 +39,6 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [package.metadata.pgrx]
+comment = "Substrait integration for PostgreSQL"
+relocatable = false
+superuser = false
