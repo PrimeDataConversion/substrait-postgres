@@ -28,18 +28,69 @@ cargo pgrx init --pg16 download
 cargo pgrx install --release
 ```
 
-### Usage
+### Quick Start
+
+#### Option 1: Using pgrx (Development)
+
+```bash
+# Install cargo-pgrx if not already installed
+cargo install cargo-pgrx --version "=0.14.3"
+
+# Initialize pgrx with your PostgreSQL version
+cargo pgrx init --pg15 download  # or --pg16, --pg17
+
+# Start PostgreSQL with the extension loaded
+cargo pgrx run
+
+# In another terminal, connect to the database
+psql -h localhost -p 28815 -d pg_substrait
+```
+
+#### Option 2: Using System PostgreSQL
+
+```bash
+# Build and install the extension
+cargo pgrx install --release
+
+# Connect to your PostgreSQL database
+psql -d your_database
+```
+
+#### Option 3: Using Docker
+
+```bash
+# Build the extension
+cargo pgrx package
+
+# Copy the generated files to your PostgreSQL Docker container
+# (See target/release/pg_substrait-pg15/ for the files)
+```
+
+### Usage Examples
 
 ```sql
 -- Create the extension
-CREATE EXTENSION substrait;
+CREATE EXTENSION IF NOT EXISTS pg_substrait;
 
--- Execute a Substrait plan from JSON
-SELECT from_substrait_json('{"version": "0.1", "plans": [...]}');
+-- Test with a simple JSON plan (this will fail as expected - needs exactly 1 relation)
+SELECT from_substrait_json('{"version": {"minorNumber": 54}, "relations": []}');
+-- Error: Expected exactly 1 relation, found 0
 
--- Execute a Substrait plan from protobuf (base64 encoded)
-SELECT from_substrait('...');
+-- Test with a valid JSON plan structure
+SELECT from_substrait_json('{"version": {"minorNumber": 54}, "relations": [{"root": {"input": {"project": {"expressions": []}}}}]}');
+-- Returns: Result: (empty result)
+
+-- Test with binary protobuf data
+SELECT from_substrait('\x00'::bytea);
+-- Error: Failed to decode protobuf: failed to decode Protobuf message: invalid tag value: 0
 ```
+
+### Available Functions
+
+- `from_substrait(plan bytea)` - Execute Substrait plans from protobuf binary format
+- `from_substrait_json(json_plan text)` - Execute Substrait plans from JSON format
+
+Both functions return `text` containing the execution result or error message.
 
 ## Development
 

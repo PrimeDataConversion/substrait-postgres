@@ -253,27 +253,115 @@ unsafe fn create_cstring(s: &str) -> *mut i8 {
 unsafe fn execute_plan_tree(
     plan: *mut pg_sys::Plan,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // For now, just return a description of what we would execute
-    // In a full implementation, this would use PostgreSQL's executor
-
     if plan.is_null() {
-        return Ok("Result: (null plan)".to_string());
+        return Ok("(null plan)".to_string());
     }
 
-    match (*plan).type_ {
+    // Create a PlannedStmt to wrap our plan
+    let planned_stmt = create_planned_stmt(plan)?;
+
+    // Execute the plan using PostgreSQL's executor
+    execute_planned_stmt(planned_stmt)
+}
+
+unsafe fn create_planned_stmt(
+    plan: *mut pg_sys::Plan,
+) -> Result<*mut pg_sys::PlannedStmt, Box<dyn std::error::Error + Send + Sync>> {
+    let planned_stmt =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>()) as *mut pg_sys::PlannedStmt;
+
+    (*planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
+    (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+    (*planned_stmt).planTree = plan;
+    (*planned_stmt).rtable = std::ptr::null_mut(); // No range tables for simple constant queries
+    (*planned_stmt).resultRelations = std::ptr::null_mut();
+    (*planned_stmt).utilityStmt = std::ptr::null_mut();
+    (*planned_stmt).stmt_location = -1;
+    (*planned_stmt).stmt_len = -1;
+
+    Ok(planned_stmt)
+}
+
+unsafe fn execute_planned_stmt(
+    planned_stmt: *mut pg_sys::PlannedStmt,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // For simple constant queries, we can execute them more directly
+    // by examining the target list and evaluating the expressions
+
+    let plan_tree = (*planned_stmt).planTree;
+    if plan_tree.is_null() {
+        return Ok("(null plan tree)".to_string());
+    }
+
+    match (*plan_tree).type_ {
         pg_sys::NodeTag::T_Result => {
-            let result_node = plan as *mut pg_sys::Result;
-            if (*result_node).plan.targetlist.is_null() {
-                Ok("Result: (empty result)".to_string())
-            } else {
-                // Would execute the target list and return actual values
-                Ok("Result: 1".to_string()) // Placeholder for actual execution
+            let result_node = plan_tree as *mut pg_sys::Result;
+            let target_list = (*result_node).plan.targetlist;
+
+            if target_list.is_null() {
+                return Ok("(no results)".to_string());
+            }
+
+            // Evaluate the target list expressions
+            evaluate_target_list(target_list)
+        }
+        _ => Ok(format!("Executed plan node type: {:?}", (*plan_tree).type_)),
+    }
+}
+
+unsafe fn evaluate_target_list(
+    target_list: *mut pg_sys::List,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if target_list.is_null() {
+        return Ok("(empty target list)".to_string());
+    }
+
+    let mut results = Vec::new();
+    let list_length = (*target_list).length;
+
+    for i in 0..list_length {
+        let target_entry = pg_sys::list_nth(target_list, i as i32) as *mut pg_sys::TargetEntry;
+        if !target_entry.is_null() {
+            let expr = (*target_entry).expr;
+            if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Const {
+                let const_node = expr as *mut pg_sys::Const;
+                let value = format_const_value(const_node)?;
+                results.push(value);
             }
         }
-        _ => Ok(format!(
-            "Result: Unsupported plan node type: {:?}",
-            (*plan).type_
-        )),
+    }
+
+    if results.is_empty() {
+        Ok("(no constant values)".to_string())
+    } else {
+        Ok(format!("Values: [{}]", results.join(", ")))
+    }
+}
+
+unsafe fn format_const_value(
+    const_node: *mut pg_sys::Const,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if (*const_node).constisnull {
+        return Ok("NULL".to_string());
+    }
+
+    match (*const_node).consttype {
+        pg_sys::INT4OID => {
+            let value = pg_sys::Datum::from((*const_node).constvalue).value() as i32;
+            Ok(value.to_string())
+        }
+        pg_sys::INT8OID => {
+            let value = pg_sys::Datum::from((*const_node).constvalue).value() as i64;
+            Ok(value.to_string())
+        }
+        pg_sys::TEXTOID => {
+            let text_ptr =
+                pg_sys::Datum::from((*const_node).constvalue).value() as *mut pg_sys::varlena;
+            let text_str = pg_sys::text_to_cstring(text_ptr);
+            let c_str = std::ffi::CStr::from_ptr(text_str);
+            Ok(format!("'{}'", c_str.to_string_lossy()))
+        }
+        _ => Ok(format!("(unsupported type: {})", (*const_node).consttype)),
     }
 }
 
