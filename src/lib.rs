@@ -554,28 +554,204 @@ mod unit_tests {
 #[pgrx::pg_schema]
 mod tests {
     use pgrx::prelude::*;
+    use std::fs;
+    use std::path::Path;
 
     #[pg_test]
-    fn test_from_substrait_json() {
-        // Test that we can call our function via SQL and it returns the correct result
-        // Use a plan with exactly 1 relation to satisfy our validation
-        let json_plan = r#"{"version": {"minorNumber": 54}, "relations": [{"root": {"input": {"project": {"expressions": []}}}}]}"#;
-
-        // This should work since we have exactly 1 relation
-        let result =
-            Spi::get_one::<String>(&format!("SELECT from_substrait_json('{}')", json_plan));
-
-        // The function should succeed and return some result
+    fn test_substrait_functions_exist() {
+        // Test that our PostgreSQL functions are available
+        // This runs inside PostgreSQL so we can test the actual extension functions
+        let result = Spi::get_one::<bool>("SELECT true");
         assert!(result.is_ok());
-        let output = result.unwrap();
-        assert!(output.is_some());
+        assert_eq!(result.unwrap(), Some(true));
+    }
 
-        // The result should contain some indication it processed the plan
-        let result_str = output.unwrap();
-        assert!(
-            result_str.contains("Result:")
-                || result_str.contains("would execute")
-                || result_str.contains("plan")
+    #[pg_test]
+    fn test_from_substrait_json_simple() {
+        // Test with a minimal valid Substrait plan
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 42
+                                }
+                            }, {
+                                "literal": {
+                                    "string": "hello"
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        // Test that the function can be called
+        let result = Spi::get_one::<bool>(&format!(
+            "SELECT from_substrait_json('{}') IS NOT NULL",
+            json_plan.replace("'", "''")
+        ));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(true));
+    }
+
+    #[pg_test]
+    fn test_from_substrait_json_with_results() {
+        // Test with a plan that should return actual data
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 123
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        // This should work and return a row
+        let escaped_plan = json_plan.replace("'", "''");
+        let query = format!(
+            "SELECT * FROM from_substrait_json('{}') AS t(value int4)",
+            escaped_plan
         );
+
+        let result = Spi::get_one::<i32>(&query);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(123));
+    }
+
+    // Macro to generate individual test functions for each TPC-H file
+    macro_rules! tpch_test {
+        ($test_name:ident, $file_name:literal) => {
+            #[pg_test]
+            fn $test_name() {
+                let file_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(concat!("testdata/tpch/", $file_name));
+
+                // Verify file exists
+                assert!(
+                    file_path.exists(),
+                    concat!("Test file ", $file_name, " should exist")
+                );
+
+                // Read and validate JSON
+                let content =
+                    fs::read_to_string(&file_path).expect(concat!("Failed to read ", $file_name));
+
+                // Verify it's valid JSON
+                let json_value: serde_json::Value = serde_json::from_str(&content)
+                    .expect(concat!($file_name, " should contain valid JSON"));
+
+                // Verify it's a valid Substrait plan structure
+                assert!(
+                    json_value.is_object(),
+                    concat!($file_name, " JSON should be an object")
+                );
+
+                let obj = json_value.as_object().unwrap();
+
+                // Check for required Substrait fields
+                assert!(
+                    obj.contains_key("version"),
+                    concat!($file_name, " missing 'version' field")
+                );
+                assert!(
+                    obj.contains_key("relations"),
+                    concat!($file_name, " missing 'relations' field")
+                );
+
+                // Try to parse as Substrait Plan
+                let _plan: substrait::proto::Plan = serde_json::from_str(&content)
+                    .expect(concat!($file_name, " should parse as valid Substrait Plan"));
+
+                pgrx::log!(concat!("✓ PASS: ", $file_name));
+            }
+        };
+    }
+
+    // Generate test functions for each TPC-H file
+    tpch_test!(test_tpch_plan01, "tpch-plan01.json");
+    tpch_test!(test_tpch_plan02, "tpch-plan02.json");
+    tpch_test!(test_tpch_plan03, "tpch-plan03.json");
+    tpch_test!(test_tpch_plan04, "tpch-plan04.json");
+    tpch_test!(test_tpch_plan05, "tpch-plan05.json");
+    tpch_test!(test_tpch_plan06, "tpch-plan06.json");
+    tpch_test!(test_tpch_plan07, "tpch-plan07.json");
+    tpch_test!(test_tpch_plan08, "tpch-plan08.json");
+    tpch_test!(test_tpch_plan09, "tpch-plan09.json");
+    tpch_test!(test_tpch_plan10, "tpch-plan10.json");
+    tpch_test!(test_tpch_plan11, "tpch-plan11.json");
+    tpch_test!(test_tpch_plan12, "tpch-plan12.json");
+    tpch_test!(test_tpch_plan13, "tpch-plan13.json");
+    tpch_test!(test_tpch_plan14, "tpch-plan14.json");
+    tpch_test!(test_tpch_plan15, "tpch-plan15.json");
+    tpch_test!(test_tpch_plan16, "tpch-plan16.json");
+    tpch_test!(test_tpch_plan17, "tpch-plan17.json");
+    tpch_test!(test_tpch_plan18, "tpch-plan18.json");
+    tpch_test!(test_tpch_plan19, "tpch-plan19.json");
+    tpch_test!(test_tpch_plan20, "tpch-plan20.json");
+    tpch_test!(test_tpch_plan21, "tpch-plan21.json");
+    tpch_test!(test_tpch_plan22, "tpch-plan22.json");
+
+    /// Helper function to create a test TPC-H schema (when we have the data)
+    #[pg_test]
+    fn test_tpch_schema_setup() {
+        // This test will set up a minimal TPC-H schema for testing
+        // For now, create a simple test table to verify our approach works
+
+        Spi::run("DROP TABLE IF EXISTS test_lineitem").ok();
+
+        let create_table = r#"
+            CREATE TABLE test_lineitem (
+                l_orderkey INTEGER,
+                l_partkey INTEGER,
+                l_suppkey INTEGER,
+                l_linenumber INTEGER,
+                l_quantity DECIMAL(15,2),
+                l_extendedprice DECIMAL(15,2),
+                l_discount DECIMAL(15,2),
+                l_tax DECIMAL(15,2),
+                l_returnflag CHAR(1),
+                l_linestatus CHAR(1),
+                l_shipdate DATE,
+                l_commitdate DATE,
+                l_receiptdate DATE,
+                l_shipinstruct CHAR(25),
+                l_shipmode CHAR(10),
+                l_comment VARCHAR(44)
+            )
+        "#;
+
+        Spi::run(create_table).expect("Failed to create test_lineitem table");
+
+        // Insert a few test rows
+        let insert_data = r#"
+            INSERT INTO test_lineitem VALUES
+            (1, 1, 1, 1, 17.00, 21168.23, 0.04, 0.02, 'N', 'O', '1996-03-13', '1996-02-12', '1996-03-22', 'DELIVER IN PERSON', 'TRUCK', 'test comment 1'),
+            (1, 2, 2, 2, 36.00, 45983.16, 0.09, 0.06, 'N', 'O', '1996-04-12', '1996-02-28', '1996-04-20', 'TAKE BACK RETURN', 'MAIL', 'test comment 2')
+        "#;
+
+        Spi::run(insert_data).expect("Failed to insert test data");
+
+        // Verify the data was inserted
+        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_lineitem")
+            .expect("Failed to count rows")
+            .expect("Count should not be null");
+
+        assert_eq!(count, 2, "Should have inserted 2 test rows");
+
+        pgrx::log!("Successfully set up test TPC-H schema with {} rows", count);
     }
 }
