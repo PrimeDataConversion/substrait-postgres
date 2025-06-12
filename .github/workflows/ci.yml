@@ -22,8 +22,40 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Cache pgrx PostgreSQL builds
+      uses: actions/cache@v4
+      with:
+        path: ~/.pgrx
+        key: ${{ runner.os }}-pgrx-pg${{ matrix.pg }}-${{ hashFiles('.github/workflows/ci.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-pgrx-pg${{ matrix.pg }}-
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libreadline-dev \
+          pkg-config \
+          build-essential \
+          libssl-dev \
+          zlib1g-dev \
+          protobuf-compiler
+
     - name: Install cargo-pgrx
-      run: cargo install cargo-pgrx --version "=0.14.3"
+      run: cargo install --locked cargo-pgrx --version "=0.14.3"
 
     - name: Initialize pgrx
       run: cargo pgrx init --pg${{ matrix.pg }} download
@@ -32,10 +64,10 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      run: cargo clippy --all --features pg${{ matrix.pg }} -- -D warnings
+      run: cargo clippy --all --no-default-features --features pg${{ matrix.pg }} -- -D warnings
 
     - name: Run tests
-      run: cargo pgrx test --features pg${{ matrix.pg }}
+      run: cargo pgrx test --no-default-features --features pg${{ matrix.pg }}
 
   pre-commit:
     runs-on: ubuntu-latest
