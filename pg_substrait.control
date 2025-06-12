@@ -1,0 +1,5 @@
+comment = 'Substrait integration for PostgreSQL'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_substrait'
+relocatable = false
+superuser = false
