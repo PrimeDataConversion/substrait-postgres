@@ -909,5 +909,11 @@
       "names": ["C_NAME", "C_CUSTKEY", "O_ORDERKEY", "O_ORDERDATE", "O_TOTALPRICE", "EXPR$5"]
     }
   }],
-  "expectedTypeUrls": []
+  "expectedTypeUrls": [],
+  "version": {
+    "majorNumber": 0,
+    "minorNumber": 38,
+    "patchNumber": 0,
+    "producer": "isthmus"
+  }
 }

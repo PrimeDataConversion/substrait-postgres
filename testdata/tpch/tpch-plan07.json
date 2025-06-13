@@ -1277,5 +1277,11 @@
       "names": ["SUPP_NATION", "CUST_NATION", "L_YEAR", "REVENUE"]
     }
   }],
-  "expectedTypeUrls": []
+  "expectedTypeUrls": [],
+  "version": {
+    "majorNumber": 0,
+    "minorNumber": 38,
+    "patchNumber": 0,
+    "producer": "isthmus"
+  }
 }
