@@ -1,11 +1,36 @@
-# select l.l_orderkey, sum(l.l_extendedprice smoke.sh tpch_smoke.sh (1 - l.l_discount)) as revenue, o.o_orderdate, o.o_shippriority from "customer" c, "orders" o, "lineitem" l where c.c_mktsegment = 'HOUSEHOLD' and c.c_custkey = o.o_custkey and l.l_orderkey = o.o_orderkey and o.o_orderdate < date '1995-03-25' and l.l_shipdate > date '1995-03-25' group by l.l_orderkey, o.o_orderdate, o.o_shippriority order by revenue desc, o.o_orderdate limit 10
+# Original SQL Query:
+# SELECT
+#     l_orderkey,
+#     sum(l_extendedprice * (1 - l_discount)) AS revenue,
+#     o_orderdate,
+#     o_shippriority
+# FROM
+#     customer,
+#     orders,
+#     lineitem
+# WHERE
+#     c_mktsegment = 'BUILDING'
+#     AND c_custkey = o_custkey
+#     AND l_orderkey = o_orderkey
+#     AND o_orderdate < CAST('1995-03-15' AS date)
+#     AND l_shipdate > CAST('1995-03-15' AS date)
+# GROUP BY
+#     l_orderkey,
+#     o_orderdate,
+#     o_shippriority
+# ORDER BY
+#     revenue DESC,
+#     o_orderdate
+# LIMIT 10;
+#
+
 {
   "extensionUris": [{
+    "extensionUriAnchor": 4,
+    "uri": "/functions_arithmetic.yaml"
+  }, {
     "extensionUriAnchor": 1,
     "uri": "/functions_boolean.yaml"
-  }, {
-    "extensionUriAnchor": 4,
-    "uri": "/functions_arithmetic_decimal.yaml"
   }, {
     "extensionUriAnchor": 3,
     "uri": "/functions_datetime.yaml"
@@ -16,44 +41,44 @@
   "extensions": [{
     "extensionFunction": {
       "extensionUriReference": 1,
-      "functionAnchor": 0,
+      "functionAnchor": 1,
       "name": "and:bool"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 2,
-      "functionAnchor": 1,
+      "functionAnchor": 2,
       "name": "equal:any_any"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 3,
-      "functionAnchor": 2,
+      "functionAnchor": 3,
       "name": "lt:date_date"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 3,
-      "functionAnchor": 3,
+      "functionAnchor": 4,
       "name": "gt:date_date"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 4,
-      "functionAnchor": 4,
-      "name": "multiply:dec_dec"
-    }
-  }, {
-    "extensionFunction": {
-      "extensionUriReference": 4,
       "functionAnchor": 5,
-      "name": "subtract:dec_dec"
+      "name": "multiply:fp64_fp64"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 4,
       "functionAnchor": 6,
-      "name": "sum:dec"
+      "name": "subtract:fp64_fp64"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 4,
+      "functionAnchor": 7,
+      "name": "sum:fp64"
     }
   }],
   "relations": [{
@@ -118,49 +143,42 @@
                                             "names": ["C_CUSTKEY", "C_NAME", "C_ADDRESS", "C_NATIONKEY", "C_PHONE", "C_ACCTBAL", "C_MKTSEGMENT", "C_COMMENT"],
                                             "struct": {
                                               "types": [{
-                                                "i64": {
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_REQUIRED"
-                                                }
-                                              }, {
-                                                "varchar": {
-                                                  "length": 25,
+                                                "i32": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               }, {
-                                                "varchar": {
-                                                  "length": 40,
+                                                "string": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               }, {
-                                                "i64": {
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_REQUIRED"
-                                                }
-                                              }, {
-                                                "fixedChar": {
-                                                  "length": 15,
+                                                "string": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               }, {
-                                                "decimal": {
-                                                  "scale": 0,
-                                                  "precision": 19,
+                                                "i32": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               }, {
-                                                "fixedChar": {
-                                                  "length": 10,
+                                                "string": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               }, {
-                                                "varchar": {
-                                                  "length": 117,
+                                                "fp64": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "string": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "string": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
@@ -184,42 +202,7 @@
                                             "names": ["O_ORDERKEY", "O_CUSTKEY", "O_ORDERSTATUS", "O_TOTALPRICE", "O_ORDERDATE", "O_ORDERPRIORITY", "O_CLERK", "O_SHIPPRIORITY", "O_COMMENT"],
                                             "struct": {
                                               "types": [{
-                                                "i64": {
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_REQUIRED"
-                                                }
-                                              }, {
-                                                "i64": {
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_REQUIRED"
-                                                }
-                                              }, {
-                                                "fixedChar": {
-                                                  "length": 1,
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_NULLABLE"
-                                                }
-                                              }, {
-                                                "decimal": {
-                                                  "scale": 0,
-                                                  "precision": 19,
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_NULLABLE"
-                                                }
-                                              }, {
-                                                "date": {
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_NULLABLE"
-                                                }
-                                              }, {
-                                                "fixedChar": {
-                                                  "length": 15,
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_NULLABLE"
-                                                }
-                                              }, {
-                                                "fixedChar": {
-                                                  "length": 15,
+                                                "i32": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
@@ -229,8 +212,37 @@
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               }, {
-                                                "varchar": {
-                                                  "length": 79,
+                                                "string": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "fp64": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "string": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "string": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "string": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "i32": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              }, {
+                                                "string": {
                                                   "typeVariationReference": 0,
                                                   "nullability": "NULLABILITY_NULLABLE"
                                                 }
@@ -256,19 +268,9 @@
                                         "names": ["L_ORDERKEY", "L_PARTKEY", "L_SUPPKEY", "L_LINENUMBER", "L_QUANTITY", "L_EXTENDEDPRICE", "L_DISCOUNT", "L_TAX", "L_RETURNFLAG", "L_LINESTATUS", "L_SHIPDATE", "L_COMMITDATE", "L_RECEIPTDATE", "L_SHIPINSTRUCT", "L_SHIPMODE", "L_COMMENT"],
                                         "struct": {
                                           "types": [{
-                                            "i64": {
+                                            "i32": {
                                               "typeVariationReference": 0,
-                                              "nullability": "NULLABILITY_REQUIRED"
-                                            }
-                                          }, {
-                                            "i64": {
-                                              "typeVariationReference": 0,
-                                              "nullability": "NULLABILITY_REQUIRED"
-                                            }
-                                          }, {
-                                            "i64": {
-                                              "typeVariationReference": 0,
-                                              "nullability": "NULLABILITY_REQUIRED"
+                                              "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
                                             "i32": {
@@ -276,75 +278,72 @@
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "decimal": {
-                                              "scale": 0,
-                                              "precision": 19,
+                                            "i32": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "decimal": {
-                                              "scale": 0,
-                                              "precision": 19,
+                                            "i32": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "decimal": {
-                                              "scale": 0,
-                                              "precision": 19,
+                                            "fp64": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "decimal": {
-                                              "scale": 0,
-                                              "precision": 19,
+                                            "fp64": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "fixedChar": {
-                                              "length": 1,
+                                            "fp64": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "fixedChar": {
-                                              "length": 1,
+                                            "fp64": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "date": {
+                                            "string": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "date": {
+                                            "string": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "date": {
+                                            "string": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "fixedChar": {
-                                              "length": 25,
+                                            "string": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "fixedChar": {
-                                              "length": 10,
+                                            "string": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
                                           }, {
-                                            "varchar": {
-                                              "length": 44,
+                                            "string": {
+                                              "typeVariationReference": 0,
+                                              "nullability": "NULLABILITY_NULLABLE"
+                                            }
+                                          }, {
+                                            "string": {
+                                              "typeVariationReference": 0,
+                                              "nullability": "NULLABILITY_NULLABLE"
+                                            }
+                                          }, {
+                                            "string": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
@@ -362,7 +361,7 @@
                               },
                               "condition": {
                                 "scalarFunction": {
-                                  "functionReference": 0,
+                                  "functionReference": 1,
                                   "args": [],
                                   "outputType": {
                                     "bool": {
@@ -373,7 +372,7 @@
                                   "arguments": [{
                                     "value": {
                                       "scalarFunction": {
-                                        "functionReference": 1,
+                                        "functionReference": 2,
                                         "args": [],
                                         "outputType": {
                                           "bool": {
@@ -395,22 +394,10 @@
                                           }
                                         }, {
                                           "value": {
-                                            "cast": {
-                                              "type": {
-                                                "fixedChar": {
-                                                  "length": 10,
-                                                  "typeVariationReference": 0,
-                                                  "nullability": "NULLABILITY_REQUIRED"
-                                                }
-                                              },
-                                              "input": {
-                                                "literal": {
-                                                  "fixedChar": "HOUSEHOLD",
-                                                  "nullable": false,
-                                                  "typeVariationReference": 0
-                                                }
-                                              },
-                                              "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                            "literal": {
+                                              "string": "BUILDING",
+                                              "nullable": false,
+                                              "typeVariationReference": 0
                                             }
                                           }
                                         }],
@@ -420,12 +407,12 @@
                                   }, {
                                     "value": {
                                       "scalarFunction": {
-                                        "functionReference": 1,
+                                        "functionReference": 2,
                                         "args": [],
                                         "outputType": {
                                           "bool": {
                                             "typeVariationReference": 0,
-                                            "nullability": "NULLABILITY_REQUIRED"
+                                            "nullability": "NULLABILITY_NULLABLE"
                                           }
                                         },
                                         "arguments": [{
@@ -459,12 +446,12 @@
                                   }, {
                                     "value": {
                                       "scalarFunction": {
-                                        "functionReference": 1,
+                                        "functionReference": 2,
                                         "args": [],
                                         "outputType": {
                                           "bool": {
                                             "typeVariationReference": 0,
-                                            "nullability": "NULLABILITY_REQUIRED"
+                                            "nullability": "NULLABILITY_NULLABLE"
                                           }
                                         },
                                         "arguments": [{
@@ -498,41 +485,6 @@
                                   }, {
                                     "value": {
                                       "scalarFunction": {
-                                        "functionReference": 2,
-                                        "args": [],
-                                        "outputType": {
-                                          "bool": {
-                                            "typeVariationReference": 0,
-                                            "nullability": "NULLABILITY_NULLABLE"
-                                          }
-                                        },
-                                        "arguments": [{
-                                          "value": {
-                                            "selection": {
-                                              "directReference": {
-                                                "structField": {
-                                                  "field": 12
-                                                }
-                                              },
-                                              "rootReference": {
-                                              }
-                                            }
-                                          }
-                                        }, {
-                                          "value": {
-                                            "literal": {
-                                              "date": 9214,
-                                              "nullable": false,
-                                              "typeVariationReference": 0
-                                            }
-                                          }
-                                        }],
-                                        "options": []
-                                      }
-                                    }
-                                  }, {
-                                    "value": {
-                                      "scalarFunction": {
                                         "functionReference": 3,
                                         "args": [],
                                         "outputType": {
@@ -543,22 +495,101 @@
                                         },
                                         "arguments": [{
                                           "value": {
-                                            "selection": {
-                                              "directReference": {
-                                                "structField": {
-                                                  "field": 27
+                                            "cast": {
+                                              "type": {
+                                                "date": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
                                                 }
                                               },
-                                              "rootReference": {
-                                              }
+                                              "input": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 12
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              },
+                                              "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
                                             }
                                           }
                                         }, {
                                           "value": {
-                                            "literal": {
-                                              "date": 9214,
-                                              "nullable": false,
-                                              "typeVariationReference": 0
+                                            "cast": {
+                                              "type": {
+                                                "date": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_REQUIRED"
+                                                }
+                                              },
+                                              "input": {
+                                                "literal": {
+                                                  "fixedChar": "1995-03-15",
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              },
+                                              "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                            }
+                                          }
+                                        }],
+                                        "options": []
+                                      }
+                                    }
+                                  }, {
+                                    "value": {
+                                      "scalarFunction": {
+                                        "functionReference": 4,
+                                        "args": [],
+                                        "outputType": {
+                                          "bool": {
+                                            "typeVariationReference": 0,
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                          }
+                                        },
+                                        "arguments": [{
+                                          "value": {
+                                            "cast": {
+                                              "type": {
+                                                "date": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                }
+                                              },
+                                              "input": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 27
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              },
+                                              "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                            }
+                                          }
+                                        }, {
+                                          "value": {
+                                            "cast": {
+                                              "type": {
+                                                "date": {
+                                                  "typeVariationReference": 0,
+                                                  "nullability": "NULLABILITY_REQUIRED"
+                                                }
+                                              },
+                                              "input": {
+                                                "literal": {
+                                                  "fixedChar": "1995-03-15",
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              },
+                                              "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
                                             }
                                           }
                                         }],
@@ -603,12 +634,10 @@
                             }
                           }, {
                             "scalarFunction": {
-                              "functionReference": 4,
+                              "functionReference": 5,
                               "args": [],
                               "outputType": {
-                                "decimal": {
-                                  "scale": 0,
-                                  "precision": 19,
+                                "fp64": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
@@ -628,12 +657,10 @@
                               }, {
                                 "value": {
                                   "scalarFunction": {
-                                    "functionReference": 5,
+                                    "functionReference": 6,
                                     "args": [],
                                     "outputType": {
-                                      "decimal": {
-                                        "scale": 0,
-                                        "precision": 19,
+                                      "fp64": {
                                         "typeVariationReference": 0,
                                         "nullability": "NULLABILITY_NULLABLE"
                                       }
@@ -642,9 +669,7 @@
                                       "value": {
                                         "cast": {
                                           "type": {
-                                            "decimal": {
-                                              "scale": 0,
-                                              "precision": 19,
+                                            "fp64": {
                                               "typeVariationReference": 0,
                                               "nullability": "NULLABILITY_NULLABLE"
                                             }
@@ -656,7 +681,7 @@
                                               "typeVariationReference": 0
                                             }
                                           },
-                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
                                         }
                                       }
                                     }, {
@@ -712,18 +737,17 @@
                             "rootReference": {
                             }
                           }
-                        }]
+                        }],
+                        "expressionReferences": []
                       }],
                       "measures": [{
                         "measure": {
-                          "functionReference": 6,
+                          "functionReference": 7,
                           "args": [],
                           "sorts": [],
                           "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
                           "outputType": {
-                            "decimal": {
-                              "scale": 0,
-                              "precision": 19,
+                            "fp64": {
                               "typeVariationReference": 0,
                               "nullability": "NULLABILITY_NULLABLE"
                             }
@@ -744,7 +768,8 @@
                           }],
                           "options": []
                         }
-                      }]
+                      }],
+                      "groupingExpressions": []
                     }
                   },
                   "expressions": [{
@@ -826,5 +851,13 @@
       "names": ["L_ORDERKEY", "REVENUE", "O_ORDERDATE", "O_SHIPPRIORITY"]
     }
   }],
-  "expectedTypeUrls": []
+  "expectedTypeUrls": [],
+  "version": {
+    "majorNumber": 0,
+    "minorNumber": 69,
+    "patchNumber": 0,
+    "gitHash": "",
+    "producer": "isthmus"
+  },
+  "parameterBindings": []
 }

@@ -1,8 +1,44 @@
-# select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal from ( select substring(c_phone from 1 for 2) as cntrycode, c_acctbal from "customer" c where substring(c_phone from 1 for 2) in ('24', '31', '11', '16', '21', '20', '34') and c_acctbal > ( select avg(c_acctbal) from "customer" where c_acctbal > 0.00 and substring(c_phone from 1 for 2) in ('24', '31', '11', '16', '21', '20', '34') ) and not exists ( select smoke.sh tpch_smoke.sh from "orders" o where o.o_custkey = c.c_custkey ) ) as custsale group by cntrycode order by cntrycode
+# Original SQL Query:
+# SELECT
+#     cntrycode,
+#     count(*) AS numcust,
+#     sum(c_acctbal) AS totacctbal
+# FROM (
+# SELECT
+#         substring(c_phone FROM 1 FOR 2) AS cntrycode,
+#         c_acctbal
+#     FROM
+#         customer
+#     WHERE
+#         substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
+#         AND c_acctbal > (
+# SELECT
+#                 avg(c_acctbal)
+#             FROM
+#                 customer
+#             WHERE
+#                 c_acctbal > 0.00
+#                 AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))
+#             AND NOT EXISTS (
+# SELECT
+#                     *
+#                 FROM
+#                     orders
+#                 WHERE
+#                     o_custkey = c_custkey)) AS custsale
+# GROUP BY
+#     cntrycode
+# ORDER BY
+#     cntrycode;
+#
+
 {
   "extensionUris": [{
     "extensionUriAnchor": 5,
     "uri": "/functions_aggregate_generic.yaml"
+  }, {
+    "extensionUriAnchor": 4,
+    "uri": "/functions_arithmetic.yaml"
   }, {
     "extensionUriAnchor": 1,
     "uri": "/functions_boolean.yaml"
@@ -10,65 +46,62 @@
     "extensionUriAnchor": 3,
     "uri": "/functions_string.yaml"
   }, {
-    "extensionUriAnchor": 4,
-    "uri": "/functions_arithmetic_decimal.yaml"
-  }, {
     "extensionUriAnchor": 2,
     "uri": "/functions_comparison.yaml"
   }],
   "extensions": [{
     "extensionFunction": {
       "extensionUriReference": 1,
-      "functionAnchor": 0,
+      "functionAnchor": 1,
       "name": "and:bool"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 1,
-      "functionAnchor": 1,
+      "functionAnchor": 2,
       "name": "or:bool"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 2,
-      "functionAnchor": 2,
+      "functionAnchor": 3,
       "name": "equal:any_any"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 3,
-      "functionAnchor": 3,
-      "name": "substring:fchar_i32_i32"
+      "functionAnchor": 4,
+      "name": "substring:str_i32_i32"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 2,
-      "functionAnchor": 4,
+      "functionAnchor": 5,
       "name": "gt:any_any"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 4,
-      "functionAnchor": 5,
-      "name": "avg:dec"
+      "functionAnchor": 6,
+      "name": "avg:fp64"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 1,
-      "functionAnchor": 6,
+      "functionAnchor": 7,
       "name": "not:bool"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 5,
-      "functionAnchor": 7,
-      "name": "count:any"
+      "functionAnchor": 8,
+      "name": "count:"
     }
   }, {
     "extensionFunction": {
       "extensionUriReference": 4,
-      "functionAnchor": 8,
-      "name": "sum:dec"
+      "functionAnchor": 9,
+      "name": "sum:fp64"
     }
   }],
   "relations": [{
@@ -108,49 +141,42 @@
                             "names": ["C_CUSTKEY", "C_NAME", "C_ADDRESS", "C_NATIONKEY", "C_PHONE", "C_ACCTBAL", "C_MKTSEGMENT", "C_COMMENT"],
                             "struct": {
                               "types": [{
-                                "i64": {
-                                  "typeVariationReference": 0,
-                                  "nullability": "NULLABILITY_REQUIRED"
-                                }
-                              }, {
-                                "varchar": {
-                                  "length": 25,
+                                "i32": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
                               }, {
-                                "varchar": {
-                                  "length": 40,
+                                "string": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
                               }, {
-                                "i64": {
-                                  "typeVariationReference": 0,
-                                  "nullability": "NULLABILITY_REQUIRED"
-                                }
-                              }, {
-                                "fixedChar": {
-                                  "length": 15,
+                                "string": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
                               }, {
-                                "decimal": {
-                                  "scale": 0,
-                                  "precision": 19,
+                                "i32": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
                               }, {
-                                "fixedChar": {
-                                  "length": 10,
+                                "string": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
                               }, {
-                                "varchar": {
-                                  "length": 117,
+                                "fp64": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
                                   "typeVariationReference": 0,
                                   "nullability": "NULLABILITY_NULLABLE"
                                 }
@@ -166,7 +192,7 @@
                       },
                       "condition": {
                         "scalarFunction": {
-                          "functionReference": 0,
+                          "functionReference": 1,
                           "args": [],
                           "outputType": {
                             "bool": {
@@ -177,7 +203,7 @@
                           "arguments": [{
                             "value": {
                               "scalarFunction": {
-                                "functionReference": 1,
+                                "functionReference": 2,
                                 "args": [],
                                 "outputType": {
                                   "bool": {
@@ -188,7 +214,7 @@
                                 "arguments": [{
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -199,11 +225,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -242,22 +267,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "24",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "13",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -267,7 +280,7 @@
                                 }, {
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -278,11 +291,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -321,22 +333,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "31",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "31",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -346,7 +346,7 @@
                                 }, {
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -357,11 +357,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -400,22 +399,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "11",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "23",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -425,7 +412,7 @@
                                 }, {
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -436,11 +423,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -479,22 +465,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "16",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "29",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -504,7 +478,7 @@
                                 }, {
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -515,11 +489,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -558,22 +531,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "21",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "30",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -583,7 +544,7 @@
                                 }, {
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -594,11 +555,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -637,22 +597,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "20",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "18",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -662,7 +610,7 @@
                                 }, {
                                   "value": {
                                     "scalarFunction": {
-                                      "functionReference": 2,
+                                      "functionReference": 3,
                                       "args": [],
                                       "outputType": {
                                         "bool": {
@@ -673,11 +621,10 @@
                                       "arguments": [{
                                         "value": {
                                           "scalarFunction": {
-                                            "functionReference": 3,
+                                            "functionReference": 4,
                                             "args": [],
                                             "outputType": {
-                                              "varchar": {
-                                                "length": 15,
+                                              "string": {
                                                 "typeVariationReference": 0,
                                                 "nullability": "NULLABILITY_NULLABLE"
                                               }
@@ -716,22 +663,10 @@
                                         }
                                       }, {
                                         "value": {
-                                          "cast": {
-                                            "type": {
-                                              "varchar": {
-                                                "length": 15,
-                                                "typeVariationReference": 0,
-                                                "nullability": "NULLABILITY_NULLABLE"
-                                              }
-                                            },
-                                            "input": {
-                                              "literal": {
-                                                "fixedChar": "34",
-                                                "nullable": false,
-                                                "typeVariationReference": 0
-                                              }
-                                            },
-                                            "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                          "literal": {
+                                            "string": "17",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
                                           }
                                         }
                                       }],
@@ -745,7 +680,7 @@
                           }, {
                             "value": {
                               "scalarFunction": {
-                                "functionReference": 4,
+                                "functionReference": 5,
                                 "args": [],
                                 "outputType": {
                                   "bool": {
@@ -798,49 +733,42 @@
                                                           "names": ["C_CUSTKEY", "C_NAME", "C_ADDRESS", "C_NATIONKEY", "C_PHONE", "C_ACCTBAL", "C_MKTSEGMENT", "C_COMMENT"],
                                                           "struct": {
                                                             "types": [{
-                                                              "i64": {
-                                                                "typeVariationReference": 0,
-                                                                "nullability": "NULLABILITY_REQUIRED"
-                                                              }
-                                                            }, {
-                                                              "varchar": {
-                                                                "length": 25,
+                                                              "i32": {
                                                                 "typeVariationReference": 0,
                                                                 "nullability": "NULLABILITY_NULLABLE"
                                                               }
                                                             }, {
-                                                              "varchar": {
-                                                                "length": 40,
+                                                              "string": {
                                                                 "typeVariationReference": 0,
                                                                 "nullability": "NULLABILITY_NULLABLE"
                                                               }
                                                             }, {
-                                                              "i64": {
-                                                                "typeVariationReference": 0,
-                                                                "nullability": "NULLABILITY_REQUIRED"
-                                                              }
-                                                            }, {
-                                                              "fixedChar": {
-                                                                "length": 15,
+                                                              "string": {
                                                                 "typeVariationReference": 0,
                                                                 "nullability": "NULLABILITY_NULLABLE"
                                                               }
                                                             }, {
-                                                              "decimal": {
-                                                                "scale": 0,
-                                                                "precision": 19,
+                                                              "i32": {
                                                                 "typeVariationReference": 0,
                                                                 "nullability": "NULLABILITY_NULLABLE"
                                                               }
                                                             }, {
-                                                              "fixedChar": {
-                                                                "length": 10,
+                                                              "string": {
                                                                 "typeVariationReference": 0,
                                                                 "nullability": "NULLABILITY_NULLABLE"
                                                               }
                                                             }, {
-                                                              "varchar": {
-                                                                "length": 117,
+                                                              "fp64": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
                                                                 "typeVariationReference": 0,
                                                                 "nullability": "NULLABILITY_NULLABLE"
                                                               }
@@ -856,7 +784,7 @@
                                                     },
                                                     "condition": {
                                                       "scalarFunction": {
-                                                        "functionReference": 0,
+                                                        "functionReference": 1,
                                                         "args": [],
                                                         "outputType": {
                                                           "bool": {
@@ -867,7 +795,7 @@
                                                         "arguments": [{
                                                           "value": {
                                                             "scalarFunction": {
-                                                              "functionReference": 4,
+                                                              "functionReference": 5,
                                                               "args": [],
                                                               "outputType": {
                                                                 "bool": {
@@ -889,14 +817,25 @@
                                                                 }
                                                               }, {
                                                                 "value": {
-                                                                  "literal": {
-                                                                    "decimal": {
-                                                                      "value": "AAAAAAAAAAAAAAAAAAAAAA==",
-                                                                      "precision": 3,
-                                                                      "scale": 2
+                                                                  "cast": {
+                                                                    "type": {
+                                                                      "fp64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
                                                                     },
-                                                                    "nullable": false,
-                                                                    "typeVariationReference": 0
+                                                                    "input": {
+                                                                      "literal": {
+                                                                        "decimal": {
+                                                                          "value": "AAAAAAAAAAAAAAAAAAAAAA==",
+                                                                          "precision": 3,
+                                                                          "scale": 2
+                                                                        },
+                                                                        "nullable": false,
+                                                                        "typeVariationReference": 0
+                                                                      }
+                                                                    },
+                                                                    "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
                                                                   }
                                                                 }
                                                               }],
@@ -906,7 +845,7 @@
                                                         }, {
                                                           "value": {
                                                             "scalarFunction": {
-                                                              "functionReference": 1,
+                                                              "functionReference": 2,
                                                               "args": [],
                                                               "outputType": {
                                                                 "bool": {
@@ -917,7 +856,7 @@
                                                               "arguments": [{
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -928,11 +867,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -971,22 +909,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "24",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "13",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -996,7 +922,7 @@
                                                               }, {
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -1007,11 +933,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -1050,22 +975,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "31",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "31",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -1075,7 +988,7 @@
                                                               }, {
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -1086,11 +999,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -1129,22 +1041,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "11",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "23",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -1154,7 +1054,7 @@
                                                               }, {
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -1165,11 +1065,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -1208,22 +1107,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "16",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "29",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -1233,7 +1120,7 @@
                                                               }, {
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -1244,11 +1131,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -1287,22 +1173,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "21",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "30",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -1312,7 +1186,7 @@
                                                               }, {
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -1323,11 +1197,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -1366,22 +1239,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "20",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "18",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -1391,7 +1252,7 @@
                                                               }, {
                                                                 "value": {
                                                                   "scalarFunction": {
-                                                                    "functionReference": 2,
+                                                                    "functionReference": 3,
                                                                     "args": [],
                                                                     "outputType": {
                                                                       "bool": {
@@ -1402,11 +1263,10 @@
                                                                     "arguments": [{
                                                                       "value": {
                                                                         "scalarFunction": {
-                                                                          "functionReference": 3,
+                                                                          "functionReference": 4,
                                                                           "args": [],
                                                                           "outputType": {
-                                                                            "varchar": {
-                                                                              "length": 15,
+                                                                            "string": {
                                                                               "typeVariationReference": 0,
                                                                               "nullability": "NULLABILITY_NULLABLE"
                                                                             }
@@ -1445,22 +1305,10 @@
                                                                       }
                                                                     }, {
                                                                       "value": {
-                                                                        "cast": {
-                                                                          "type": {
-                                                                            "varchar": {
-                                                                              "length": 15,
-                                                                              "typeVariationReference": 0,
-                                                                              "nullability": "NULLABILITY_NULLABLE"
-                                                                            }
-                                                                          },
-                                                                          "input": {
-                                                                            "literal": {
-                                                                              "fixedChar": "34",
-                                                                              "nullable": false,
-                                                                              "typeVariationReference": 0
-                                                                            }
-                                                                          },
-                                                                          "failureBehavior": "FAILURE_BEHAVIOR_UNSPECIFIED"
+                                                                        "literal": {
+                                                                          "string": "17",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
                                                                         }
                                                                       }
                                                                     }],
@@ -1491,18 +1339,17 @@
                                               }
                                             },
                                             "groupings": [{
-                                              "groupingExpressions": []
+                                              "groupingExpressions": [],
+                                              "expressionReferences": []
                                             }],
                                             "measures": [{
                                               "measure": {
-                                                "functionReference": 5,
+                                                "functionReference": 6,
                                                 "args": [],
                                                 "sorts": [],
                                                 "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
                                                 "outputType": {
-                                                  "decimal": {
-                                                    "scale": 0,
-                                                    "precision": 19,
+                                                  "fp64": {
                                                     "typeVariationReference": 0,
                                                     "nullability": "NULLABILITY_NULLABLE"
                                                   }
@@ -1523,7 +1370,8 @@
                                                 }],
                                                 "options": []
                                               }
-                                            }]
+                                            }],
+                                            "groupingExpressions": []
                                           }
                                         }
                                       }
@@ -1536,7 +1384,7 @@
                           }, {
                             "value": {
                               "scalarFunction": {
-                                "functionReference": 6,
+                                "functionReference": 7,
                                 "args": [],
                                 "outputType": {
                                   "bool": {
@@ -1565,42 +1413,7 @@
                                                   "names": ["O_ORDERKEY", "O_CUSTKEY", "O_ORDERSTATUS", "O_TOTALPRICE", "O_ORDERDATE", "O_ORDERPRIORITY", "O_CLERK", "O_SHIPPRIORITY", "O_COMMENT"],
                                                   "struct": {
                                                     "types": [{
-                                                      "i64": {
-                                                        "typeVariationReference": 0,
-                                                        "nullability": "NULLABILITY_REQUIRED"
-                                                      }
-                                                    }, {
-                                                      "i64": {
-                                                        "typeVariationReference": 0,
-                                                        "nullability": "NULLABILITY_REQUIRED"
-                                                      }
-                                                    }, {
-                                                      "fixedChar": {
-                                                        "length": 1,
-                                                        "typeVariationReference": 0,
-                                                        "nullability": "NULLABILITY_NULLABLE"
-                                                      }
-                                                    }, {
-                                                      "decimal": {
-                                                        "scale": 0,
-                                                        "precision": 19,
-                                                        "typeVariationReference": 0,
-                                                        "nullability": "NULLABILITY_NULLABLE"
-                                                      }
-                                                    }, {
-                                                      "date": {
-                                                        "typeVariationReference": 0,
-                                                        "nullability": "NULLABILITY_NULLABLE"
-                                                      }
-                                                    }, {
-                                                      "fixedChar": {
-                                                        "length": 15,
-                                                        "typeVariationReference": 0,
-                                                        "nullability": "NULLABILITY_NULLABLE"
-                                                      }
-                                                    }, {
-                                                      "fixedChar": {
-                                                        "length": 15,
+                                                      "i32": {
                                                         "typeVariationReference": 0,
                                                         "nullability": "NULLABILITY_NULLABLE"
                                                       }
@@ -1610,8 +1423,37 @@
                                                         "nullability": "NULLABILITY_NULLABLE"
                                                       }
                                                     }, {
-                                                      "varchar": {
-                                                        "length": 79,
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "fp64": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "i32": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
                                                         "typeVariationReference": 0,
                                                         "nullability": "NULLABILITY_NULLABLE"
                                                       }
@@ -1627,12 +1469,12 @@
                                             },
                                             "condition": {
                                               "scalarFunction": {
-                                                "functionReference": 2,
+                                                "functionReference": 3,
                                                 "args": [],
                                                 "outputType": {
                                                   "bool": {
                                                     "typeVariationReference": 0,
-                                                    "nullability": "NULLABILITY_REQUIRED"
+                                                    "nullability": "NULLABILITY_NULLABLE"
                                                   }
                                                 },
                                                 "arguments": [{
@@ -1681,11 +1523,10 @@
                   },
                   "expressions": [{
                     "scalarFunction": {
-                      "functionReference": 3,
+                      "functionReference": 4,
                       "args": [],
                       "outputType": {
-                        "varchar": {
-                          "length": 15,
+                        "string": {
                           "typeVariationReference": 0,
                           "nullability": "NULLABILITY_NULLABLE"
                         }
@@ -1745,11 +1586,12 @@
                     "rootReference": {
                     }
                   }
-                }]
+                }],
+                "expressionReferences": []
               }],
               "measures": [{
                 "measure": {
-                  "functionReference": 7,
+                  "functionReference": 8,
                   "args": [],
                   "sorts": [],
                   "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
@@ -1765,14 +1607,12 @@
                 }
               }, {
                 "measure": {
-                  "functionReference": 8,
+                  "functionReference": 9,
                   "args": [],
                   "sorts": [],
                   "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
                   "outputType": {
-                    "decimal": {
-                      "scale": 0,
-                      "precision": 19,
+                    "fp64": {
                       "typeVariationReference": 0,
                       "nullability": "NULLABILITY_NULLABLE"
                     }
@@ -1793,7 +1633,8 @@
                   }],
                   "options": []
                 }
-              }]
+              }],
+              "groupingExpressions": []
             }
           },
           "sorts": [{
@@ -1815,5 +1656,13 @@
       "names": ["CNTRYCODE", "NUMCUST", "TOTACCTBAL"]
     }
   }],
-  "expectedTypeUrls": []
+  "expectedTypeUrls": [],
+  "version": {
+    "majorNumber": 0,
+    "minorNumber": 69,
+    "patchNumber": 0,
+    "gitHash": "",
+    "producer": "isthmus"
+  },
+  "parameterBindings": []
 }
