@@ -1,6 +1,6 @@
 use anyhow::Result;
 use pgrx::pg_sys;
-use substrait::proto::{Expression, Plan, PlanRel, Rel};
+use substrait::proto::{Expression, Plan, PlanRel, Rel, Type};
 
 #[derive(Debug)]
 pub struct ExecutionResult {
@@ -321,4 +321,449 @@ pub unsafe fn execute_plan_tree_structured(
         }
         _ => Err("Unsupported plan node type for structured execution".into()),
     }
+}
+
+// Schema extraction utilities for Substrait Plans
+
+#[derive(Debug, Clone)]
+pub struct SubstraitSchema {
+    pub column_names: Vec<String>,
+    pub column_types: Vec<SubstraitType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubstraitType {
+    pub type_name: String,
+    pub postgres_type_oid: pg_sys::Oid,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableSchema {
+    pub table_name: String,
+    pub column_names: Vec<String>,
+    pub column_types: Vec<SubstraitType>,
+}
+
+/// Extract the output schema from a Substrait Plan
+/// This gets the column names and types that will be returned by the plan
+pub fn extract_plan_output_schema(
+    plan: &Plan,
+) -> Result<SubstraitSchema, Box<dyn std::error::Error + Send + Sync>> {
+    if plan.relations.is_empty() {
+        return Err("Plan has no relations".into());
+    }
+
+    let relation = &plan.relations[0];
+    extract_relation_output_schema(relation)
+}
+
+/// Extract the output schema from a PlanRel
+fn extract_relation_output_schema(
+    relation: &PlanRel,
+) -> Result<SubstraitSchema, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(rel_type) = &relation.rel_type {
+        match rel_type {
+            substrait::proto::plan_rel::RelType::Root(root) => {
+                // RelRoot contains the output column names
+                let column_names = root.names.clone();
+
+                // To get the types, we need to traverse the input relation tree
+                let column_types = if let Some(input) = &root.input {
+                    extract_relation_types(input, column_names.len())?
+                } else {
+                    // If no input, create default types
+                    vec![
+                        SubstraitType {
+                            type_name: "text".to_string(),
+                            postgres_type_oid: pg_sys::TEXTOID,
+                            nullable: true,
+                        };
+                        column_names.len()
+                    ]
+                };
+
+                Ok(SubstraitSchema {
+                    column_names,
+                    column_types,
+                })
+            }
+            _ => Err("Only Root relations are supported for schema extraction".into()),
+        }
+    } else {
+        Err("Relation missing rel_type".into())
+    }
+}
+
+/// Extract column types from a relation tree
+fn extract_relation_types(
+    rel: &Rel,
+    expected_count: usize,
+) -> Result<Vec<SubstraitType>, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::rel::RelType;
+
+    match &rel.rel_type {
+        Some(RelType::Project(project)) => {
+            // For project relations, analyze the expressions to determine output types
+            let mut types = Vec::new();
+
+            for expr in &project.expressions {
+                let substrait_type = extract_expression_type(expr)?;
+                types.push(substrait_type);
+            }
+
+            // If we don't have enough types, fill with defaults
+            while types.len() < expected_count {
+                types.push(SubstraitType {
+                    type_name: "text".to_string(),
+                    postgres_type_oid: pg_sys::TEXTOID,
+                    nullable: true,
+                });
+            }
+
+            Ok(types)
+        }
+        Some(RelType::Read(read)) => {
+            // For read relations, get types from the base schema
+            if let Some(base_schema) = &read.base_schema {
+                extract_types_from_schema_struct(&base_schema.r#struct, expected_count)
+            } else {
+                // Create default types if no schema
+                Ok(vec![
+                    SubstraitType {
+                        type_name: "text".to_string(),
+                        postgres_type_oid: pg_sys::TEXTOID,
+                        nullable: true,
+                    };
+                    expected_count
+                ])
+            }
+        }
+        Some(RelType::Aggregate(_)) => {
+            // For aggregate relations, types depend on the aggregation functions
+            // For now, default to numeric types commonly used in aggregation
+            Ok(vec![
+                SubstraitType {
+                    type_name: "fp64".to_string(),
+                    postgres_type_oid: pg_sys::FLOAT8OID,
+                    nullable: true,
+                };
+                expected_count
+            ])
+        }
+        Some(RelType::Sort(sort)) => {
+            // Sort doesn't change types, recurse to input
+            if let Some(input) = &sort.input {
+                extract_relation_types(input, expected_count)
+            } else {
+                Ok(vec![
+                    SubstraitType {
+                        type_name: "text".to_string(),
+                        postgres_type_oid: pg_sys::TEXTOID,
+                        nullable: true,
+                    };
+                    expected_count
+                ])
+            }
+        }
+        Some(RelType::Filter(filter)) => {
+            // Filter doesn't change types, recurse to input
+            if let Some(input) = &filter.input {
+                extract_relation_types(input, expected_count)
+            } else {
+                Ok(vec![
+                    SubstraitType {
+                        type_name: "text".to_string(),
+                        postgres_type_oid: pg_sys::TEXTOID,
+                        nullable: true,
+                    };
+                    expected_count
+                ])
+            }
+        }
+        _ => {
+            // For unsupported relation types, return default types
+            Ok(vec![
+                SubstraitType {
+                    type_name: "text".to_string(),
+                    postgres_type_oid: pg_sys::TEXTOID,
+                    nullable: true,
+                };
+                expected_count
+            ])
+        }
+    }
+}
+
+/// Extract the type of a Substrait expression
+fn extract_expression_type(
+    expr: &Expression,
+) -> Result<SubstraitType, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            if let Some(literal_type) = &literal.literal_type {
+                match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(_) => {
+                        Ok(SubstraitType {
+                            type_name: "i32".to_string(),
+                            postgres_type_oid: pg_sys::INT4OID,
+                            nullable: literal.nullable,
+                        })
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(_) => {
+                        Ok(SubstraitType {
+                            type_name: "i64".to_string(),
+                            postgres_type_oid: pg_sys::INT8OID,
+                            nullable: literal.nullable,
+                        })
+                    }
+                    substrait::proto::expression::literal::LiteralType::Fp64(_) => {
+                        Ok(SubstraitType {
+                            type_name: "fp64".to_string(),
+                            postgres_type_oid: pg_sys::FLOAT8OID,
+                            nullable: literal.nullable,
+                        })
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(_)
+                    | substrait::proto::expression::literal::LiteralType::FixedChar(_) => {
+                        Ok(SubstraitType {
+                            type_name: "string".to_string(),
+                            postgres_type_oid: pg_sys::TEXTOID,
+                            nullable: literal.nullable,
+                        })
+                    }
+                    substrait::proto::expression::literal::LiteralType::Boolean(_) => {
+                        Ok(SubstraitType {
+                            type_name: "bool".to_string(),
+                            postgres_type_oid: pg_sys::BOOLOID,
+                            nullable: literal.nullable,
+                        })
+                    }
+                    _ => Ok(SubstraitType {
+                        type_name: "unknown".to_string(),
+                        postgres_type_oid: pg_sys::TEXTOID,
+                        nullable: true,
+                    }),
+                }
+            } else {
+                Err("Literal expression missing literal type".into())
+            }
+        }
+        Some(RexType::Selection(_selection)) => {
+            // For field selections, we would need to look up the field type
+            // from the input schema. For now, default to text.
+            Ok(SubstraitType {
+                type_name: "selection".to_string(),
+                postgres_type_oid: pg_sys::TEXTOID,
+                nullable: true,
+            })
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            // For scalar functions, use the output type if available
+            if let Some(output_type) = &func.output_type {
+                convert_substrait_type_to_postgres(output_type)
+            } else {
+                Ok(SubstraitType {
+                    type_name: "function".to_string(),
+                    postgres_type_oid: pg_sys::TEXTOID,
+                    nullable: true,
+                })
+            }
+        }
+        _ => Ok(SubstraitType {
+            type_name: "unknown".to_string(),
+            postgres_type_oid: pg_sys::TEXTOID,
+            nullable: true,
+        }),
+    }
+}
+
+/// Extract types from a Substrait Struct (base schema)
+fn extract_types_from_schema_struct(
+    struct_type: &Option<substrait::proto::r#type::Struct>,
+    expected_count: usize,
+) -> Result<Vec<SubstraitType>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(struct_def) = struct_type {
+        let mut types = Vec::new();
+
+        for type_def in &struct_def.types {
+            let substrait_type = convert_substrait_type_to_postgres(type_def)?;
+            types.push(substrait_type);
+        }
+
+        // Ensure we have the expected number of types
+        while types.len() < expected_count {
+            types.push(SubstraitType {
+                type_name: "text".to_string(),
+                postgres_type_oid: pg_sys::TEXTOID,
+                nullable: true,
+            });
+        }
+
+        Ok(types)
+    } else {
+        // No struct definition, return defaults
+        Ok(vec![
+            SubstraitType {
+                type_name: "text".to_string(),
+                postgres_type_oid: pg_sys::TEXTOID,
+                nullable: true,
+            };
+            expected_count
+        ])
+    }
+}
+
+/// Convert a Substrait Type to a SubstraitType with PostgreSQL mapping
+fn convert_substrait_type_to_postgres(
+    substrait_type: &Type,
+) -> Result<SubstraitType, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::r#type::Kind;
+
+    // For now, default to nullable - we can enhance this later based on the actual API
+    let nullable = true;
+
+    if let Some(kind) = &substrait_type.kind {
+        match kind {
+            Kind::I32(_) => Ok(SubstraitType {
+                type_name: "i32".to_string(),
+                postgres_type_oid: pg_sys::INT4OID,
+                nullable,
+            }),
+            Kind::I64(_) => Ok(SubstraitType {
+                type_name: "i64".to_string(),
+                postgres_type_oid: pg_sys::INT8OID,
+                nullable,
+            }),
+            Kind::Fp64(_) => Ok(SubstraitType {
+                type_name: "fp64".to_string(),
+                postgres_type_oid: pg_sys::FLOAT8OID,
+                nullable,
+            }),
+            Kind::String(_) => Ok(SubstraitType {
+                type_name: "string".to_string(),
+                postgres_type_oid: pg_sys::TEXTOID,
+                nullable,
+            }),
+            Kind::Bool(_) => Ok(SubstraitType {
+                type_name: "bool".to_string(),
+                postgres_type_oid: pg_sys::BOOLOID,
+                nullable,
+            }),
+            Kind::Date(_) => Ok(SubstraitType {
+                type_name: "date".to_string(),
+                postgres_type_oid: pg_sys::DATEOID,
+                nullable,
+            }),
+            _ => Ok(SubstraitType {
+                type_name: "unknown".to_string(),
+                postgres_type_oid: pg_sys::TEXTOID,
+                nullable,
+            }),
+        }
+    } else {
+        Ok(SubstraitType {
+            type_name: "unknown".to_string(),
+            postgres_type_oid: pg_sys::TEXTOID,
+            nullable,
+        })
+    }
+}
+
+/// Extract all table schemas from a Substrait Plan
+/// This finds all the base tables and their schemas
+pub fn extract_table_schemas_from_plan(
+    plan: &Plan,
+) -> Result<Vec<TableSchema>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut table_schemas = Vec::new();
+
+    for relation in &plan.relations {
+        if let Some(rel_type) = &relation.rel_type {
+            if let substrait::proto::plan_rel::RelType::Root(root) = rel_type {
+                if let Some(input) = &root.input {
+                    extract_table_schemas_from_relation(input, &mut table_schemas)?;
+                }
+            }
+        }
+    }
+
+    Ok(table_schemas)
+}
+
+/// Recursively extract table schemas from a relation tree
+fn extract_table_schemas_from_relation(
+    rel: &Rel,
+    table_schemas: &mut Vec<TableSchema>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::rel::RelType;
+
+    match &rel.rel_type {
+        Some(RelType::Read(read)) => {
+            // Extract table schema from read relation
+            if let Some(read_type) = &read.read_type {
+                if let substrait::proto::read_rel::ReadType::NamedTable(named_table) = read_type {
+                    let table_name = named_table.names.join(".");
+
+                    let (column_names, column_types) = if let Some(base_schema) = &read.base_schema
+                    {
+                        let names = base_schema.names.clone();
+                        let types =
+                            extract_types_from_schema_struct(&base_schema.r#struct, names.len())?;
+                        (names, types)
+                    } else {
+                        (vec![], vec![])
+                    };
+
+                    table_schemas.push(TableSchema {
+                        table_name,
+                        column_names,
+                        column_types,
+                    });
+                }
+            }
+        }
+        Some(RelType::Project(project)) => {
+            if let Some(input) = &project.input {
+                extract_table_schemas_from_relation(input, table_schemas)?;
+            }
+        }
+        Some(RelType::Filter(filter)) => {
+            if let Some(input) = &filter.input {
+                extract_table_schemas_from_relation(input, table_schemas)?;
+            }
+        }
+        Some(RelType::Sort(sort)) => {
+            if let Some(input) = &sort.input {
+                extract_table_schemas_from_relation(input, table_schemas)?;
+            }
+        }
+        Some(RelType::Aggregate(aggregate)) => {
+            if let Some(input) = &aggregate.input {
+                extract_table_schemas_from_relation(input, table_schemas)?;
+            }
+        }
+        Some(RelType::Join(join)) => {
+            if let Some(left) = &join.left {
+                extract_table_schemas_from_relation(left, table_schemas)?;
+            }
+            if let Some(right) = &join.right {
+                extract_table_schemas_from_relation(right, table_schemas)?;
+            }
+        }
+        Some(RelType::Cross(cross)) => {
+            if let Some(left) = &cross.left {
+                extract_table_schemas_from_relation(left, table_schemas)?;
+            }
+            if let Some(right) = &cross.right {
+                extract_table_schemas_from_relation(right, table_schemas)?;
+            }
+        }
+        _ => {
+            // For other relation types, we don't extract table schemas
+        }
+    }
+
+    Ok(())
 }
