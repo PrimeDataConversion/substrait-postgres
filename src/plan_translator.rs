@@ -14,6 +14,7 @@ pub struct ColumnInfo {
     pub name: String,
     pub type_oid: pg_sys::Oid,
     pub type_mod: i32,
+    pub attr_number: pg_sys::AttrNumber,
 }
 
 pub fn execute_substrait_plan(
@@ -151,7 +152,7 @@ unsafe fn convert_expression_to_target_entry(
                     as *mut pg_sys::TargetEntry;
                 (*target_entry).expr = const_expr;
                 (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
-                (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
+                (*target_entry).resname = create_cstring("result");
                 (*target_entry).resjunk = false;
 
                 Ok(target_entry)
@@ -228,9 +229,101 @@ pub unsafe fn create_values_scan_node(
 pub unsafe fn create_seqscan_node(
     table_name: &str,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // This is complex as it requires looking up the table OID, etc.
-    // For now, return an error
-    Err(format!("SeqScan for table '{}' not yet implemented", table_name).into())
+    // Look up the table OID by name
+    let table_oid = lookup_table_oid(table_name)?;
+
+    // Create a SeqScan node
+    let seqscan_node =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
+    (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+    (*seqscan_node).scan.scanrelid = table_oid.into();
+
+    // Create target list for the table's columns
+    let target_list = create_target_list_for_table(table_oid)?;
+    (*seqscan_node).scan.plan.targetlist = target_list;
+
+    Ok(seqscan_node as *mut pg_sys::Plan)
+}
+
+unsafe fn lookup_table_oid(
+    table_name: &str,
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    // Try to look up the table in the current search path
+    let table_cstring = create_cstring(table_name);
+
+    // Use PostgreSQL's RangeVarGetRelid to look up the table
+    let range_var =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeVar>()) as *mut pg_sys::RangeVar;
+    (*range_var).relname = table_cstring;
+    (*range_var).inh = true;
+    (*range_var).relpersistence = pg_sys::RELPERSISTENCE_PERMANENT as i8;
+
+    // Look up the relation OID
+    let relation_oid = pg_sys::RangeVarGetRelidExtended(
+        range_var,
+        pg_sys::NoLock as i32,
+        0,
+        None,
+        std::ptr::null_mut(),
+    );
+
+    if relation_oid == pg_sys::InvalidOid {
+        return Err(format!("Table '{}' not found", table_name).into());
+    }
+
+    Ok(relation_oid)
+}
+
+unsafe fn create_target_list_for_table(
+    table_oid: pg_sys::Oid,
+) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
+    // Open the relation to get its tuple descriptor
+    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
+    if relation.is_null() {
+        return Err(format!("Could not open relation with OID {}", table_oid).into());
+    }
+
+    let tuple_desc = (*relation).rd_att;
+    let num_attrs = (*tuple_desc).natts;
+
+    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+
+    // Create target entries for each column
+    for i in 0..num_attrs {
+        let attr = (*tuple_desc).attrs.as_ptr().offset(i as isize);
+        if (*attr).attisdropped {
+            continue; // Skip dropped columns
+        }
+
+        // Create a Var node for this column
+        let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+        (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
+        (*var_node).varno = 1; // Single table scan
+        (*var_node).varattno = (*attr).attnum;
+        (*var_node).vartype = (*attr).atttypid;
+        (*var_node).vartypmod = (*attr).atttypmod;
+        (*var_node).varcollid = (*attr).attcollation;
+        (*var_node).varlevelsup = 0;
+
+        // Create target entry
+        let target_entry =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
+        (*target_entry).expr = var_node as *mut pg_sys::Expr;
+        (*target_entry).resno = (*attr).attnum;
+
+        // Copy the column name
+        let attr_name = std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr());
+        let attr_name_str = attr_name.to_string_lossy();
+        (*target_entry).resname = create_cstring(&attr_name_str);
+        (*target_entry).resjunk = false;
+
+        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+    }
+
+    // Close the relation
+    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    Ok(target_list)
 }
 
 pub unsafe fn create_cstring(s: &str) -> *mut i8 {
@@ -273,7 +366,7 @@ pub unsafe fn execute_plan_tree_structured(
                         let c_str = std::ffi::CStr::from_ptr((*target_entry).resname);
                         c_str.to_string_lossy().to_string()
                     } else {
-                        format!("column_{}", i + 1)
+                        "result".to_string()
                     };
 
                     // Get column type from the expression
@@ -290,6 +383,7 @@ pub unsafe fn execute_plan_tree_structured(
                         name: col_name,
                         type_oid,
                         type_mod,
+                        attr_number: i as pg_sys::AttrNumber + 1, // 1-based attribute numbers
                     });
                 }
             }
@@ -304,8 +398,17 @@ pub unsafe fn execute_plan_tree_structured(
                     let expr = (*target_entry).expr;
                     if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Const {
                         let const_node = expr as *mut pg_sys::Const;
-                        row_values.push((*const_node).constvalue);
-                        row_nulls.push((*const_node).constisnull);
+                        let is_null = (*const_node).constisnull;
+
+                        if !is_null && (*const_node).consttype == pg_sys::INT4OID {
+                            // Extract the actual value and create a fresh datum
+                            let int_value = (*const_node).constvalue.value() as i32;
+                            row_values.push(pg_sys::Datum::from(int_value));
+                        } else {
+                            // For other types or null values, use the original datum
+                            row_values.push((*const_node).constvalue);
+                        }
+                        row_nulls.push(is_null);
                     } else {
                         row_values.push(pg_sys::Datum::null());
                         row_nulls.push(true);
@@ -319,8 +422,123 @@ pub unsafe fn execute_plan_tree_structured(
                 nulls: vec![row_nulls],
             })
         }
+        pg_sys::NodeTag::T_SeqScan => {
+            let seqscan_node = plan as *mut pg_sys::SeqScan;
+            let target_list = (*seqscan_node).scan.plan.targetlist;
+            let relation_oid = (*seqscan_node).scan.scanrelid;
+
+            if target_list.is_null() {
+                return Ok(ExecutionResult {
+                    columns: vec![],
+                    rows: vec![],
+                    nulls: vec![],
+                });
+            }
+
+            // Extract column information from target list
+            let mut columns = Vec::new();
+            let list_length = (*target_list).length;
+
+            for i in 0..list_length {
+                let target_entry = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+                if !target_entry.is_null() {
+                    let col_name = if !(*target_entry).resname.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr((*target_entry).resname);
+                        c_str.to_string_lossy().to_string()
+                    } else {
+                        "result".to_string()
+                    };
+
+                    // Get column type from the Var node
+                    let expr = (*target_entry).expr;
+                    let (type_oid, type_mod) =
+                        if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
+                            let var_node = expr as *mut pg_sys::Var;
+                            ((*var_node).vartype, (*var_node).vartypmod)
+                        } else {
+                            (pg_sys::TEXTOID, -1) // Default to text
+                        };
+
+                    columns.push(ColumnInfo {
+                        name: col_name,
+                        type_oid,
+                        type_mod,
+                        attr_number: i as pg_sys::AttrNumber + 1, // 1-based attribute numbers
+                    });
+                }
+            }
+
+            // Execute the actual table scan using PostgreSQL's executor
+            let rows_and_nulls = execute_table_scan(relation_oid.into(), &columns)?;
+
+            Ok(ExecutionResult {
+                columns,
+                rows: rows_and_nulls.0,
+                nulls: rows_and_nulls.1,
+            })
+        }
         _ => Err("Unsupported plan node type for structured execution".into()),
     }
+}
+
+unsafe fn execute_table_scan(
+    relation_oid: pg_sys::Oid,
+    columns: &[ColumnInfo],
+) -> Result<(Vec<Vec<pg_sys::Datum>>, Vec<Vec<bool>>), Box<dyn std::error::Error + Send + Sync>> {
+    // Open the relation
+    let relation = pg_sys::relation_open(relation_oid, pg_sys::AccessShareLock as i32);
+    if relation.is_null() {
+        return Err(format!("Could not open relation with OID {}", relation_oid).into());
+    }
+
+    // Start a table scan
+    let scan = pg_sys::table_beginscan(
+        relation,
+        pg_sys::GetActiveSnapshot(),
+        0,
+        std::ptr::null_mut(),
+    );
+    if scan.is_null() {
+        pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+        return Err("Could not start table scan".into());
+    }
+
+    let mut rows = Vec::new();
+    let mut nulls = Vec::new();
+
+    // Scan all tuples
+    loop {
+        let tuple = pg_sys::heap_getnext(scan, pg_sys::ScanDirection::ForwardScanDirection);
+        if tuple.is_null() {
+            break; // No more tuples
+        }
+
+        let mut row_values = Vec::new();
+        let mut row_nulls = Vec::new();
+
+        // Extract values for each column
+        for col in columns {
+            let mut is_null = false;
+            let datum = pg_sys::heap_getattr(
+                tuple,
+                col.attr_number.into(),
+                (*relation).rd_att,
+                &mut is_null,
+            );
+
+            row_values.push(datum);
+            row_nulls.push(is_null);
+        }
+
+        rows.push(row_values);
+        nulls.push(row_nulls);
+    }
+
+    // Clean up
+    pg_sys::table_endscan(scan);
+    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    Ok((rows, nulls))
 }
 
 // Schema extraction utilities for Substrait Plans
