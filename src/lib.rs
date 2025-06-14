@@ -1023,22 +1023,70 @@ mod tests {
     #[pg_test]
     fn test_from_substrait_with_minimal_protobuf() {
         // Test from_substrait_safe with a minimal valid protobuf
-        // We'll create the simplest possible Substrait Plan protobuf
+        // This is the equivalent of "SELECT 1" - a project of a literal expression
 
-        // For now, test that we can call the function without crashing
-        // even if the protobuf is invalid - this tests our error handling
+        use prost::Message;
+        use substrait::proto::Plan;
 
-        // Test with empty bytea (should handle gracefully)
-        let result = Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait_safe('\\x'::bytea)");
+        // Create the minimal Substrait plan: SELECT 1
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["column_1"],
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 1
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
 
-        // Empty bytea should be handled without crashing
-        // It may return 0 rows or an error, both are acceptable
-        if result.is_ok() {
-            assert_eq!(result.unwrap(), Some(0)); // Should return 0 rows for empty input
-        } else {
-            // Error is also acceptable for empty/invalid input
-            assert!(true, "Function correctly errors on empty input");
+        // Parse JSON to Plan struct
+        let plan: Plan = match serde_json::from_str(json_plan) {
+            Ok(p) => p,
+            Err(e) => {
+                panic!("Failed to parse minimal plan JSON: {}", e);
+            }
+        };
+
+        // Encode Plan to protobuf bytes
+        let mut protobuf_bytes = Vec::new();
+        if let Err(e) = plan.encode(&mut protobuf_bytes) {
+            panic!("Failed to encode minimal plan to protobuf: {}", e);
         }
+
+        // Convert bytes to hex string for SQL
+        let hex_string = protobuf_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        // Test with the minimal valid protobuf data (SELECT 1 equivalent)
+        let query = format!(
+            "SELECT COUNT(*) FROM from_substrait_safe('\\x{}'::bytea)",
+            hex_string
+        );
+        let result = Spi::get_one::<i64>(&query);
+
+        // The function should handle this minimal valid plan gracefully
+        assert!(
+            result.is_ok(),
+            "from_substrait_safe should handle minimal valid protobuf data (SELECT 1 equivalent) without crashing"
+        );
+
+        // We expect at least 1 row to be returned for SELECT 1
+        let count = result.unwrap().unwrap_or(0);
+        assert!(
+            count >= 1,
+            "SELECT 1 equivalent should return at least 1 row, got {}",
+            count
+        );
     }
 
     #[pg_test]
