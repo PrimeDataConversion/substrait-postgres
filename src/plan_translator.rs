@@ -334,6 +334,7 @@ pub struct SubstraitSchema {
 #[derive(Debug, Clone)]
 pub struct SubstraitType {
     pub type_name: String,
+    #[allow(dead_code)]
     pub postgres_type_oid: pg_sys::Oid,
     pub nullable: bool,
 }
