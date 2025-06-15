@@ -1,0 +1,1668 @@
+# Original SQL Query:
+# SELECT
+#     cntrycode,
+#     count(*) AS numcust,
+#     sum(c_acctbal) AS totacctbal
+# FROM (
+# SELECT
+#         substring(c_phone FROM 1 FOR 2) AS cntrycode,
+#         c_acctbal
+#     FROM
+#         customer
+#     WHERE
+#         substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
+#         AND c_acctbal > (
+# SELECT
+#                 avg(c_acctbal)
+#             FROM
+#                 customer
+#             WHERE
+#                 c_acctbal > 0.00
+#                 AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))
+#             AND NOT EXISTS (
+# SELECT
+#                     *
+#                 FROM
+#                     orders
+#                 WHERE
+#                     o_custkey = c_custkey)) AS custsale
+# GROUP BY
+#     cntrycode
+# ORDER BY
+#     cntrycode;
+#
+
+{
+  "extensionUris": [{
+    "extensionUriAnchor": 5,
+    "uri": "/functions_aggregate_generic.yaml"
+  }, {
+    "extensionUriAnchor": 4,
+    "uri": "/functions_arithmetic.yaml"
+  }, {
+    "extensionUriAnchor": 1,
+    "uri": "/functions_boolean.yaml"
+  }, {
+    "extensionUriAnchor": 3,
+    "uri": "/functions_string.yaml"
+  }, {
+    "extensionUriAnchor": 2,
+    "uri": "/functions_comparison.yaml"
+  }],
+  "extensions": [{
+    "extensionFunction": {
+      "extensionUriReference": 1,
+      "functionAnchor": 1,
+      "name": "and:bool"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 1,
+      "functionAnchor": 2,
+      "name": "or:bool"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 2,
+      "functionAnchor": 3,
+      "name": "equal:any_any"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 3,
+      "functionAnchor": 4,
+      "name": "substring:str_i32_i32"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 2,
+      "functionAnchor": 5,
+      "name": "gt:any_any"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 4,
+      "functionAnchor": 6,
+      "name": "avg:fp64"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 1,
+      "functionAnchor": 7,
+      "name": "not:bool"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 5,
+      "functionAnchor": 8,
+      "name": "count:"
+    }
+  }, {
+    "extensionFunction": {
+      "extensionUriReference": 4,
+      "functionAnchor": 9,
+      "name": "sum:fp64"
+    }
+  }],
+  "relations": [{
+    "root": {
+      "input": {
+        "sort": {
+          "common": {
+            "direct": {
+            }
+          },
+          "input": {
+            "aggregate": {
+              "common": {
+                "direct": {
+                }
+              },
+              "input": {
+                "project": {
+                  "common": {
+                    "emit": {
+                      "outputMapping": [8, 9]
+                    }
+                  },
+                  "input": {
+                    "filter": {
+                      "common": {
+                        "direct": {
+                        }
+                      },
+                      "input": {
+                        "read": {
+                          "common": {
+                            "direct": {
+                            }
+                          },
+                          "baseSchema": {
+                            "names": ["C_CUSTKEY", "C_NAME", "C_ADDRESS", "C_NATIONKEY", "C_PHONE", "C_ACCTBAL", "C_MKTSEGMENT", "C_COMMENT"],
+                            "struct": {
+                              "types": [{
+                                "i32": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "i32": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "fp64": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }, {
+                                "string": {
+                                  "typeVariationReference": 0,
+                                  "nullability": "NULLABILITY_NULLABLE"
+                                }
+                              }],
+                              "typeVariationReference": 0,
+                              "nullability": "NULLABILITY_REQUIRED"
+                            }
+                          },
+                          "namedTable": {
+                            "names": ["CUSTOMER"]
+                          }
+                        }
+                      },
+                      "condition": {
+                        "scalarFunction": {
+                          "functionReference": 1,
+                          "args": [],
+                          "outputType": {
+                            "bool": {
+                              "typeVariationReference": 0,
+                              "nullability": "NULLABILITY_NULLABLE"
+                            }
+                          },
+                          "arguments": [{
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 2,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_NULLABLE"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "13",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "31",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "23",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "29",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "30",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "18",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "scalarFunction": {
+                                      "functionReference": 3,
+                                      "args": [],
+                                      "outputType": {
+                                        "bool": {
+                                          "typeVariationReference": 0,
+                                          "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                      },
+                                      "arguments": [{
+                                        "value": {
+                                          "scalarFunction": {
+                                            "functionReference": 4,
+                                            "args": [],
+                                            "outputType": {
+                                              "string": {
+                                                "typeVariationReference": 0,
+                                                "nullability": "NULLABILITY_NULLABLE"
+                                              }
+                                            },
+                                            "arguments": [{
+                                              "value": {
+                                                "selection": {
+                                                  "directReference": {
+                                                    "structField": {
+                                                      "field": 4
+                                                    }
+                                                  },
+                                                  "rootReference": {
+                                                  }
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 1,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }, {
+                                              "value": {
+                                                "literal": {
+                                                  "i32": 2,
+                                                  "nullable": false,
+                                                  "typeVariationReference": 0
+                                                }
+                                              }
+                                            }],
+                                            "options": []
+                                          }
+                                        }
+                                      }, {
+                                        "value": {
+                                          "literal": {
+                                            "string": "17",
+                                            "nullable": false,
+                                            "typeVariationReference": 0
+                                          }
+                                        }
+                                      }],
+                                      "options": []
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 5,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_NULLABLE"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "selection": {
+                                      "directReference": {
+                                        "structField": {
+                                          "field": 5
+                                        }
+                                      },
+                                      "rootReference": {
+                                      }
+                                    }
+                                  }
+                                }, {
+                                  "value": {
+                                    "subquery": {
+                                      "scalar": {
+                                        "input": {
+                                          "aggregate": {
+                                            "common": {
+                                              "direct": {
+                                              }
+                                            },
+                                            "input": {
+                                              "project": {
+                                                "common": {
+                                                  "emit": {
+                                                    "outputMapping": [8]
+                                                  }
+                                                },
+                                                "input": {
+                                                  "filter": {
+                                                    "common": {
+                                                      "direct": {
+                                                      }
+                                                    },
+                                                    "input": {
+                                                      "read": {
+                                                        "common": {
+                                                          "direct": {
+                                                          }
+                                                        },
+                                                        "baseSchema": {
+                                                          "names": ["C_CUSTKEY", "C_NAME", "C_ADDRESS", "C_NATIONKEY", "C_PHONE", "C_ACCTBAL", "C_MKTSEGMENT", "C_COMMENT"],
+                                                          "struct": {
+                                                            "types": [{
+                                                              "i32": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "i32": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "fp64": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }, {
+                                                              "string": {
+                                                                "typeVariationReference": 0,
+                                                                "nullability": "NULLABILITY_NULLABLE"
+                                                              }
+                                                            }],
+                                                            "typeVariationReference": 0,
+                                                            "nullability": "NULLABILITY_REQUIRED"
+                                                          }
+                                                        },
+                                                        "namedTable": {
+                                                          "names": ["CUSTOMER"]
+                                                        }
+                                                      }
+                                                    },
+                                                    "condition": {
+                                                      "scalarFunction": {
+                                                        "functionReference": 1,
+                                                        "args": [],
+                                                        "outputType": {
+                                                          "bool": {
+                                                            "typeVariationReference": 0,
+                                                            "nullability": "NULLABILITY_NULLABLE"
+                                                          }
+                                                        },
+                                                        "arguments": [{
+                                                          "value": {
+                                                            "scalarFunction": {
+                                                              "functionReference": 5,
+                                                              "args": [],
+                                                              "outputType": {
+                                                                "bool": {
+                                                                  "typeVariationReference": 0,
+                                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                                }
+                                                              },
+                                                              "arguments": [{
+                                                                "value": {
+                                                                  "selection": {
+                                                                    "directReference": {
+                                                                      "structField": {
+                                                                        "field": 5
+                                                                      }
+                                                                    },
+                                                                    "rootReference": {
+                                                                    }
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "cast": {
+                                                                    "type": {
+                                                                      "fp64": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_REQUIRED"
+                                                                      }
+                                                                    },
+                                                                    "input": {
+                                                                      "literal": {
+                                                                        "decimal": {
+                                                                          "value": "AAAAAAAAAAAAAAAAAAAAAA==",
+                                                                          "precision": 3,
+                                                                          "scale": 2
+                                                                        },
+                                                                        "nullable": false,
+                                                                        "typeVariationReference": 0
+                                                                      }
+                                                                    },
+                                                                    "failureBehavior": "FAILURE_BEHAVIOR_THROW_EXCEPTION"
+                                                                  }
+                                                                }
+                                                              }],
+                                                              "options": []
+                                                            }
+                                                          }
+                                                        }, {
+                                                          "value": {
+                                                            "scalarFunction": {
+                                                              "functionReference": 2,
+                                                              "args": [],
+                                                              "outputType": {
+                                                                "bool": {
+                                                                  "typeVariationReference": 0,
+                                                                  "nullability": "NULLABILITY_NULLABLE"
+                                                                }
+                                                              },
+                                                              "arguments": [{
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "13",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "31",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "23",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "29",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "30",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "18",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }, {
+                                                                "value": {
+                                                                  "scalarFunction": {
+                                                                    "functionReference": 3,
+                                                                    "args": [],
+                                                                    "outputType": {
+                                                                      "bool": {
+                                                                        "typeVariationReference": 0,
+                                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                                      }
+                                                                    },
+                                                                    "arguments": [{
+                                                                      "value": {
+                                                                        "scalarFunction": {
+                                                                          "functionReference": 4,
+                                                                          "args": [],
+                                                                          "outputType": {
+                                                                            "string": {
+                                                                              "typeVariationReference": 0,
+                                                                              "nullability": "NULLABILITY_NULLABLE"
+                                                                            }
+                                                                          },
+                                                                          "arguments": [{
+                                                                            "value": {
+                                                                              "selection": {
+                                                                                "directReference": {
+                                                                                  "structField": {
+                                                                                    "field": 4
+                                                                                  }
+                                                                                },
+                                                                                "rootReference": {
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 1,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }, {
+                                                                            "value": {
+                                                                              "literal": {
+                                                                                "i32": 2,
+                                                                                "nullable": false,
+                                                                                "typeVariationReference": 0
+                                                                              }
+                                                                            }
+                                                                          }],
+                                                                          "options": []
+                                                                        }
+                                                                      }
+                                                                    }, {
+                                                                      "value": {
+                                                                        "literal": {
+                                                                          "string": "17",
+                                                                          "nullable": false,
+                                                                          "typeVariationReference": 0
+                                                                        }
+                                                                      }
+                                                                    }],
+                                                                    "options": []
+                                                                  }
+                                                                }
+                                                              }],
+                                                              "options": []
+                                                            }
+                                                          }
+                                                        }],
+                                                        "options": []
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "expressions": [{
+                                                  "selection": {
+                                                    "directReference": {
+                                                      "structField": {
+                                                        "field": 5
+                                                      }
+                                                    },
+                                                    "rootReference": {
+                                                    }
+                                                  }
+                                                }]
+                                              }
+                                            },
+                                            "groupings": [{
+                                              "groupingExpressions": [],
+                                              "expressionReferences": []
+                                            }],
+                                            "measures": [{
+                                              "measure": {
+                                                "functionReference": 6,
+                                                "args": [],
+                                                "sorts": [],
+                                                "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
+                                                "outputType": {
+                                                  "fp64": {
+                                                    "typeVariationReference": 0,
+                                                    "nullability": "NULLABILITY_NULLABLE"
+                                                  }
+                                                },
+                                                "invocation": "AGGREGATION_INVOCATION_ALL",
+                                                "arguments": [{
+                                                  "value": {
+                                                    "selection": {
+                                                      "directReference": {
+                                                        "structField": {
+                                                          "field": 0
+                                                        }
+                                                      },
+                                                      "rootReference": {
+                                                      }
+                                                    }
+                                                  }
+                                                }],
+                                                "options": []
+                                              }
+                                            }],
+                                            "groupingExpressions": []
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }, {
+                            "value": {
+                              "scalarFunction": {
+                                "functionReference": 7,
+                                "args": [],
+                                "outputType": {
+                                  "bool": {
+                                    "typeVariationReference": 0,
+                                    "nullability": "NULLABILITY_REQUIRED"
+                                  }
+                                },
+                                "arguments": [{
+                                  "value": {
+                                    "subquery": {
+                                      "setPredicate": {
+                                        "predicateOp": "PREDICATE_OP_EXISTS",
+                                        "tuples": {
+                                          "filter": {
+                                            "common": {
+                                              "direct": {
+                                              }
+                                            },
+                                            "input": {
+                                              "read": {
+                                                "common": {
+                                                  "direct": {
+                                                  }
+                                                },
+                                                "baseSchema": {
+                                                  "names": ["O_ORDERKEY", "O_CUSTKEY", "O_ORDERSTATUS", "O_TOTALPRICE", "O_ORDERDATE", "O_ORDERPRIORITY", "O_CLERK", "O_SHIPPRIORITY", "O_COMMENT"],
+                                                  "struct": {
+                                                    "types": [{
+                                                      "i32": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "i32": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "fp64": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "i32": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }, {
+                                                      "string": {
+                                                        "typeVariationReference": 0,
+                                                        "nullability": "NULLABILITY_NULLABLE"
+                                                      }
+                                                    }],
+                                                    "typeVariationReference": 0,
+                                                    "nullability": "NULLABILITY_REQUIRED"
+                                                  }
+                                                },
+                                                "namedTable": {
+                                                  "names": ["ORDERS"]
+                                                }
+                                              }
+                                            },
+                                            "condition": {
+                                              "scalarFunction": {
+                                                "functionReference": 3,
+                                                "args": [],
+                                                "outputType": {
+                                                  "bool": {
+                                                    "typeVariationReference": 0,
+                                                    "nullability": "NULLABILITY_NULLABLE"
+                                                  }
+                                                },
+                                                "arguments": [{
+                                                  "value": {
+                                                    "selection": {
+                                                      "directReference": {
+                                                        "structField": {
+                                                          "field": 1
+                                                        }
+                                                      },
+                                                      "rootReference": {
+                                                      }
+                                                    }
+                                                  }
+                                                }, {
+                                                  "value": {
+                                                    "selection": {
+                                                      "directReference": {
+                                                        "structField": {
+                                                          "field": 0
+                                                        }
+                                                      },
+                                                      "outerReference": {
+                                                        "stepsOut": 1
+                                                      }
+                                                    }
+                                                  }
+                                                }],
+                                                "options": []
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }],
+                                "options": []
+                              }
+                            }
+                          }],
+                          "options": []
+                        }
+                      }
+                    }
+                  },
+                  "expressions": [{
+                    "scalarFunction": {
+                      "functionReference": 4,
+                      "args": [],
+                      "outputType": {
+                        "string": {
+                          "typeVariationReference": 0,
+                          "nullability": "NULLABILITY_NULLABLE"
+                        }
+                      },
+                      "arguments": [{
+                        "value": {
+                          "selection": {
+                            "directReference": {
+                              "structField": {
+                                "field": 4
+                              }
+                            },
+                            "rootReference": {
+                            }
+                          }
+                        }
+                      }, {
+                        "value": {
+                          "literal": {
+                            "i32": 1,
+                            "nullable": false,
+                            "typeVariationReference": 0
+                          }
+                        }
+                      }, {
+                        "value": {
+                          "literal": {
+                            "i32": 2,
+                            "nullable": false,
+                            "typeVariationReference": 0
+                          }
+                        }
+                      }],
+                      "options": []
+                    }
+                  }, {
+                    "selection": {
+                      "directReference": {
+                        "structField": {
+                          "field": 5
+                        }
+                      },
+                      "rootReference": {
+                      }
+                    }
+                  }]
+                }
+              },
+              "groupings": [{
+                "groupingExpressions": [{
+                  "selection": {
+                    "directReference": {
+                      "structField": {
+                        "field": 0
+                      }
+                    },
+                    "rootReference": {
+                    }
+                  }
+                }],
+                "expressionReferences": []
+              }],
+              "measures": [{
+                "measure": {
+                  "functionReference": 8,
+                  "args": [],
+                  "sorts": [],
+                  "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
+                  "outputType": {
+                    "i64": {
+                      "typeVariationReference": 0,
+                      "nullability": "NULLABILITY_REQUIRED"
+                    }
+                  },
+                  "invocation": "AGGREGATION_INVOCATION_ALL",
+                  "arguments": [],
+                  "options": []
+                }
+              }, {
+                "measure": {
+                  "functionReference": 9,
+                  "args": [],
+                  "sorts": [],
+                  "phase": "AGGREGATION_PHASE_INITIAL_TO_RESULT",
+                  "outputType": {
+                    "fp64": {
+                      "typeVariationReference": 0,
+                      "nullability": "NULLABILITY_NULLABLE"
+                    }
+                  },
+                  "invocation": "AGGREGATION_INVOCATION_ALL",
+                  "arguments": [{
+                    "value": {
+                      "selection": {
+                        "directReference": {
+                          "structField": {
+                            "field": 1
+                          }
+                        },
+                        "rootReference": {
+                        }
+                      }
+                    }
+                  }],
+                  "options": []
+                }
+              }],
+              "groupingExpressions": []
+            }
+          },
+          "sorts": [{
+            "expr": {
+              "selection": {
+                "directReference": {
+                  "structField": {
+                    "field": 0
+                  }
+                },
+                "rootReference": {
+                }
+              }
+            },
+            "direction": "SORT_DIRECTION_ASC_NULLS_LAST"
+          }]
+        }
+      },
+      "names": ["CNTRYCODE", "NUMCUST", "TOTACCTBAL"]
+    }
+  }],
+  "expectedTypeUrls": [],
+  "version": {
+    "majorNumber": 0,
+    "minorNumber": 69,
+    "patchNumber": 0,
+    "gitHash": "",
+    "producer": "isthmus"
+  },
+  "parameterBindings": []
+}
