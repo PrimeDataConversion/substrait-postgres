@@ -400,14 +400,9 @@ pub unsafe fn execute_plan_tree_structured(
                         let const_node = expr as *mut pg_sys::Const;
                         let is_null = (*const_node).constisnull;
 
-                        if !is_null && (*const_node).consttype == pg_sys::INT4OID {
-                            // Extract the actual value and create a fresh datum
-                            let int_value = (*const_node).constvalue.value() as i32;
-                            row_values.push(pg_sys::Datum::from(int_value));
-                        } else {
-                            // For other types or null values, use the original datum
-                            row_values.push((*const_node).constvalue);
-                        }
+                        // Don't reprocess datums - just pass them through directly
+                        // The SRF handler will do the final extraction in the correct memory context
+                        row_values.push((*const_node).constvalue);
                         row_nulls.push(is_null);
                     } else {
                         row_values.push(pg_sys::Datum::null());

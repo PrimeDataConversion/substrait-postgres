@@ -19,7 +19,8 @@ fn from_substrait_safe(plan_bytes: &[u8]) -> TableIterator<'static, (name!(resul
             // Extract schema from the plan
             let _schema = match extract_plan_output_schema(&plan) {
                 Ok(schema) => schema,
-                Err(e) => {
+                Err(_e) => {
+                    // TODO: Instead of returning a default message, return an error.  The contract for extract_plan_output_schema should be to return a schema unless the plan is invalid in which case it should throw an error which we should pass along.
                     // Create simple default schema
                     plan_translator::SubstraitSchema {
                         column_names: vec!["result".to_string()],
@@ -68,7 +69,7 @@ pub extern "C" fn pg_finfo_from_substrait_wrapper() -> &'static pg_sys::Pg_finfo
 }
 
 #[pg_extern(
-    sql = "CREATE OR REPLACE FUNCTION from_substrait(plan_bytes bytea) RETURNS TABLE(result int) AS 'MODULE_PATHNAME', 'from_substrait_wrapper' LANGUAGE c IMMUTABLE STRICT;"
+    sql = "CREATE OR REPLACE FUNCTION from_substrait(plan_bytes bytea) RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'from_substrait_wrapper' LANGUAGE c IMMUTABLE STRICT;"
 )]
 fn from_substrait_placeholder() {}
 
@@ -86,7 +87,8 @@ fn from_substrait_json_safe(json_plan: &str) -> TableIterator<'static, (name!(re
     // Extract schema from the plan
     let _schema = match extract_plan_output_schema(&plan) {
         Ok(schema) => schema,
-        Err(e) => {
+        Err(_e) => {
+            // TODO: Instead of returning a default message, return an error.  The contract for extract_plan_output_schema should be to return a schema unless the plan is invalid in which case it should throw an error which we should pass along.
             // Create simple default schema
             plan_translator::SubstraitSchema {
                 column_names: vec!["result".to_string()],
@@ -106,7 +108,7 @@ fn from_substrait_json_safe(json_plan: &str) -> TableIterator<'static, (name!(re
 }
 
 #[pg_extern(
-    sql = "CREATE OR REPLACE FUNCTION from_substrait_json(json_plan text) RETURNS TABLE(result int) AS 'MODULE_PATHNAME', 'from_substrait_json_safe_wrapper' LANGUAGE c IMMUTABLE STRICT;"
+    sql = "CREATE OR REPLACE FUNCTION from_substrait_json(json_plan text) RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'from_substrait_json_safe_wrapper' LANGUAGE c IMMUTABLE STRICT;"
 )]
 fn from_substrait_json_placeholder() {}
 
@@ -274,50 +276,13 @@ fn extract_literal_from_plan(plan: &Plan) -> Option<i32> {
 }
 
 unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan) -> pg_sys::Datum {
-    // For now, extract the literal value from the plan and use the working SRF pattern
-    // This bypasses the complex plan execution path that has datum corruption issues
-
-    // Try to extract the literal value from the plan
-    let literal_value = extract_literal_from_plan(&plan).unwrap_or(123);
-
-    // Use the exact same working pattern as test_srf_one_integer
-    let func_ctx = pg_sys::init_MultiFuncCall(fcinfo);
-
-    if (*func_ctx).call_cntr == 0 {
-        // First call - set up for one integer column
-        let memory_ctx = (*func_ctx).multi_call_memory_ctx;
-        let old_ctx = pg_sys::MemoryContextSwitchTo(memory_ctx);
-
-        let tupdesc = pg_sys::CreateTemplateTupleDesc(1);
-        let col_name = create_cstring("result");
-        pg_sys::TupleDescInitEntry(tupdesc, 1, col_name, pg_sys::INT4OID, -1, 0);
-        pg_sys::BlessTupleDesc(tupdesc);
-        (*func_ctx).tuple_desc = tupdesc;
-        (*func_ctx).max_calls = 1; // One row
-
-        pg_sys::MemoryContextSwitchTo(old_ctx);
-    }
-
-    if (*func_ctx).call_cntr < (*func_ctx).max_calls {
-        // Return a single row with the literal value
-        let old_ctx = pg_sys::MemoryContextSwitchTo((*func_ctx).multi_call_memory_ctx);
-
-        let values_array =
-            pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
-        let nulls_array = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
-
-        *values_array = pg_sys::Datum::from(literal_value);
-        *nulls_array = false;
-
-        let tuple = pg_sys::heap_form_tuple((*func_ctx).tuple_desc, values_array, nulls_array);
-        let result = pg_sys::Datum::from(tuple);
-
-        pg_sys::MemoryContextSwitchTo(old_ctx);
-        (*func_ctx).call_cntr += 1;
-        result
-    } else {
-        pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
-        pg_sys::Datum::null()
+    // Execute the plan and get results
+    match execute_substrait_plan(plan) {
+        Ok(result_data) => {
+            // Pass results to SRF execution
+            execute_results_as_srf(fcinfo, result_data)
+        }
+        Err(_) => pg_sys::Datum::null(),
     }
 }
 
@@ -332,17 +297,21 @@ unsafe fn execute_results_as_srf(
         let memory_ctx = (*func_ctx).multi_call_memory_ctx;
         let old_ctx = pg_sys::MemoryContextSwitchTo(memory_ctx);
 
-        // Build tuple descriptor that matches the SQL function signature exactly
-        let tupdesc = pg_sys::CreateTemplateTupleDesc(1); // Always 1 column for our case
-        let col_name = create_cstring("result"); // Must match SQL function signature
-        pg_sys::TupleDescInitEntry(
-            tupdesc,
-            1,
-            col_name,
-            pg_sys::INT4OID, // Hard-code to INT4 to match function signature
-            -1,
-            0,
-        );
+        // Build tuple descriptor dynamically based on the plan's output schema
+        let num_columns = results.columns.len();
+        let tupdesc = pg_sys::CreateTemplateTupleDesc(num_columns as i32);
+
+        for (i, column) in results.columns.iter().enumerate() {
+            let col_name = create_cstring(&column.name);
+            pg_sys::TupleDescInitEntry(
+                tupdesc,
+                (i + 1) as pg_sys::AttrNumber, // 1-based indexing
+                col_name,
+                column.type_oid,
+                column.type_mod,
+                0,
+            );
+        }
         pg_sys::BlessTupleDesc(tupdesc);
         (*func_ctx).tuple_desc = tupdesc;
 
@@ -370,35 +339,30 @@ unsafe fn execute_results_as_srf(
             let row_values = &results_ref.rows[row_idx];
             let row_nulls = &results_ref.nulls[row_idx];
 
-            // Use the same pattern as the working simple SRF - always create a fresh datum in the SRF context
+            // Handle dynamic multi-column results
             let old_ctx = pg_sys::MemoryContextSwitchTo((*func_ctx).multi_call_memory_ctx);
 
-            if row_values.len() == 1 {
-                // Debug: hardcode the value to 123 to test if the issue is in the SRF layer
-                let int_value = 123i32; // Directly hardcode instead of extracting from row_values
-                let is_null = false; // Hardcode as well
+            let num_columns = row_values.len();
 
-                let values_array =
-                    pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
-                let nulls_array = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
+            // Allocate arrays for the tuple formation
+            let values_array = pg_sys::palloc(num_columns * std::mem::size_of::<pg_sys::Datum>())
+                as *mut pg_sys::Datum;
+            let nulls_array =
+                pg_sys::palloc(num_columns * std::mem::size_of::<bool>()) as *mut bool;
 
-                // Create a fresh datum in the proper memory context, exactly like the working test function
-                *values_array = pg_sys::Datum::from(int_value);
-                *nulls_array = is_null;
-
-                let tuple =
-                    pg_sys::heap_form_tuple((*func_ctx).tuple_desc, values_array, nulls_array);
-                let result = pg_sys::Datum::from(tuple);
-
-                pg_sys::MemoryContextSwitchTo(old_ctx);
-                (*func_ctx).call_cntr += 1;
-                result
-            } else {
-                // Handle multi-column case if needed
-                pg_sys::MemoryContextSwitchTo(old_ctx);
-                (*func_ctx).call_cntr += 1;
-                pg_sys::Datum::null()
+            // Copy the row data into the arrays
+            for i in 0..num_columns {
+                *values_array.offset(i as isize) = row_values[i];
+                *nulls_array.offset(i as isize) = row_nulls[i];
             }
+
+            // Create the tuple with the dynamic schema
+            let tuple = pg_sys::heap_form_tuple((*func_ctx).tuple_desc, values_array, nulls_array);
+            let result = pg_sys::HeapTupleGetDatum(tuple);
+
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            (*func_ctx).call_cntr += 1;
+            result
         } else {
             pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
             pg_sys::Datum::null()
@@ -661,8 +625,9 @@ mod tests {
         }
 
         // Test with the real execution function (not the safe mock version)
+        // Since the function returns SETOF RECORD, we need to specify the column definition
         let query = format!(
-            "SELECT COUNT(*) FROM from_substrait('{}'::bytea)",
+            "SELECT COUNT(*) FROM from_substrait('{}'::bytea) AS t(test_value int)",
             hex_string
         );
         let result = Spi::get_one::<i64>(&query);
@@ -683,7 +648,7 @@ mod tests {
 
         // Now test that we can actually get the value
         let value_query = format!(
-            "SELECT result FROM from_substrait('{}'::bytea) LIMIT 1",
+            "SELECT test_value FROM from_substrait('{}'::bytea) AS t(test_value int) LIMIT 1",
             hex_string
         );
         let value_result = Spi::get_one::<i32>(&value_query);
