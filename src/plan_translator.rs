@@ -167,9 +167,17 @@ unsafe fn convert_expression_to_target_entry(
 pub unsafe fn create_int4_const(
     value: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Look up the int4 type OID dynamically instead of using the constant
+    let type_name = create_cstring("int4");
+    let type_oid = pg_sys::TypenameGetTypid(type_name);
+
+    if type_oid == pg_sys::InvalidOid {
+        return Err("Could not find int4 type OID".into());
+    }
+
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
     (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = pg_sys::INT4OID;
+    (*const_node).consttype = type_oid;
     (*const_node).consttypmod = -1;
     (*const_node).constcollid = pg_sys::InvalidOid;
     (*const_node).constlen = 4;
@@ -183,9 +191,17 @@ pub unsafe fn create_int4_const(
 pub unsafe fn create_int8_const(
     value: i64,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Look up the int8 type OID dynamically instead of using the constant
+    let type_name = create_cstring("int8");
+    let type_oid = pg_sys::TypenameGetTypid(type_name);
+
+    if type_oid == pg_sys::InvalidOid {
+        return Err("Could not find int8 type OID".into());
+    }
+
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
     (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = pg_sys::INT8OID;
+    (*const_node).consttype = type_oid;
     (*const_node).consttypmod = -1;
     (*const_node).constcollid = pg_sys::InvalidOid;
     (*const_node).constlen = 8;
@@ -199,12 +215,20 @@ pub unsafe fn create_int8_const(
 pub unsafe fn create_text_const(
     value: &str,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Look up the text type OID dynamically instead of using the constant
+    let type_name = create_cstring("text");
+    let type_oid = pg_sys::TypenameGetTypid(type_name);
+
+    if type_oid == pg_sys::InvalidOid {
+        return Err("Could not find text type OID".into());
+    }
+
     let text_datum =
         pg_sys::cstring_to_text_with_len(value.as_ptr() as *const i8, value.len() as i32);
 
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
     (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = pg_sys::TEXTOID;
+    (*const_node).consttype = type_oid;
     (*const_node).consttypmod = -1;
     (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
     (*const_node).constlen = -1;
@@ -374,9 +398,20 @@ pub unsafe fn execute_plan_tree_structured(
                     let (type_oid, type_mod) =
                         if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Const {
                             let const_node = expr as *mut pg_sys::Const;
-                            ((*const_node).consttype, (*const_node).consttypmod)
+                            let const_type = (*const_node).consttype;
+                            // Fail if we have an invalid OID
+                            if const_type == pg_sys::InvalidOid || const_type == 0.into() {
+                                return Err(format!(
+                                    "Invalid type OID {} for const expression",
+                                    const_type
+                                )
+                                .into());
+                            }
+                            (const_type, (*const_node).consttypmod)
                         } else {
-                            (pg_sys::TEXTOID, -1) // Default to text
+                            return Err(
+                                "Expected const expression but found different node type".into()
+                            );
                         };
 
                     columns.push(ColumnInfo {
@@ -446,13 +481,23 @@ pub unsafe fn execute_plan_tree_structured(
 
                     // Get column type from the Var node
                     let expr = (*target_entry).expr;
-                    let (type_oid, type_mod) =
-                        if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
-                            let var_node = expr as *mut pg_sys::Var;
-                            ((*var_node).vartype, (*var_node).vartypmod)
-                        } else {
-                            (pg_sys::TEXTOID, -1) // Default to text
-                        };
+                    let (type_oid, type_mod) = if !expr.is_null()
+                        && (*expr).type_ == pg_sys::NodeTag::T_Var
+                    {
+                        let var_node = expr as *mut pg_sys::Var;
+                        let var_type = (*var_node).vartype;
+                        // Fail if we have an invalid OID
+                        if var_type == pg_sys::InvalidOid || var_type == 0.into() {
+                            return Err(format!(
+                                "Invalid type OID {} for var expression",
+                                var_type
+                            )
+                            .into());
+                        }
+                        (var_type, (*var_node).vartypmod)
+                    } else {
+                        return Err("Expected var expression but found different node type".into());
+                    };
 
                     columns.push(ColumnInfo {
                         name: col_name,
