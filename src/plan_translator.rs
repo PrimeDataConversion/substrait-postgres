@@ -31,10 +31,29 @@ pub fn execute_substrait_plan(
 
     let relation = &plan.relations[0];
 
+    // Extract column names from the root relation
+    let column_names = if let Some(rel_type) = &relation.rel_type {
+        if let substrait::proto::plan_rel::RelType::Root(root) = rel_type {
+            root.names.clone()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
     // Convert Substrait relation to PostgreSQL plan tree and execute
     unsafe {
         let plan_tree = convert_relation_to_plan_tree(relation)?;
-        let result = execute_plan_tree_structured(plan_tree)?;
+        let mut result = execute_plan_tree_structured(plan_tree)?;
+
+        // Update column names with the ones from the plan schema
+        for (i, column) in result.columns.iter_mut().enumerate() {
+            if i < column_names.len() {
+                column.name = column_names[i].clone();
+            }
+        }
+
         Ok(result)
     }
 }
@@ -152,7 +171,7 @@ unsafe fn convert_expression_to_target_entry(
                     as *mut pg_sys::TargetEntry;
                 (*target_entry).expr = const_expr;
                 (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
-                (*target_entry).resname = create_cstring("result");
+                (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
                 (*target_entry).resjunk = false;
 
                 Ok(target_entry)
@@ -167,12 +186,12 @@ unsafe fn convert_expression_to_target_entry(
 pub unsafe fn create_int4_const(
     value: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // Look up the int4 type OID dynamically instead of using the constant
-    let type_name = create_cstring("int4");
-    let type_oid = pg_sys::TypenameGetTypid(type_name);
+    // Use the PostgreSQL built-in constant, but validate it first
+    let type_oid = pg_sys::INT4OID;
 
-    if type_oid == pg_sys::InvalidOid {
-        return Err("Could not find int4 type OID".into());
+    // Validate that the OID is reasonable (should not be 0 or InvalidOid)
+    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+        return Err(format!("Invalid INT4OID: {}", type_oid).into());
     }
 
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
@@ -191,12 +210,12 @@ pub unsafe fn create_int4_const(
 pub unsafe fn create_int8_const(
     value: i64,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // Look up the int8 type OID dynamically instead of using the constant
-    let type_name = create_cstring("int8");
-    let type_oid = pg_sys::TypenameGetTypid(type_name);
+    // Use the PostgreSQL built-in constant, but validate it first
+    let type_oid = pg_sys::INT8OID;
 
-    if type_oid == pg_sys::InvalidOid {
-        return Err("Could not find int8 type OID".into());
+    // Validate that the OID is reasonable (should not be 0 or InvalidOid)
+    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+        return Err(format!("Invalid INT8OID: {}", type_oid).into());
     }
 
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
@@ -215,12 +234,12 @@ pub unsafe fn create_int8_const(
 pub unsafe fn create_text_const(
     value: &str,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // Look up the text type OID dynamically instead of using the constant
-    let type_name = create_cstring("text");
-    let type_oid = pg_sys::TypenameGetTypid(type_name);
+    // Use the PostgreSQL built-in constant, but validate it first
+    let type_oid = pg_sys::TEXTOID;
 
-    if type_oid == pg_sys::InvalidOid {
-        return Err("Could not find text type OID".into());
+    // Validate that the OID is reasonable (should not be 0 or InvalidOid)
+    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+        return Err(format!("Invalid TEXTOID: {}", type_oid).into());
     }
 
     let text_datum =
@@ -399,6 +418,10 @@ pub unsafe fn execute_plan_tree_structured(
                         if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Const {
                             let const_node = expr as *mut pg_sys::Const;
                             let const_type = (*const_node).consttype;
+
+                            // Debug: print the OID we got from the const node
+                            eprintln!("DEBUG: Const node type_oid: {}", const_type);
+
                             // Fail if we have an invalid OID
                             if const_type == pg_sys::InvalidOid || const_type == 0.into() {
                                 return Err(format!(
@@ -414,12 +437,29 @@ pub unsafe fn execute_plan_tree_structured(
                             );
                         };
 
-                    columns.push(ColumnInfo {
-                        name: col_name,
+                    // Debug: Verify type OID before creating ColumnInfo
+                    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+                        return Err(format!(
+                            "About to create ColumnInfo with invalid type OID {} for column '{}' at index {}",
+                            type_oid, col_name, i
+                        ).into());
+                    }
+
+                    // Add explicit logging to track the OID values
+                    let column_info = ColumnInfo {
+                        name: col_name.clone(),
                         type_oid,
                         type_mod,
                         attr_number: i as pg_sys::AttrNumber + 1, // 1-based attribute numbers
-                    });
+                    };
+
+                    // Log the actual values being stored
+                    eprintln!(
+                        "DEBUG: Created ColumnInfo - name: '{}', type_oid: {}, type_mod: {}",
+                        column_info.name, column_info.type_oid, column_info.type_mod
+                    );
+
+                    columns.push(column_info);
                 }
             }
 
@@ -498,6 +538,14 @@ pub unsafe fn execute_plan_tree_structured(
                     } else {
                         return Err("Expected var expression but found different node type".into());
                     };
+
+                    // Debug: Verify type OID before creating ColumnInfo
+                    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+                        return Err(format!(
+                            "About to create ColumnInfo with invalid type OID {} for column '{}' at index {}",
+                            type_oid, col_name, i
+                        ).into());
+                    }
 
                     columns.push(ColumnInfo {
                         name: col_name,
