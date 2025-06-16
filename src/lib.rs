@@ -1,7 +1,6 @@
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 use prost::Message;
-use serde_json;
 use substrait::proto::Plan;
 
 mod plan_translator;
@@ -14,7 +13,7 @@ pgrx::pg_module_magic!();
 
 /// Extension initialization function
 #[pg_extern]
-fn _PG_init() {
+fn _pg_init() {
     // For now, just initialize without parser hooks to focus on core functionality
     // unsafe {
     //     initialize_parse_hooks();
@@ -83,7 +82,7 @@ pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
         return pg_sys::Datum::null();
     }
 
-    let arg_ptr = ((*fcinfo).args.as_ptr() as *const pg_sys::NullableDatum).offset(0);
+    let arg_ptr = (*fcinfo).args.as_ptr().offset(0);
     let arg = &*arg_ptr;
 
     if arg.isnull {
@@ -91,7 +90,7 @@ pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
         return pg_sys::Datum::null();
     }
 
-    let datum = pg_sys::Datum::from(arg.value);
+    let datum = arg.value;
     let text_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
     if text_ptr.is_null() {
         pgrx::info!("Text pointer is null");
@@ -421,17 +420,17 @@ fn from_substrait_json_native(
                         })
                         .collect();
 
-                    pgrx::iter::TableIterator::new(values.into_iter())
+                    pgrx::iter::TableIterator::new(values)
                 }
                 Err(e) => {
                     pgrx::warning!("Failed to execute plan: {}", e);
-                    pgrx::iter::TableIterator::new(vec![].into_iter())
+                    pgrx::iter::TableIterator::new(vec![])
                 }
             }
         }
         Err(e) => {
             pgrx::warning!("Failed to parse JSON: {}", e);
-            pgrx::iter::TableIterator::new(vec![].into_iter())
+            pgrx::iter::TableIterator::new(vec![])
         }
     }
 }
@@ -447,15 +446,14 @@ unsafe fn extract_bytea_arg(fcinfo: pg_sys::FunctionCallInfo, arg_num: i32) -> &
         return &[];
     }
 
-    let arg_ptr =
-        ((*fcinfo).args.as_ptr() as *const pg_sys::NullableDatum).offset(arg_num as isize);
+    let arg_ptr = (*fcinfo).args.as_ptr().offset(arg_num as isize);
     let arg = &*arg_ptr;
 
     if arg.isnull {
         return &[];
     }
 
-    let datum = pg_sys::Datum::from(arg.value);
+    let datum = arg.value;
     let bytea_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
     if bytea_ptr.is_null() {
         return &[];
@@ -470,7 +468,7 @@ unsafe fn extract_bytea_arg(fcinfo: pg_sys::FunctionCallInfo, arg_num: i32) -> &
     let data_len = if (len_word & 0x01) == 0 {
         (len_word >> 2) as usize - 4
     } else {
-        (len_word >> 1) as usize & 0x7F - 1
+        (len_word >> 1) as usize & (0x7F - 1)
     };
 
     let data_ptr = if (len_word & 0x01) == 0 {
@@ -551,7 +549,7 @@ unsafe fn execute_results_as_srf(
         // We need to get it from the result info
 
         let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-        if !result_info.is_null() && (*result_info).expectedDesc != std::ptr::null_mut() {
+        if !result_info.is_null() && !(*result_info).expectedDesc.is_null() {
             // Debug: Check the expected tuple descriptor
             let expected_desc = (*result_info).expectedDesc;
             eprintln!(
@@ -652,7 +650,7 @@ unsafe fn execute_results_as_srf(
             let actual_columns = std::cmp::min(num_columns, expected_natts);
 
             for i in 0..actual_columns {
-                let attr = (*tupdesc).attrs.as_ptr().offset(i as isize);
+                let attr = (*tupdesc).attrs.as_ptr().add(i);
                 let expected_typid = (*attr).atttypid;
                 let our_value = row_values[i];
                 let our_is_null = row_nulls[i];
@@ -663,29 +661,29 @@ unsafe fn execute_results_as_srf(
                 );
 
                 if our_is_null {
-                    *values_array.offset(i as isize) = pg_sys::Datum::null();
-                    *nulls_array.offset(i as isize) = true;
+                    *values_array.add(i) = pg_sys::Datum::null();
+                    *nulls_array.add(i) = true;
                 } else {
                     match expected_typid {
                         pg_sys::INT4OID => {
                             let int_val = our_value.value() as i32;
                             eprintln!("DEBUG: Converting to INT4, extracted value: {}", int_val);
-                            *values_array.offset(i as isize) = pg_sys::Datum::from(int_val);
-                            *nulls_array.offset(i as isize) = false;
+                            *values_array.add(i) = pg_sys::Datum::from(int_val);
+                            *nulls_array.add(i) = false;
                         }
                         pg_sys::INT8OID => {
                             let long_val = our_value.value() as i64;
                             eprintln!("DEBUG: Converting to INT8, extracted value: {}", long_val);
-                            *values_array.offset(i as isize) = pg_sys::Datum::from(long_val);
-                            *nulls_array.offset(i as isize) = false;
+                            *values_array.add(i) = pg_sys::Datum::from(long_val);
+                            *nulls_array.add(i) = false;
                         }
                         _ => {
                             eprintln!(
                                 "DEBUG: Unsupported type conversion for OID {}",
                                 expected_typid
                             );
-                            *values_array.offset(i as isize) = our_value;
-                            *nulls_array.offset(i as isize) = false;
+                            *values_array.add(i) = our_value;
+                            *nulls_array.add(i) = false;
                         }
                     }
                 }
@@ -693,8 +691,8 @@ unsafe fn execute_results_as_srf(
 
             // Fill remaining expected columns with NULLs
             for i in actual_columns..expected_natts {
-                *values_array.offset(i as isize) = pg_sys::Datum::null();
-                *nulls_array.offset(i as isize) = true;
+                *values_array.add(i) = pg_sys::Datum::null();
+                *nulls_array.add(i) = true;
                 eprintln!("DEBUG: Filling column {} with NULL", i);
             }
 
@@ -705,7 +703,7 @@ unsafe fn execute_results_as_srf(
                 (*tuple_desc).natts
             );
             for i in 0..(*tuple_desc).natts {
-                let attr = (*tuple_desc).attrs.as_ptr().offset(i as isize);
+                let attr = (*tuple_desc).attrs.as_ptr().add(i as usize);
                 eprintln!(
                     "DEBUG: Final check - Attribute {}: attnum={}, atttypid={}, attisdropped={}",
                     i,
