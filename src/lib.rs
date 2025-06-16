@@ -49,26 +49,10 @@ pub unsafe extern "C-unwind" fn from_substrait_wrapper(
         return handle_empty_srf(fcinfo);
     }
 
-    // TEMPORARY: Skip plan execution to isolate the SRF issue
-    pgrx::info!("DEBUG: About to test SRF with empty result");
-    let empty_result = ExecutionResult {
-        columns: vec![crate::plan_translator::ColumnInfo {
-            name: "test_col".to_string(),
-            type_oid: pg_sys::INT4OID,
-            type_mod: -1,
-            attr_number: 1,
-        }],
-        rows: vec![vec![pg_sys::Datum::from(42i32)]],
-        nulls: vec![vec![false]],
-    };
-    pgrx::info!("DEBUG: About to call execute_results_as_srf");
-    execute_results_as_srf(fcinfo, empty_result)
-
-    // Original code commented out for testing:
-    // match Plan::decode(plan_bytes) {
-    //     Ok(plan) => execute_substrait_as_srf(fcinfo, plan),
-    // Err(_e) => handle_empty_srf(fcinfo),
-    // }
+    match Plan::decode(plan_bytes) {
+        Ok(plan) => execute_substrait_as_srf(fcinfo, plan),
+        Err(_e) => handle_empty_srf(fcinfo),
+    }
 }
 
 #[no_mangle]
@@ -535,7 +519,7 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
         }
         Err(e) => {
             pgrx::info!("Failed to execute plan: {}", e);
-            pg_sys::Datum::null()
+            handle_empty_srf(fcinfo)
         }
     }
 }
