@@ -97,11 +97,12 @@ Both functions return `text` containing the execution result or error message.
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (requires proper locale setup)
 cargo pgrx test
 
-# Run tests for specific PostgreSQL version
-cargo pgrx test --features pg16
+# To set locale in your shell profile permanently:
+# echo 'export LC_ALL=en_US.UTF-8' >> ~/.zshrc  # for zsh
+# echo 'export LC_ALL=en_US.UTF-8' >> ~/.bashrc # for bash
 ```
 
 ### Code Quality
