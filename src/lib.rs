@@ -837,7 +837,7 @@ unsafe fn validate_as_clause_against_schema(tupdesc: pg_sys::TupleDesc, results:
 
     // Check each column type
     for i in 0..expected_cols {
-        let attr = (*tupdesc).attrs.as_ptr().offset(i as isize);
+        let attr = (*tupdesc).attrs.as_ptr().add(i);
         let expected_typid = (*attr).atttypid;
         let actual_typid = results.columns[i].type_oid;
 
