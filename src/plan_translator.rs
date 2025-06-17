@@ -275,12 +275,25 @@ pub unsafe fn create_seqscan_node(
     // Create a SeqScan node
     let seqscan_node =
         pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
-    (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
-    (*seqscan_node).scan.scanrelid = table_oid.into();
+    // Handle different PostgreSQL versions
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    {
+        (*seqscan_node).plan.type_ = pg_sys::NodeTag::T_SeqScan;
+        (*seqscan_node).scanrelid = table_oid.into();
 
-    // Create target list for the table's columns
-    let target_list = create_target_list_for_table(table_oid)?;
-    (*seqscan_node).scan.plan.targetlist = target_list;
+        // Create target list for the table's columns
+        let target_list = create_target_list_for_table(table_oid)?;
+        (*seqscan_node).plan.targetlist = target_list;
+    }
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    {
+        (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+        (*seqscan_node).scan.scanrelid = table_oid.into();
+
+        // Create target list for the table's columns
+        let target_list = create_target_list_for_table(table_oid)?;
+        (*seqscan_node).scan.plan.targetlist = target_list;
+    }
 
     Ok(seqscan_node as *mut pg_sys::Plan)
 }
@@ -491,8 +504,19 @@ pub unsafe fn execute_plan_tree_structured(
         }
         pg_sys::NodeTag::T_SeqScan => {
             let seqscan_node = plan as *mut pg_sys::SeqScan;
-            let target_list = (*seqscan_node).scan.plan.targetlist;
-            let relation_oid = (*seqscan_node).scan.scanrelid;
+            // Handle different PostgreSQL versions
+            #[cfg(any(feature = "pg13", feature = "pg14"))]
+            let (target_list, relation_oid) = {
+                let target_list = (*seqscan_node).plan.targetlist;
+                let relation_oid = (*seqscan_node).scanrelid;
+                (target_list, relation_oid)
+            };
+            #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+            let (target_list, relation_oid) = {
+                let target_list = (*seqscan_node).scan.plan.targetlist;
+                let relation_oid = (*seqscan_node).scan.scanrelid;
+                (target_list, relation_oid)
+            };
 
             if target_list.is_null() {
                 return Ok(ExecutionResult {
