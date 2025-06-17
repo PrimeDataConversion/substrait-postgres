@@ -30,7 +30,7 @@ anyhow = "1.0.98"
 pgrx-tests = "=0.14.3"
 
 [features]
-default = ["pg16"]
+default = ["pg15"]
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]

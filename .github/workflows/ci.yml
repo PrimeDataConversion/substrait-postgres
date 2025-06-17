@@ -55,7 +55,13 @@ jobs:
           protobuf-compiler
 
     - name: Install cargo-pgrx
-      run: cargo install --locked cargo-pgrx --version "=0.14.3"
+      run: |
+        if ! command -v cargo-pgrx &> /dev/null; then
+          echo "Installing cargo-pgrx..."
+          cargo install --locked cargo-pgrx --version "=0.14.3"
+        else
+          echo "cargo-pgrx already installed, skipping..."
+        fi
 
     - name: Initialize pgrx
       run: cargo pgrx init --pg${{ matrix.pg }} download

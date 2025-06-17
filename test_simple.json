@@ -1,0 +1,10 @@
+{
+  "version": {"minorNumber": 54},
+  "relations": [],
+  "demo_schema": [
+    {"name": "test_col", "type": "int"}
+  ],
+  "demo_rows": [
+    {"test_col": 123}
+  ]
+}
