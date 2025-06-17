@@ -3,22 +3,17 @@ use pgrx::prelude::*;
 use prost::Message;
 use substrait::proto::Plan;
 
-mod parse_hooks;
 mod plan_translator;
 
-use parse_hooks::initialize_parse_hooks;
 use plan_translator::{execute_substrait_plan, ExecutionResult};
 
 pgrx::pg_module_magic!();
 
 /// Extension initialization function
-#[pg_extern]
-fn _pg_init() {
-    // Initialize parser hooks to enable automatic schema detection
-    unsafe {
-        initialize_parse_hooks();
-    }
-    pgrx::info!("Substrait PostgreSQL extension initialized");
+#[no_mangle]
+pub extern "C" fn _PG_init() {
+    // Extension initialization - no special setup needed for now
+    pgrx::info!("Substrait PostgreSQL extension loaded");
 }
 
 /// Debug function to check PostgreSQL type OIDs at runtime
@@ -589,6 +584,9 @@ unsafe fn execute_results_as_srf(
                 (*copied_tupdesc).natts
             );
 
+            // Validate that the AS clause matches the actual schema
+            validate_as_clause_against_schema(copied_tupdesc, &results);
+
             // Debug: print the expected column information
             for i in 0..(*copied_tupdesc).natts {
                 let attr = (*copied_tupdesc).attrs.as_ptr().offset(i as isize);
@@ -602,7 +600,19 @@ unsafe fn execute_results_as_srf(
                 );
             }
         } else {
-            pgrx::error!("SETOF RECORD function requires AS clause to specify return columns");
+            // No AS clause provided - we need to provide a helpful error with the correct schema
+            let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
+            if !result_info.is_null() {
+                (*result_info).isDone = pg_sys::ExprDoneCond::ExprEndResult;
+            }
+            pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
+
+            // Generate the correct AS clause based on the actual schema
+            let as_clause = generate_as_clause(&results);
+            pgrx::error!(
+                "Substrait function requires AS clause to specify return columns. Use: AS t({})",
+                as_clause
+            );
         }
 
         // Store the results
@@ -785,6 +795,79 @@ unsafe fn execute_results_as_srf(
         }
         pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
         pg_sys::Datum::null()
+    }
+}
+
+/// Generate an AS clause string from ExecutionResult schema
+fn generate_as_clause(results: &ExecutionResult) -> String {
+    results
+        .columns
+        .iter()
+        .map(|col| {
+            let pg_type = match col.type_oid {
+                pg_sys::INT4OID => "integer",
+                pg_sys::INT8OID => "bigint",
+                pg_sys::TEXTOID => "text",
+                pg_sys::FLOAT4OID => "real",
+                pg_sys::FLOAT8OID => "double precision",
+                pg_sys::BOOLOID => "boolean",
+                _ => "text", // fallback
+            };
+            format!("{} {}", col.name, pg_type)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Validate that the provided AS clause matches the actual schema
+unsafe fn validate_as_clause_against_schema(tupdesc: pg_sys::TupleDesc, results: &ExecutionResult) {
+    let expected_cols = (*tupdesc).natts as usize;
+    let actual_cols = results.columns.len();
+
+    // Check column count
+    if expected_cols != actual_cols {
+        let correct_as_clause = generate_as_clause(results);
+        pgrx::error!(
+            "AS clause has {} column(s) but Substrait plan returns {} column(s). Use: AS t({})",
+            expected_cols,
+            actual_cols,
+            correct_as_clause
+        );
+    }
+
+    // Check each column type
+    for i in 0..expected_cols {
+        let attr = (*tupdesc).attrs.as_ptr().offset(i as isize);
+        let expected_typid = (*attr).atttypid;
+        let actual_typid = results.columns[i].type_oid;
+
+        if expected_typid != actual_typid {
+            let attr_name = std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr());
+            let expected_type_name = get_type_name(expected_typid);
+            let actual_type_name = get_type_name(actual_typid);
+            let correct_as_clause = generate_as_clause(results);
+
+            pgrx::error!(
+                "AS clause column '{}' has type '{}' but Substrait plan returns type '{}'. Use: AS t({})",
+                attr_name.to_string_lossy(),
+                expected_type_name,
+                actual_type_name,
+                correct_as_clause
+            );
+        }
+    }
+}
+
+/// Get a human-readable type name from a PostgreSQL type OID
+fn get_type_name(type_oid: pg_sys::Oid) -> &'static str {
+    match type_oid {
+        pg_sys::INT4OID => "integer",
+        pg_sys::INT8OID => "bigint",
+        pg_sys::TEXTOID => "text",
+        pg_sys::FLOAT4OID => "real",
+        pg_sys::FLOAT8OID => "double precision",
+        pg_sys::BOOLOID => "boolean",
+        _ => "unknown",
     }
 }
 
