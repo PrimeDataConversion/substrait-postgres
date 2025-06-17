@@ -124,7 +124,7 @@ unsafe fn process_function_rte_for_substrait(rte: &mut pg_sys::RangeTblEntry) {
 
         // Check if the function expression is a FuncExpr
         if !range_func_ref.funcexpr.is_null() {
-            let node = range_func_ref.funcexpr as *mut pg_sys::Node;
+            let node = range_func_ref.funcexpr;
             if !node.is_null() {
                 let node_ref = &*node;
 
@@ -150,49 +150,58 @@ unsafe fn process_func_expr_for_substrait(
 
     let func_expr_ref = &*func_expr;
 
-    // Get the function name to check if it's from_substrait or from_substrait_auto
+    // Get the function name to check if it's from_substrait or from_substrait_json
     let func_name = get_function_name(func_expr_ref.funcid);
 
-    if func_name != "from_substrait" && func_name != "from_substrait_auto" {
+    if func_name != "from_substrait" && func_name != "from_substrait_json" {
         return;
     }
 
     pgrx::info!("Found from_substrait function call, attempting schema extraction");
 
-    // Extract the bytea literal argument
-    match extract_bytea_literal_from_args(func_expr_ref.args) {
-        Some(bytea_data) => {
-            // Parse the Substrait plan and extract schema
-            match extract_schema_from_bytea(&bytea_data) {
-                Ok(schema) => {
-                    if schema.columns.is_empty() {
-                        pgrx::warning!("Substrait plan produced empty schema");
-                        return;
-                    }
-
-                    pgrx::info!(
-                        "Successfully extracted schema with {} columns",
-                        schema.columns.len()
-                    );
-
-                    // Modify the RTE to include the inferred column definitions
-                    if let Err(e) = inject_column_definitions_into_rte_safe(rte, &schema) {
-                        pgrx::error!("Failed to inject column definitions: {}", e);
-                    }
-                }
-                Err(e) => {
-                    pgrx::warning!("Failed to extract schema from Substrait plan: {}", e);
-                    // For robustness, we could inject a default schema here
-                    inject_default_schema(rte);
-                }
+    // Extract the argument based on function type
+    let schema_result = if func_name == "from_substrait_json" {
+        // Extract text literal argument for JSON functions
+        match extract_text_literal_from_args(func_expr_ref.args) {
+            Some(json_text) => extract_schema_from_json(&json_text),
+            None => {
+                pgrx::warning!("Could not extract text literal from from_substrait_json arguments");
+                Err(anyhow::anyhow!("No text literal found"))
             }
         }
-        None => {
-            pgrx::warning!("Could not extract bytea literal from function arguments");
-            // Only applicable for from_substrait_auto, regular from_substrait still needs AS clause
-            if func_name == "from_substrait_auto" {
-                inject_default_schema(rte);
+    } else {
+        // Extract bytea literal argument for binary functions
+        match extract_bytea_literal_from_args(func_expr_ref.args) {
+            Some(bytea_data) => extract_schema_from_bytea(&bytea_data),
+            None => {
+                pgrx::warning!("Could not extract bytea literal from from_substrait arguments");
+                Err(anyhow::anyhow!("No bytea literal found"))
             }
+        }
+    };
+
+    match schema_result {
+        Ok(schema) => {
+            if schema.columns.is_empty() {
+                pgrx::warning!("Substrait plan produced empty schema");
+                inject_default_schema(rte);
+                return;
+            }
+
+            pgrx::info!(
+                "Successfully extracted schema with {} columns",
+                schema.columns.len()
+            );
+
+            // Modify the RTE to include the inferred column definitions
+            if let Err(e) = inject_column_definitions_into_rte_safe(rte, &schema) {
+                pgrx::error!("Failed to inject column definitions: {}", e);
+            }
+        }
+        Err(e) => {
+            pgrx::warning!("Failed to extract schema from Substrait plan: {}", e);
+            // For robustness, inject a default schema
+            inject_default_schema(rte);
         }
     }
 }
@@ -217,6 +226,48 @@ unsafe fn get_function_name(func_oid: pg_sys::Oid) -> String {
 
     pg_sys::ReleaseSysCache(proc_tuple);
     name
+}
+
+/// Extract text literal from function arguments (for JSON functions)
+unsafe fn extract_text_literal_from_args(args: *mut pg_sys::List) -> Option<String> {
+    if args.is_null() {
+        return None;
+    }
+
+    let list_length = pg_sys::list_length(args);
+    if list_length == 0 {
+        return None;
+    }
+
+    // Get the first argument (should be the text literal)
+    let first_arg_node = pg_sys::list_nth(args, 0);
+    if first_arg_node.is_null() {
+        return None;
+    }
+
+    let node = first_arg_node as *mut pg_sys::Node;
+    if node.is_null() {
+        return None;
+    }
+
+    let node_ref = &*node;
+
+    // Check if it's a constant (literal)
+    if node_ref.type_ == pg_sys::NodeTag::T_Const {
+        let const_node = node as *mut pg_sys::Const;
+        if const_node.is_null() {
+            return None;
+        }
+
+        let const_ref = &*const_node;
+
+        // Check if it's a text type
+        if const_ref.consttype == pg_sys::TEXTOID {
+            return extract_text_from_datum(const_ref.constvalue);
+        }
+    }
+
+    None
 }
 
 /// Extract bytea literal from function arguments
@@ -261,6 +312,44 @@ unsafe fn extract_bytea_literal_from_args(args: *mut pg_sys::List) -> Option<Vec
     None
 }
 
+/// Extract text data from a PostgreSQL Datum
+unsafe fn extract_text_from_datum(datum: pg_sys::Datum) -> Option<String> {
+    if datum.value() == 0 {
+        return None;
+    }
+
+    let text_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
+    if text_ptr.is_null() {
+        return None;
+    }
+
+    let detoasted_ptr = pg_sys::pg_detoast_datum_packed(text_ptr);
+    if detoasted_ptr.is_null() {
+        return None;
+    }
+
+    let len_word = *(detoasted_ptr as *const u32);
+    let data_len = if (len_word & 0x01) == 0 {
+        (len_word >> 2) as usize - 4
+    } else {
+        (len_word >> 1) as usize & (0x7F - 1)
+    };
+
+    let data_ptr = if (len_word & 0x01) == 0 {
+        (detoasted_ptr as *const u8).offset(4)
+    } else {
+        (detoasted_ptr as *const u8).offset(1)
+    };
+
+    if data_len == 0 {
+        return Some(String::new());
+    }
+
+    let slice = std::slice::from_raw_parts(data_ptr, data_len);
+    // Convert bytes to string, handling potential UTF-8 issues
+    String::from_utf8(slice.to_vec()).ok()
+}
+
 /// Extract bytea data from a PostgreSQL Datum
 unsafe fn extract_bytea_from_datum(datum: pg_sys::Datum) -> Option<Vec<u8>> {
     if datum.value() == 0 {
@@ -281,7 +370,7 @@ unsafe fn extract_bytea_from_datum(datum: pg_sys::Datum) -> Option<Vec<u8>> {
     let data_len = if (len_word & 0x01) == 0 {
         (len_word >> 2) as usize - 4
     } else {
-        (len_word >> 1) as usize & 0x7F - 1
+        (len_word >> 1) as usize & (0x7F - 1)
     };
 
     let data_ptr = if (len_word & 0x01) == 0 {
@@ -296,6 +385,38 @@ unsafe fn extract_bytea_from_datum(datum: pg_sys::Datum) -> Option<Vec<u8>> {
 
     let slice = std::slice::from_raw_parts(data_ptr, data_len);
     Some(slice.to_vec())
+}
+
+/// Extract schema information from JSON string containing a Substrait plan
+fn extract_schema_from_json(json_data: &str) -> Result<SubstraitSchema> {
+    // Parse the JSON to a Substrait plan
+    let plan = serde_json::from_str::<Plan>(json_data)
+        .map_err(|e| anyhow::anyhow!("Failed to parse JSON as Substrait plan: {}", e))?;
+
+    // Use the existing plan execution logic to extract schema
+    let result_data = crate::plan_translator::execute_substrait_plan(plan)
+        .map_err(|e| anyhow::anyhow!("Failed to execute plan for schema: {}", e))?;
+
+    // Convert to our schema format
+    let columns = result_data
+        .columns
+        .into_iter()
+        .map(|col| SubstraitColumn {
+            name: col.name,
+            postgres_type: match col.type_oid {
+                pg_sys::INT4OID => "integer".to_string(),
+                pg_sys::INT8OID => "bigint".to_string(),
+                pg_sys::TEXTOID => "text".to_string(),
+                pg_sys::FLOAT4OID => "real".to_string(),
+                pg_sys::FLOAT8OID => "double precision".to_string(),
+                pg_sys::BOOLOID => "boolean".to_string(),
+                _ => "text".to_string(), // Default fallback
+            },
+            type_oid: col.type_oid,
+        })
+        .collect();
+
+    Ok(SubstraitSchema { columns })
 }
 
 /// Extract schema information from bytea data containing a Substrait plan

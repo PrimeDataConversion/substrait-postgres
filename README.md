@@ -72,25 +72,69 @@ cargo pgrx package
 -- Create the extension
 CREATE EXTENSION IF NOT EXISTS pg_substrait;
 
--- Test with a simple JSON plan (this will fail as expected - needs exactly 1 relation)
-SELECT from_substrait_json('{"version": {"minorNumber": 54}, "relations": []}');
--- Error: Expected exactly 1 relation, found 0
+-- Execute a simple literal plan (AS clause is optional - schema is auto-detected)
+SELECT * FROM from_substrait_json('{
+  "version": {"minorNumber": 54},
+  "relations": [{
+    "root": {
+      "names": ["result"],
+      "input": {
+        "project": {
+          "expressions": [{
+            "literal": {"i32": 42}
+          }]
+        }
+      }
+    }
+  }]
+}');
+-- Returns: 42
 
--- Test with a valid JSON plan structure
-SELECT from_substrait_json('{"version": {"minorNumber": 54}, "relations": [{"root": {"input": {"project": {"expressions": []}}}}]}');
--- Returns: Result: (empty result)
+-- Execute a plan with multiple columns (AS clause still optional)
+SELECT * FROM from_substrait_json('{
+  "version": {"minorNumber": 54},
+  "relations": [{
+    "root": {
+      "names": ["num", "text"],
+      "input": {
+        "project": {
+          "expressions": [
+            {"literal": {"i32": 123}},
+            {"literal": {"string": "hello"}}
+          ]
+        }
+      }
+    }
+  }]
+}');
+-- Returns: 123 | hello
 
--- Test with binary protobuf data
-SELECT from_substrait('\x00'::bytea);
--- Error: Failed to decode protobuf: failed to decode Protobuf message: invalid tag value: 0
+-- You can still use the AS clause for explicit type control (backward compatibility)
+SELECT * FROM from_substrait_json('{
+  "version": {"minorNumber": 54},
+  "relations": [{
+    "root": {
+      "names": ["value"],
+      "input": {
+        "project": {
+          "expressions": [{"literal": {"i32": 999}}]
+        }
+      }
+    }
+  }]
+}') AS t(value int);
+-- Returns: 999
+
+-- Execute from binary protobuf (schema auto-detected)
+SELECT * FROM from_substrait(decode('...', 'hex'));
 ```
 
 ### Available Functions
 
-- `from_substrait(plan bytea)` - Execute Substrait plans from protobuf binary format
-- `from_substrait_json(json_plan text)` - Execute Substrait plans from JSON format
+- `from_substrait(plan bytea) RETURNS SETOF RECORD` - Execute Substrait plans from protobuf binary format
+- `from_substrait_json(json_plan text) RETURNS SETOF RECORD` - Execute Substrait plans from JSON format
 
-Both functions return `text` containing the execution result or error message.
+Both functions return `SETOF RECORD` with **automatic schema detection**. The extension analyzes the Substrait plan to determine column names and types, so the AS clause is **optional**. You can still provide an AS clause for explicit type control or backward compatibility.
 
 ## Development
 

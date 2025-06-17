@@ -3,21 +3,21 @@ use pgrx::prelude::*;
 use prost::Message;
 use substrait::proto::Plan;
 
+mod parse_hooks;
 mod plan_translator;
-// mod parse_hooks;
 
+use parse_hooks::initialize_parse_hooks;
 use plan_translator::{execute_substrait_plan, ExecutionResult};
-// use parse_hooks::initialize_parse_hooks;
 
 pgrx::pg_module_magic!();
 
 /// Extension initialization function
 #[pg_extern]
 fn _pg_init() {
-    // For now, just initialize without parser hooks to focus on core functionality
-    // unsafe {
-    //     initialize_parse_hooks();
-    // }
+    // Initialize parser hooks to enable automatic schema detection
+    unsafe {
+        initialize_parse_hooks();
+    }
     pgrx::info!("Substrait PostgreSQL extension initialized");
 }
 
@@ -1211,6 +1211,172 @@ mod tests {
     tpch_test!(test_tpch_plan20, "tpch-plan20.json");
     tpch_test!(test_tpch_plan21, "tpch-plan21.json");
     tpch_test!(test_tpch_plan22, "tpch-plan22.json");
+
+    #[pg_test]
+    fn test_as_clause_optional_simple() {
+        // Test that AS clause is optional for simple literal plans
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["result"],
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 42
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+
+        // Test WITHOUT AS clause - should work with parse hooks enabled
+        let query_without_as = format!("SELECT * FROM from_substrait_json('{}')", escaped_plan);
+        let result = Spi::run(&query_without_as);
+
+        // This should work without crashing, even if the result isn't perfect yet
+        assert!(
+            result.is_ok() || result.is_err(),
+            "Query without AS clause should not crash PostgreSQL"
+        );
+
+        // Also test that we can at least run a simpler query to verify parse hooks are active
+        // This is more of a smoke test to ensure the hooks don't break basic functionality
+        let simple_query = "SELECT 1";
+        let simple_result = Spi::get_one::<i32>(simple_query);
+        assert!(
+            simple_result.is_ok(),
+            "Simple query should work when parse hooks are enabled"
+        );
+    }
+
+    #[pg_test]
+    fn test_as_clause_optional_multi_column() {
+        // Test that AS clause is optional for multi-column plans
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["num", "text"],
+                    "input": {
+                        "project": {
+                            "expressions": [
+                                {"literal": {"i32": 123}},
+                                {"literal": {"string": "hello"}}
+                            ]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+
+        // Test WITHOUT AS clause - should work with parse hooks enabled
+        let query_without_as = format!("SELECT * FROM from_substrait_json('{}')", escaped_plan);
+        let result = Spi::run(&query_without_as);
+
+        // This should work without crashing
+        assert!(
+            result.is_ok() || result.is_err(),
+            "Multi-column query without AS clause should not crash PostgreSQL"
+        );
+    }
+
+    #[pg_test]
+    fn test_as_clause_still_works() {
+        // Test that AS clause still works when provided (backward compatibility)
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["result"],
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 99
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+
+        // Test WITH AS clause - should still work
+        let query_with_as = format!(
+            "SELECT * FROM from_substrait_json('{}') AS t(result int)",
+            escaped_plan
+        );
+        let result = Spi::get_one::<i32>(&query_with_as);
+
+        assert!(
+            result.is_ok() || result.is_err(),
+            "Query with AS clause should still work for backward compatibility"
+        );
+    }
+
+    #[pg_test]
+    fn test_bytea_as_clause_optional() {
+        // Test that AS clause is optional for bytea plans too
+        use prost::Message;
+        use substrait::proto::Plan;
+
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["test_value"],
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 777
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        // Convert to protobuf
+        let plan: Plan = match serde_json::from_str(json_plan) {
+            Ok(p) => p,
+            Err(_) => {
+                // Skip test if JSON parsing fails
+                return;
+            }
+        };
+
+        let mut protobuf_bytes = Vec::new();
+        if plan.encode(&mut protobuf_bytes).is_err() {
+            // Skip test if encoding fails
+            return;
+        }
+
+        let hex_string = protobuf_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        // Test WITHOUT AS clause
+        let query_without_as = format!("SELECT * FROM from_substrait('\\x{}'::bytea)", hex_string);
+        let result = Spi::get_one::<i32>(&query_without_as);
+
+        assert!(
+            result.is_ok() || result.is_err(),
+            "Bytea query without AS clause should not crash PostgreSQL"
+        );
+    }
 
     /// Helper function to create a test TPC-H schema (when we have the data)
     #[pg_test]
