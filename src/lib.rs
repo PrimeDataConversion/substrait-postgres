@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use prost::Message;
 use substrait::proto::Plan;
 
+mod executor;
 mod plan_translator;
 
 use plan_translator::{execute_substrait_plan, ExecutionResult};
@@ -16,18 +17,6 @@ pub extern "C" fn _PG_init() {
     pgrx::info!("Substrait PostgreSQL extension loaded");
 }
 
-/// Debug function to check PostgreSQL type OIDs at runtime
-#[pg_extern]
-fn debug_type_oids() -> String {
-    format!(
-        "INT4OID: {}, INT8OID: {}, TEXTOID: {}, InvalidOid: {}",
-        pg_sys::INT4OID,
-        pg_sys::INT8OID,
-        pg_sys::TEXTOID,
-        pg_sys::InvalidOid
-    )
-}
-
 /// Primary Substrait execution function for protobuf plans
 /// Usage: SELECT * FROM from_substrait(plan_bytes) AS t(col1 type1, col2 type2, ...)
 /// The AS clause column definitions must match the plan's output schema
@@ -39,13 +28,12 @@ pub unsafe extern "C-unwind" fn from_substrait_wrapper(
     let plan_bytes = extract_bytea_arg(fcinfo, 0);
 
     if plan_bytes.is_empty() {
-        // For SRF functions, we need to properly handle the empty case
-        return handle_empty_srf(fcinfo);
+        pgrx::error!("Invalid Substrait plan: empty bytea provided");
     }
 
     match Plan::decode(plan_bytes) {
         Ok(plan) => execute_substrait_as_srf(fcinfo, plan),
-        Err(_e) => handle_empty_srf(fcinfo),
+        Err(e) => pgrx::error!("Invalid Substrait plan: failed to decode protobuf: {}", e),
     }
 }
 
@@ -116,321 +104,43 @@ pub extern "C" fn pg_finfo_from_substrait_json_wrapper() -> &'static pg_sys::Pg_
     &V1_API
 }
 
-/// Dynamic schema function for bytea input using PostgreSQL's jsonb_to_recordset approach
-/// Usage: SELECT * FROM jsonb_to_recordset(from_substrait_dynamic(plan_bytes)::jsonb) AS t(col1 type1, col2 type2, ...)
-#[pg_extern]
-fn from_substrait_dynamic(plan_bytes: &[u8]) -> String {
-    pgrx::info!(
-        "Starting from_substrait_dynamic with plan bytes length: {}",
-        plan_bytes.len()
-    );
-
-    if plan_bytes.is_empty() {
-        return serde_json::json!([]).to_string();
-    }
-
-    // Parse the Substrait plan from protobuf bytes
-    match Plan::decode(plan_bytes) {
-        Ok(plan) => {
-            match execute_substrait_plan(plan) {
-                Ok(result_data) => {
-                    pgrx::info!(
-                        "Successfully executed plan with {} rows, {} columns",
-                        result_data.rows.len(),
-                        result_data.columns.len()
-                    );
-
-                    // Create rows as JSON objects for jsonb_to_recordset compatibility
-                    let rows: Vec<serde_json::Value> = result_data
-                        .rows
-                        .into_iter()
-                        .enumerate()
-                        .map(|(row_idx, row)| {
-                            let row_nulls = if row_idx < result_data.nulls.len() {
-                                &result_data.nulls[row_idx]
-                            } else {
-                                &vec![false; row.len()]
-                            };
-
-                            let mut row_obj = serde_json::Map::new();
-
-                            for (col_idx, datum) in row.into_iter().enumerate() {
-                                if col_idx < result_data.columns.len() {
-                                    let col_name = &result_data.columns[col_idx].name;
-                                    let value = if col_idx < row_nulls.len() && row_nulls[col_idx] {
-                                        serde_json::Value::Null
-                                    } else {
-                                        match result_data.columns[col_idx].type_oid {
-                                            pg_sys::INT4OID => {
-                                                serde_json::json!(datum.value() as i32)
-                                            }
-                                            pg_sys::INT8OID => {
-                                                serde_json::json!(datum.value() as i64)
-                                            }
-                                            pg_sys::TEXTOID => {
-                                                serde_json::json!(format!("{}", datum.value()))
-                                            }
-                                            _ => serde_json::json!(datum.value() as i64),
-                                        }
-                                    };
-                                    row_obj.insert(col_name.clone(), value);
-                                }
-                            }
-
-                            serde_json::Value::Object(row_obj)
-                        })
-                        .collect();
-
-                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
-                }
-                Err(e) => {
-                    pgrx::warning!("Failed to execute plan: {}", e);
-                    serde_json::json!([{"error": format!("Execution failed: {}", e)}]).to_string()
-                }
-            }
-        }
-        Err(e) => {
-            pgrx::warning!("Failed to decode protobuf: {}", e);
-            serde_json::json!([{"error": format!("Decode failed: {}", e)}]).to_string()
-        }
-    }
-}
-
-/// Helper function to generate schema information for bytea dynamic functions
-#[pg_extern]
-fn from_substrait_schema(plan_bytes: &[u8]) -> String {
-    pgrx::info!("Getting schema for plan bytes length: {}", plan_bytes.len());
-
-    if plan_bytes.is_empty() {
-        return serde_json::json!([{"error": "Empty plan bytes provided"}]).to_string();
-    }
-
-    // Parse the Substrait plan and return just the schema information
-    match Plan::decode(plan_bytes) {
-        Ok(plan) => match execute_substrait_plan(plan) {
-            Ok(result_data) => {
-                let schema = result_data
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        serde_json::json!({
-                            "name": col.name,
-                            "type": match col.type_oid {
-                                pg_sys::INT4OID => "integer",
-                                pg_sys::INT8OID => "bigint",
-                                pg_sys::TEXTOID => "text",
-                                _ => "unknown"
-                            },
-                            "postgres_type": match col.type_oid {
-                                pg_sys::INT4OID => "int4",
-                                pg_sys::INT8OID => "int8",
-                                pg_sys::TEXTOID => "text",
-                                _ => "text"
-                            }
-                        })
-                    })
-                    .collect::<Vec<_>>();
-
-                serde_json::to_string(&schema).unwrap_or_else(|_| "[]".to_string())
-            }
-            Err(e) => {
-                pgrx::warning!("Failed to get schema: {}", e);
-                serde_json::json!([{"error": format!("Schema extraction failed: {}", e)}])
-                    .to_string()
-            }
-        },
-        Err(e) => {
-            pgrx::warning!("Failed to parse protobuf for schema: {}", e);
-            serde_json::json!([{"error": format!("Protobuf parse failed: {}", e)}]).to_string()
-        }
-    }
-}
-
-/// Dynamic schema function using PostgreSQL's jsonb_to_recordset approach
-/// Usage: SELECT * FROM jsonb_to_recordset(from_substrait_json_dynamic(json_plan)::jsonb) AS t(col1 type1, col2 type2, ...)
-/// Or get schema first: SELECT from_substrait_json_schema(json_plan) to see column definitions
-#[pg_extern]
-fn from_substrait_json_dynamic(json_plan: &str) -> String {
-    pgrx::info!(
-        "Starting from_substrait_json_dynamic with plan: {}",
-        json_plan
-    );
-
-    // Parse the Substrait plan from JSON and execute it
-    match serde_json::from_str::<Plan>(json_plan) {
-        Ok(plan) => {
-            match execute_substrait_plan(plan) {
-                Ok(result_data) => {
-                    pgrx::info!(
-                        "Successfully executed plan with {} rows, {} columns",
-                        result_data.rows.len(),
-                        result_data.columns.len()
-                    );
-
-                    // Create rows as JSON objects for jsonb_to_recordset compatibility
-                    let rows: Vec<serde_json::Value> = result_data
-                        .rows
-                        .into_iter()
-                        .enumerate()
-                        .map(|(row_idx, row)| {
-                            let row_nulls = if row_idx < result_data.nulls.len() {
-                                &result_data.nulls[row_idx]
-                            } else {
-                                &vec![false; row.len()]
-                            };
-
-                            let mut row_obj = serde_json::Map::new();
-
-                            for (col_idx, datum) in row.into_iter().enumerate() {
-                                if col_idx < result_data.columns.len() {
-                                    let col_name = &result_data.columns[col_idx].name;
-                                    let value = if col_idx < row_nulls.len() && row_nulls[col_idx] {
-                                        serde_json::Value::Null
-                                    } else {
-                                        match result_data.columns[col_idx].type_oid {
-                                            pg_sys::INT4OID => {
-                                                serde_json::json!(datum.value() as i32)
-                                            }
-                                            pg_sys::INT8OID => {
-                                                serde_json::json!(datum.value() as i64)
-                                            }
-                                            pg_sys::TEXTOID => {
-                                                serde_json::json!(format!("{}", datum.value()))
-                                            }
-                                            _ => serde_json::json!(datum.value() as i64),
-                                        }
-                                    };
-                                    row_obj.insert(col_name.clone(), value);
-                                }
-                            }
-
-                            serde_json::Value::Object(row_obj)
-                        })
-                        .collect();
-
-                    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
-                }
-                Err(e) => {
-                    pgrx::warning!("Failed to execute plan: {}", e);
-                    serde_json::json!({"error": format!("Execution failed: {}", e)}).to_string()
-                }
-            }
-        }
-        Err(e) => {
-            pgrx::warning!("Failed to parse JSON: {}", e);
-            serde_json::json!({"error": format!("Parse failed: {}", e)}).to_string()
-        }
-    }
-}
-
 /// Helper function to generate schema information for dynamic functions
-#[pg_extern]
-fn from_substrait_json_schema(json_plan: &str) -> String {
-    pgrx::info!("Getting schema for JSON plan: {}", json_plan);
-
-    // Parse the Substrait plan and return just the schema information
-    match serde_json::from_str::<Plan>(json_plan) {
-        Ok(plan) => match execute_substrait_plan(plan) {
-            Ok(result_data) => {
-                let schema = result_data
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        serde_json::json!({
-                            "name": col.name,
-                            "type": match col.type_oid {
-                                pg_sys::INT4OID => "integer",
-                                pg_sys::INT8OID => "bigint",
-                                pg_sys::TEXTOID => "text",
-                                _ => "unknown"
-                            },
-                            "postgres_type": match col.type_oid {
-                                pg_sys::INT4OID => "int4",
-                                pg_sys::INT8OID => "int8",
-                                pg_sys::TEXTOID => "text",
-                                _ => "text"
-                            }
-                        })
+#[allow(dead_code)]
+fn extract_plan_schema(plan: Plan) -> String {
+    // Extract schema information from a Substrait plan
+    match execute_substrait_plan(plan) {
+        Ok(result_data) => {
+            let schema = result_data
+                .columns
+                .iter()
+                .map(|col| {
+                    serde_json::json!({
+                        "name": col.name,
+                        "type": match col.type_oid {
+                            pg_sys::INT4OID => "integer",
+                            pg_sys::INT8OID => "bigint",
+                            pg_sys::TEXTOID => "text",
+                            _ => "unknown"
+                        },
+                        "postgres_type": match col.type_oid {
+                            pg_sys::INT4OID => "int4",
+                            pg_sys::INT8OID => "int8",
+                            pg_sys::TEXTOID => "text",
+                            _ => "text"
+                        }
                     })
-                    .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
 
-                serde_json::to_string(&schema).unwrap_or_else(|_| "[]".to_string())
-            }
-            Err(e) => {
-                pgrx::warning!("Failed to get schema: {}", e);
-                serde_json::json!([{"error": format!("Schema extraction failed: {}", e)}])
-                    .to_string()
-            }
-        },
+            serde_json::to_string(&schema).unwrap_or_else(|_| "[]".to_string())
+        }
         Err(e) => {
-            pgrx::warning!("Failed to parse JSON for schema: {}", e);
-            serde_json::json!([{"error": format!("JSON parse failed: {}", e)}]).to_string()
+            pgrx::warning!("Failed to get schema: {}", e);
+            serde_json::json!([{"error": format!("Schema extraction failed: {}", e)}]).to_string()
         }
     }
 }
 
-/// Working native pgrx SRF function that successfully returns data (single column for testing)
-#[pg_extern]
-fn from_substrait_json_native(
-    json_plan: &str,
-) -> pgrx::iter::TableIterator<'static, (name!(result, i32),)> {
-    pgrx::info!(
-        "Starting from_substrait_json_native with plan: {}",
-        json_plan
-    );
-
-    // Parse the Substrait plan from JSON and execute it
-    match serde_json::from_str::<Plan>(json_plan) {
-        Ok(plan) => {
-            match execute_substrait_plan(plan) {
-                Ok(result_data) => {
-                    pgrx::info!(
-                        "Successfully executed plan with {} rows",
-                        result_data.rows.len()
-                    );
-
-                    // Convert the first column to i32 values and return them
-                    let values: Vec<(i32,)> = result_data
-                        .rows
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(row_idx, row)| {
-                            if !row.is_empty() {
-                                let is_null = if row_idx < result_data.nulls.len()
-                                    && !result_data.nulls[row_idx].is_empty()
-                                {
-                                    result_data.nulls[row_idx][0]
-                                } else {
-                                    false
-                                };
-
-                                if !is_null {
-                                    Some((row[0].value() as i32,))
-                                } else {
-                                    Some((0,)) // Handle nulls as 0 for now
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    pgrx::iter::TableIterator::new(values)
-                }
-                Err(e) => {
-                    pgrx::warning!("Failed to execute plan: {}", e);
-                    pgrx::iter::TableIterator::new(vec![])
-                }
-            }
-        }
-        Err(e) => {
-            pgrx::warning!("Failed to parse JSON: {}", e);
-            pgrx::iter::TableIterator::new(vec![])
-        }
-    }
-}
-
-/// Fixed SETOF RECORD implementation - this should work now
 #[pg_extern(
     sql = "CREATE OR REPLACE FUNCTION from_substrait_json(json_plan text) RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'from_substrait_json_wrapper' LANGUAGE c STRICT;"
 )]
@@ -479,27 +189,6 @@ unsafe fn extract_bytea_arg(fcinfo: pg_sys::FunctionCallInfo, arg_num: i32) -> &
     std::slice::from_raw_parts(data_ptr, data_len)
 }
 
-/// Handle empty input for SRF functions properly
-unsafe fn handle_empty_srf(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
-    let func_ctx = pg_sys::init_MultiFuncCall(fcinfo);
-
-    if (*func_ctx).call_cntr == 0 {
-        // Set up for returning no rows
-        (*func_ctx).max_calls = 0;
-
-        // Set up return info
-        let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-        if !result_info.is_null() {
-            (*result_info).returnMode = pg_sys::SetFunctionReturnMode::SFRM_ValuePerCall;
-            (*result_info).isDone = pg_sys::ExprDoneCond::ExprEndResult;
-        }
-    }
-
-    // End the MultiFuncCall since we have no rows to return
-    pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
-    pg_sys::Datum::null()
-}
-
 unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan) -> pg_sys::Datum {
     pgrx::info!("Starting execute_substrait_as_srf");
     match execute_substrait_plan(plan) {
@@ -511,8 +200,7 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
             execute_results_as_srf(fcinfo, result_data)
         }
         Err(e) => {
-            pgrx::info!("Failed to execute plan: {}", e);
-            handle_empty_srf(fcinfo)
+            pgrx::error!("Failed to execute Substrait plan: {}", e);
         }
     }
 }
@@ -874,40 +562,29 @@ fn get_type_name(type_oid: pg_sys::Oid) -> &'static str {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
+    use crate::extract_plan_schema;
     use pgrx::prelude::*;
 
     #[pg_test]
+    #[should_panic(expected = "Invalid Substrait plan: empty bytea provided")]
     fn test_from_substrait_basic() {
-        // Test that the function can be called
-        let result =
+        // Test that the function panics with proper error message for empty bytea
+        let _ =
             Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait(''::bytea) AS t(result int)");
-
-        // The function should handle empty input gracefully (either return 0 or error)
-        // The key test is that PostgreSQL doesn't crash
-        assert!(
-            result.is_ok() || result.is_err(),
-            "Function should not crash PostgreSQL"
-        );
     }
 
     #[pg_test]
+    #[should_panic(
+        expected = "Failed to execute Substrait plan: Expected exactly 1 relation, found 0"
+    )]
     fn test_from_substrait_json_basic() {
-        // Test that the JSON function can be called
-        let result =
+        // Test that the JSON function panics with proper error message for empty JSON
+        let _ =
             Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait_json('{}') AS t(result int)");
-
-        // The function should handle empty input gracefully
-        assert!(
-            result.is_ok() || result.is_err(),
-            "Function should not crash PostgreSQL"
-        );
     }
 
     #[pg_test]
-    fn test_from_substrait_error_handling() {
-        // Test from_substrait function error handling without causing crashes
-        // We'll test that the function can be called safely even with invalid data
-
+    fn test_from_substrait_function_metadata() {
         // Test that we can query the function metadata
         let result = Spi::get_one::<String>(
             "SELECT format('from_substrait function accepts %s and returns %s',
@@ -919,18 +596,13 @@ mod tests {
         let function_info = result.unwrap().unwrap();
         assert!(function_info.contains("bytea"));
         assert!(function_info.contains("SETOF"));
+    }
 
-        // Test that the function can be called without crashing PostgreSQL
-        // Testing with empty bytea - if function is unsafe, this would crash
-        let result =
-            Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait('') AS t(result int)");
-
-        // The key test is that PostgreSQL doesn't crash
-        // The function should handle the request gracefully (either return 0 or error)
-        assert!(
-            result.is_ok() || result.is_err(),
-            "Function should not crash PostgreSQL"
-        );
+    #[pg_test]
+    #[should_panic(expected = "Invalid Substrait plan: empty bytea provided")]
+    fn test_from_substrait_empty_bytea_error() {
+        // Test that the function returns the correct error for empty bytea
+        let _ = Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait('') AS t(result int)");
     }
 
     #[pg_test]
@@ -1005,11 +677,10 @@ mod tests {
         );
         let result = Spi::get_one::<i64>(&query);
 
-        // Note: This may fail due to the type OID issue we're currently debugging
-        // But it should not crash PostgreSQL
+        // This should succeed - we have a valid plan with a literal expression
         assert!(
-            result.is_ok() || result.is_err(),
-            "Real execution should handle literal expressions without crashing: {:?}",
+            result.is_ok(),
+            "Real execution with valid literal expression should succeed: {:?}",
             result.err()
         );
     }
@@ -1068,10 +739,10 @@ mod tests {
         );
         let result = Spi::get_one::<i64>(&query);
 
-        // The function should handle this minimal valid plan gracefully
+        // This should succeed - we have a minimal valid plan (SELECT 1)
         assert!(
-            result.is_ok() || result.is_err(),
-            "from_substrait should handle minimal valid protobuf data (SELECT 1 equivalent) without crashing"
+            result.is_ok(),
+            "from_substrait should succeed with minimal valid protobuf data (SELECT 1 equivalent)"
         );
     }
 
@@ -1137,10 +808,11 @@ mod tests {
         );
         let result = Spi::get_one::<i64>(&query);
 
-        // The function should handle this gracefully, either returning data or a proper error
+        // This should succeed - we have valid protobuf data
         assert!(
-            result.is_ok() || result.is_err(),
-            "from_substrait should handle valid protobuf data without crashing"
+            result.is_ok(),
+            "from_substrait should succeed with valid protobuf data: {:?}",
+            result.err()
         );
     }
 
@@ -1177,9 +849,11 @@ mod tests {
         );
 
         let result = Spi::get_one::<i64>(&query);
+        // This should succeed - we have a valid JSON plan
         assert!(
-            result.is_ok() || result.is_err(),
-            "from_substrait_json should handle valid plan without crashing"
+            result.is_ok(),
+            "from_substrait_json should succeed with valid plan: {:?}",
+            result.err()
         );
     }
 
@@ -1212,9 +886,11 @@ mod tests {
         );
 
         let result = Spi::get_one::<i64>(&query);
+        // This should succeed - we have a valid JSON plan that returns results
         assert!(
-            result.is_ok() || result.is_err(),
-            "from_substrait_json should handle valid plan without crashing"
+            result.is_ok(),
+            "from_substrait_json should succeed with valid plan and return results: {:?}",
+            result.err()
         );
     }
 
@@ -1246,7 +922,7 @@ mod tests {
                     .join("\n");
 
                 // Verify it's valid JSON and parse as Substrait Plan
-                let _plan: substrait::proto::Plan = serde_json::from_str(&json_content)
+                let plan: substrait::proto::Plan = serde_json::from_str(&json_content)
                     .expect(concat!($file_name, " should parse as valid Substrait Plan"));
 
                 // Escape single quotes for SQL
@@ -1255,73 +931,37 @@ mod tests {
                 pgrx::info!("Testing {} - Attempting AS clause discovery", $file_name);
 
                 // Step 1: Try schema discovery function
-                let schema_query = format!("SELECT from_substrait_json_schema('{}')", escaped_json);
-                match Spi::get_one::<String>(&schema_query) {
-                    Ok(Some(schema_info)) if !schema_info.contains("error") => {
-                        // Schema discovery worked! Try executing with this AS clause
-                        pgrx::info!("{} - Got schema: {}", $file_name, schema_info);
+                let schema_info = extract_plan_schema(plan);
+                if schema_info.contains("error") {
+                    pgrx::info!("{} - Schema discovery failed: {}", $file_name, schema_info);
+                    return;
+                }
 
-                        let execution_query = format!(
-                            "SELECT * FROM from_substrait_json('{}') AS t({})",
-                            escaped_json, schema_info
-                        );
+                // Schema discovery worked! Try executing with this AS clause
+                pgrx::info!("{} - Got schema: {}", $file_name, schema_info);
 
-                        // This might fail due to missing tables, but AS clause should be correct
-                        match Spi::run(&execution_query) {
-                            Ok(_) => pgrx::info!("{} - Execution succeeded!", $file_name),
-                            Err(e) => {
-                                let error_msg = format!("{:?}", e);
-                                if error_msg.contains("does not exist")
-                                    || error_msg.contains("relation")
-                                {
-                                    pgrx::info!(
-                                        "{} - AS clause correct, but missing tables: {}",
-                                        $file_name,
-                                        error_msg
-                                    );
-                                } else {
-                                    pgrx::info!(
-                                        "{} - AS clause validation failed: {}",
-                                        $file_name,
-                                        error_msg
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        // Schema discovery failed, try dummy AS clause to get error message
-                        pgrx::info!(
-                            "{} - Schema discovery failed, trying dummy AS clause",
-                            $file_name
-                        );
+                let execution_query = format!(
+                    "SELECT * FROM from_substrait_json('{}') AS t({})",
+                    escaped_json, schema_info
+                );
 
-                        let dummy_query = format!(
-                            "SELECT * FROM from_substrait_json('{}') AS t(dummy_col int)",
-                            escaped_json
-                        );
-
-                        match Spi::run(&dummy_query) {
-                            Ok(_) => {
-                                pgrx::info!("{} - Dummy AS clause worked unexpectedly", $file_name)
-                            }
-                            Err(e) => {
-                                let error_msg = format!("{:?}", e);
-                                if error_msg.contains("AS clause") || error_msg.contains("column") {
-                                    pgrx::info!(
-                                        "{} - Got helpful error for AS clause: {}",
-                                        $file_name,
-                                        error_msg
-                                    );
-                                } else if error_msg.contains("does not exist") {
-                                    pgrx::info!(
-                                        "{} - Missing tables, but AS clause structure accepted",
-                                        $file_name
-                                    );
-                                } else {
-                                    pgrx::info!("{} - Other error: {}", $file_name, error_msg);
-                                }
-                            }
+                // This might fail due to missing tables, but AS clause should be correct
+                match Spi::run(&execution_query) {
+                    Ok(_) => pgrx::info!("{} - Execution succeeded!", $file_name),
+                    Err(e) => {
+                        let error_msg = format!("{:?}", e);
+                        if error_msg.contains("does not exist") || error_msg.contains("relation") {
+                            pgrx::info!(
+                                "{} - AS clause correct, but missing tables: {}",
+                                $file_name,
+                                error_msg
+                            );
+                        } else {
+                            pgrx::info!(
+                                "{} - AS clause validation failed: {}",
+                                $file_name,
+                                error_msg
+                            );
                         }
                     }
                 }
@@ -1330,6 +970,7 @@ mod tests {
     }
 
     // Generate test functions for each TPC-H file
+    // TODO: Modify to also test the results.
     tpch_test!(test_tpch_plan01, "tpch-plan01.json");
     tpch_test!(test_tpch_plan02, "tpch-plan02.json");
     tpch_test!(test_tpch_plan03, "tpch-plan03.json");
@@ -1352,8 +993,8 @@ mod tests {
     tpch_test!(test_tpch_plan22, "tpch-plan22.json");
 
     #[pg_test]
-    fn test_as_clause_still_works() {
-        // Test that AS clause still works when provided (backward compatibility)
+    fn test_valid_as_clause_works() {
+        // Test that a valid AS clause works
         let json_plan = r#"{
             "version": {"minorNumber": 54},
             "relations": [{
@@ -1381,9 +1022,11 @@ mod tests {
         );
         let result = Spi::get_one::<i32>(&query_with_as);
 
+        // This should succeed - we have a valid plan with AS clause
         assert!(
-            result.is_ok() || result.is_err(),
-            "Query with AS clause should still work for backward compatibility"
+            result.is_ok(),
+            "Query with AS clause should succeed: {:?}",
+            result.err()
         );
     }
 
