@@ -562,7 +562,7 @@ fn get_type_name(type_oid: pg_sys::Oid) -> &'static str {
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
-    use crate::extract_plan_schema;
+    use crate::{execute_substrait_plan, generate_as_clause};
     use pgrx::prelude::*;
 
     #[pg_test]
@@ -894,9 +894,16 @@ mod tests {
         );
     }
 
-    // Macro to generate individual test functions for each TPC-H file
+    // Golden expectation types for TPC-H query validation
+    enum GoldenExpectation {
+        IntExact(i64),
+        FloatTolerance(f64, f64), // value, tolerance
+        StringExact(&'static str),
+    }
+
+    // TPC-H test macro with localized golden values
     macro_rules! tpch_test {
-        ($test_name:ident, $file_name:literal) => {
+        ($test_name:ident, $file_name:literal, $expected_value:expr) => {
             #[pg_test]
             fn $test_name() {
                 use std::fs;
@@ -928,40 +935,108 @@ mod tests {
                 // Escape single quotes for SQL
                 let escaped_json = json_content.replace("'", "''");
 
-                pgrx::info!("Testing {} - Attempting AS clause discovery", $file_name);
-
-                // Step 1: Try schema discovery function
-                let schema_info = extract_plan_schema(plan);
-                if schema_info.contains("error") {
-                    pgrx::info!("{} - Schema discovery failed: {}", $file_name, schema_info);
-                    return;
-                }
-
-                // Schema discovery worked! Try executing with this AS clause
-                pgrx::info!("{} - Got schema: {}", $file_name, schema_info);
-
-                let execution_query = format!(
-                    "SELECT * FROM from_substrait_json('{}') AS t({})",
-                    escaped_json, schema_info
+                pgrx::info!(
+                    "Testing {} - Attempting dynamic AS clause generation",
+                    $file_name
                 );
 
-                // This might fail due to missing tables, but AS clause should be correct
-                match Spi::run(&execution_query) {
-                    Ok(_) => pgrx::info!("{} - Execution succeeded!", $file_name),
+                // Step 1: Execute plan to get schema information
+                let plan_result = execute_substrait_plan(plan);
+                let as_clause = match plan_result {
+                    Ok(result_data) => {
+                        let clause = generate_as_clause(&result_data);
+                        pgrx::info!("{} - Generated AS clause: {}", $file_name, clause);
+                        clause
+                    }
                     Err(e) => {
-                        let error_msg = format!("{:?}", e);
-                        if error_msg.contains("does not exist") || error_msg.contains("relation") {
-                            pgrx::info!(
-                                "{} - AS clause correct, but missing tables: {}",
-                                $file_name,
-                                error_msg
-                            );
-                        } else {
-                            pgrx::info!(
-                                "{} - AS clause validation failed: {}",
-                                $file_name,
-                                error_msg
-                            );
+                        pgrx::info!("{} - Schema discovery failed: {}", $file_name, e);
+                        return;
+                    }
+                };
+
+                // Step 2: Set up TPC-H database for result validation
+                pgrx::info!(
+                    "{} - Setting up TPC-H database for result validation",
+                    $file_name
+                );
+                setup_tpch_database_if_needed();
+
+                // Step 3: Execute the Substrait plan and validate results with golden values
+                let execution_query = format!(
+                    "SELECT * FROM from_substrait_json('{}') AS t({})",
+                    escaped_json, as_clause
+                );
+
+                match $expected_value {
+                    GoldenExpectation::IntExact(expected) => {
+                        // For int expectations, get the first column of the first row and convert to i64
+                        match Spi::get_one::<i64>(&format!(
+                            "SELECT ({})::bigint LIMIT 1",
+                            execution_query
+                        )) {
+                            Ok(Some(actual)) => {
+                                assert_eq!(
+                                    actual, expected,
+                                    "{} - Expected {}, got {}",
+                                    $file_name, expected, actual
+                                );
+                                pgrx::info!(
+                                    "{} - Golden result validation passed! Value: {}",
+                                    $file_name,
+                                    actual
+                                );
+                            }
+                            Ok(None) => panic!("{} - Query returned NULL", $file_name),
+                            Err(e) => panic!("{} - Query execution failed: {:?}", $file_name, e),
+                        }
+                    }
+                    GoldenExpectation::FloatTolerance(expected, tolerance) => {
+                        // For float expectations, get the first column of the first row and convert to f64
+                        match Spi::get_one::<f64>(&format!(
+                            "SELECT ({})::double precision LIMIT 1",
+                            execution_query
+                        )) {
+                            Ok(Some(actual)) => {
+                                let difference = (actual - expected).abs();
+                                assert!(
+                                    difference < tolerance,
+                                    "{} - Expected {}, got {}, difference {} exceeds tolerance {}",
+                                    $file_name,
+                                    expected,
+                                    actual,
+                                    difference,
+                                    tolerance
+                                );
+                                pgrx::info!(
+                                    "{} - Golden result validation passed! Value: {}",
+                                    $file_name,
+                                    actual
+                                );
+                            }
+                            Ok(None) => panic!("{} - Query returned NULL", $file_name),
+                            Err(e) => panic!("{} - Query execution failed: {:?}", $file_name, e),
+                        }
+                    }
+                    GoldenExpectation::StringExact(expected) => {
+                        // For string expectations, get the first column of the first row as text
+                        match Spi::get_one::<String>(&format!(
+                            "SELECT ({})::text LIMIT 1",
+                            execution_query
+                        )) {
+                            Ok(Some(actual)) => {
+                                assert_eq!(
+                                    actual, expected,
+                                    "{} - Expected '{}', got '{}'",
+                                    $file_name, expected, actual
+                                );
+                                pgrx::info!(
+                                    "{} - Golden result validation passed! Value: {}",
+                                    $file_name,
+                                    actual
+                                );
+                            }
+                            Ok(None) => panic!("{} - Query returned NULL", $file_name),
+                            Err(e) => panic!("{} - Query execution failed: {:?}", $file_name, e),
                         }
                     }
                 }
@@ -969,28 +1044,126 @@ mod tests {
         };
     }
 
-    // Generate test functions for each TPC-H file
-    // TODO: Modify to also test the results.
-    tpch_test!(test_tpch_plan01, "tpch-plan01.json");
-    tpch_test!(test_tpch_plan02, "tpch-plan02.json");
-    tpch_test!(test_tpch_plan03, "tpch-plan03.json");
-    tpch_test!(test_tpch_plan04, "tpch-plan04.json");
-    tpch_test!(test_tpch_plan05, "tpch-plan05.json");
-    tpch_test!(test_tpch_plan06, "tpch-plan06.json");
-    tpch_test!(test_tpch_plan07, "tpch-plan07.json");
-    tpch_test!(test_tpch_plan09, "tpch-plan09.json");
-    tpch_test!(test_tpch_plan10, "tpch-plan10.json");
-    tpch_test!(test_tpch_plan11, "tpch-plan11.json");
-    tpch_test!(test_tpch_plan12, "tpch-plan12.json");
-    tpch_test!(test_tpch_plan13, "tpch-plan13.json");
-    tpch_test!(test_tpch_plan14, "tpch-plan14.json");
-    tpch_test!(test_tpch_plan16, "tpch-plan16.json");
-    tpch_test!(test_tpch_plan17, "tpch-plan17.json");
-    tpch_test!(test_tpch_plan18, "tpch-plan18.json");
-    tpch_test!(test_tpch_plan19, "tpch-plan19.json");
-    tpch_test!(test_tpch_plan20, "tpch-plan20.json");
-    tpch_test!(test_tpch_plan21, "tpch-plan21.json");
-    tpch_test!(test_tpch_plan22, "tpch-plan22.json");
+    // Generate test functions for each TPC-H file with localized golden values
+    tpch_test!(
+        test_tpch_plan01,
+        "tpch-plan01.json",
+        GoldenExpectation::IntExact(14876)
+    );
+
+    tpch_test!(
+        test_tpch_plan02,
+        "tpch-plan02.json",
+        GoldenExpectation::FloatTolerance(4186.95, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan03,
+        "tpch-plan03.json",
+        GoldenExpectation::FloatTolerance(2136084.7152, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan04,
+        "tpch-plan04.json",
+        GoldenExpectation::IntExact(93)
+    );
+
+    tpch_test!(
+        test_tpch_plan05,
+        "tpch-plan05.json",
+        GoldenExpectation::FloatTolerance(64059308.7936, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan06,
+        "tpch-plan06.json",
+        GoldenExpectation::FloatTolerance(1193053.2253, 0.001)
+    );
+
+    tpch_test!(
+        test_tpch_plan07,
+        "tpch-plan07.json",
+        GoldenExpectation::FloatTolerance(268068.5774, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan09,
+        "tpch-plan09.json",
+        GoldenExpectation::FloatTolerance(97864.5682, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan10,
+        "tpch-plan10.json",
+        GoldenExpectation::FloatTolerance(378211.3252, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan11,
+        "tpch-plan11.json",
+        GoldenExpectation::FloatTolerance(13271249.89, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan12,
+        "tpch-plan12.json",
+        GoldenExpectation::IntExact(64)
+    );
+
+    tpch_test!(
+        test_tpch_plan13,
+        "tpch-plan13.json",
+        GoldenExpectation::IntExact(500)
+    );
+
+    tpch_test!(
+        test_tpch_plan14,
+        "tpch-plan14.json",
+        GoldenExpectation::FloatTolerance(15.48654581228407, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan16,
+        "tpch-plan16.json",
+        GoldenExpectation::IntExact(8)
+    );
+
+    tpch_test!(
+        test_tpch_plan17,
+        "tpch-plan17.json",
+        GoldenExpectation::FloatTolerance(348406.05, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan18,
+        "tpch-plan18.json",
+        GoldenExpectation::FloatTolerance(439687.23, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan19,
+        "tpch-plan19.json",
+        GoldenExpectation::FloatTolerance(22923.0280, 0.01)
+    );
+
+    tpch_test!(
+        test_tpch_plan20,
+        "tpch-plan20.json",
+        GoldenExpectation::StringExact("Supplier#000000013")
+    );
+
+    tpch_test!(
+        test_tpch_plan21,
+        "tpch-plan21.json",
+        GoldenExpectation::IntExact(9)
+    );
+
+    tpch_test!(
+        test_tpch_plan22,
+        "tpch-plan22.json",
+        GoldenExpectation::FloatTolerance(75359.29, 0.01)
+    );
 
     #[pg_test]
     fn test_valid_as_clause_works() {
@@ -1030,52 +1203,55 @@ mod tests {
         );
     }
 
-    /// Helper function to create a test TPC-H schema (when we have the data)
-    #[pg_test]
-    fn test_tpch_schema_setup() {
-        // This test will set up a minimal TPC-H schema for testing
-        // For now, create a simple test table to verify our approach works
+    /// Sets up TPC-H database if needed (checks if lineitem table exists)
+    fn setup_tpch_database_if_needed() {
+        // Check if lineitem table already exists
+        let table_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'lineitem')",
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
 
-        Spi::run("DROP TABLE IF EXISTS test_lineitem").ok();
+        if table_exists {
+            pgrx::info!("TPC-H lineitem table already exists, skipping setup");
+            return;
+        }
 
-        let create_table = r#"
-            CREATE TABLE test_lineitem (
-                l_orderkey INTEGER,
-                l_partkey INTEGER,
-                l_suppkey INTEGER,
-                l_linenumber INTEGER,
-                l_quantity DECIMAL(15,2),
-                l_extendedprice DECIMAL(15,2),
-                l_discount DECIMAL(15,2),
-                l_tax DECIMAL(15,2),
-                l_returnflag CHAR(1),
-                l_linestatus CHAR(1),
-                l_shipdate DATE,
-                l_commitdate DATE,
-                l_receiptdate DATE,
-                l_shipinstruct CHAR(25),
-                l_shipmode CHAR(10),
-                l_comment VARCHAR(44)
-            )
-        "#;
+        pgrx::info!("Setting up TPC-H database using shell script");
 
-        Spi::run(create_table).expect("Failed to create test_lineitem table");
+        use std::process::Command;
 
-        // Insert a few test rows
-        let insert_data = r#"
-            INSERT INTO test_lineitem VALUES
-            (1, 1, 1, 1, 17.00, 21168.23, 0.04, 0.02, 'N', 'O', '1996-03-13', '1996-02-12', '1996-03-22', 'DELIVER IN PERSON', 'TRUCK', 'test comment 1'),
-            (1, 2, 2, 2, 36.00, 45983.16, 0.09, 0.06, 'N', 'O', '1996-04-12', '1996-02-28', '1996-04-20', 'TAKE BACK RETURN', 'MAIL', 'test comment 2')
-        "#;
+        // Find the setup script in the project
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let script_path = std::path::Path::new(manifest_dir).join("scripts/setup-tpch.sh");
 
-        Spi::run(insert_data).expect("Failed to insert test data");
+        if !script_path.exists() {
+            panic!("TPC-H setup script not found at: {}", script_path.display());
+        }
 
-        // Verify the data was inserted
-        let count = Spi::get_one::<i64>("SELECT COUNT(*) FROM test_lineitem")
-            .expect("Failed to count rows")
-            .expect("Count should not be null");
+        // Get connection details for the test database
+        let db_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/pgrx_tests".to_string());
 
-        assert_eq!(count, 2, "Should have inserted 2 test rows");
+        // Run the setup script
+        let output = Command::new("bash")
+            .arg(&script_path)
+            .arg("pgrx_tests") // Pass the test database name
+            .env("DATABASE_URL", &db_url)
+            .output()
+            .expect("Failed to execute TPC-H setup script");
+
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "TPC-H setup script failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
+                stdout, stderr
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        pgrx::info!("TPC-H setup completed: {}", stdout);
     }
 }
 
