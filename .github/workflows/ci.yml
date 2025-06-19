@@ -73,18 +73,10 @@ jobs:
     - name: Initialize pgrx
       run: cargo pgrx init --pg${{ matrix.pg }} download
 
-    - name: Setup TPC-H test database
+    - name: Prepare TPC-H setup script
       run: |
-        # Start PostgreSQL and create test database
-        cargo pgrx start pg${{ matrix.pg }}
-        sleep 5  # Give PostgreSQL time to start
-
-        # Run TPC-H setup script
+        # Make TPC-H setup script executable for tests
         chmod +x scripts/setup-tpch.sh
-        scripts/setup-tpch.sh pgrx_tests
-
-        # Stop PostgreSQL (it will be restarted during tests)
-        cargo pgrx stop pg${{ matrix.pg }}
 
     - name: Check formatting
       run: cargo fmt --all -- --check
