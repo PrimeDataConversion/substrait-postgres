@@ -218,6 +218,23 @@ pub unsafe fn convert_rel_to_plan_tree(
 
             create_limit_node(input_plan, offset, count)
         }
+        Some(RelType::Filter(filter)) => {
+            // Handle filter relation - create a Filter node
+            let input_plan = if let Some(input) = &filter.input {
+                convert_rel_to_plan_tree(input)?
+            } else {
+                return Err("Filter relation missing input".into());
+            };
+
+            // Convert the filter condition to a PostgreSQL expression
+            let condition_expr = if let Some(condition) = &filter.condition {
+                convert_expression_to_postgres(condition)?
+            } else {
+                return Err("Filter relation missing condition".into());
+            };
+
+            create_filter_node(input_plan, condition_expr)
+        }
         Some(rel_type) => {
             let type_name = get_relation_type_name(rel_type);
             Err(format!(
@@ -615,4 +632,188 @@ pub unsafe fn create_limit_node(
     }
 
     Ok(limit_node as *mut pg_sys::Plan)
+}
+
+/// Convert a Substrait expression to a PostgreSQL expression tree
+pub unsafe fn convert_expression_to_postgres(
+    expr: &Expression,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            // Handle literal values
+            if let Some(literal_type) = &literal.literal_type {
+                match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        create_int8_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        // For now, treat date as int32 (days since epoch)
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
+                        create_text_const(val)
+                    }
+                    _ => Err("Unsupported literal type in filter condition".into()),
+                }
+            } else {
+                Err("Literal expression missing literal type".into())
+            }
+        }
+        Some(RexType::Selection(selection)) => {
+            // Handle column references - use reference_type directly
+            if let Some(ref_type) = &selection.reference_type {
+                match ref_type {
+                    substrait::proto::expression::field_reference::ReferenceType::DirectReference(direct_ref) => {
+                        if let Some(struct_field) = &direct_ref.reference_type {
+                            match struct_field {
+                                substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
+                                    create_var_node(field.field as i32 + 1) // 1-based indexing
+                                }
+                                _ => Err("Unsupported reference type in filter condition".into()),
+                            }
+                        } else {
+                            Err("Missing reference type in direct reference".into())
+                        }
+                    }
+                    _ => Err("Unsupported field reference type in filter condition".into()),
+                }
+            } else {
+                Err("Missing reference type in selection".into())
+            }
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            // Handle scalar functions (e.g., comparison operators)
+            create_scalar_function_expr(func)
+        }
+        Some(RexType::Cast(cast)) => {
+            // Handle type casts
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres(input)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            // For now, just return the input expression without casting
+            // TODO: Implement proper type casting
+            Ok(input_expr)
+        }
+        _ => Err("Unsupported expression type in filter condition".into()),
+    }
+}
+
+/// Create a PostgreSQL Var node for column references
+pub unsafe fn create_var_node(
+    attr_number: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+    (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
+    (*var_node).varno = 1; // Single table reference for now
+    (*var_node).varattno = attr_number as pg_sys::AttrNumber;
+    (*var_node).vartype = pg_sys::UNKNOWNOID; // Will be resolved during planning
+    (*var_node).vartypmod = -1;
+    (*var_node).varcollid = pg_sys::InvalidOid;
+    (*var_node).varlevelsup = 0;
+
+    Ok(var_node as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL scalar function expression
+pub unsafe fn create_scalar_function_expr(
+    func: &substrait::proto::expression::ScalarFunction,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // For now, create a simple comparison operation
+    // In a full implementation, we'd need to map Substrait function references to PostgreSQL operators
+
+    if func.arguments.len() == 2 {
+        // Binary comparison - assume it's a less-than-equal comparison for dates
+        let left_arg = if let Some(arg) = func.arguments.get(0) {
+            if let Some(value) = &arg.arg_type {
+                match value {
+                    substrait::proto::function_argument::ArgType::Value(expr) => {
+                        convert_expression_to_postgres(expr)?
+                    }
+                    _ => return Err("Unsupported argument type in scalar function".into()),
+                }
+            } else {
+                return Err("Missing argument type in scalar function".into());
+            }
+        } else {
+            return Err("Missing left argument in binary function".into());
+        };
+
+        let right_arg = if let Some(arg) = func.arguments.get(1) {
+            if let Some(value) = &arg.arg_type {
+                match value {
+                    substrait::proto::function_argument::ArgType::Value(expr) => {
+                        convert_expression_to_postgres(expr)?
+                    }
+                    _ => return Err("Unsupported argument type in scalar function".into()),
+                }
+            } else {
+                return Err("Missing argument type in scalar function".into());
+            }
+        } else {
+            return Err("Missing right argument in binary function".into());
+        };
+
+        // Create a binary operation expression (less-than-equal for now)
+        create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(1058)) // DATE_LE_OP
+    } else {
+        Err("Unsupported scalar function with non-binary arguments".into())
+    }
+}
+
+/// Create a PostgreSQL binary operation expression
+pub unsafe fn create_binary_op_expr(
+    left_arg: *mut pg_sys::Expr,
+    right_arg: *mut pg_sys::Expr,
+    operator_oid: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let op_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::OpExpr>()) as *mut pg_sys::OpExpr;
+    (*op_expr).xpr.type_ = pg_sys::NodeTag::T_OpExpr;
+    (*op_expr).opno = operator_oid;
+    (*op_expr).opfuncid = pg_sys::InvalidOid; // Will be resolved during planning
+    (*op_expr).opresulttype = pg_sys::BOOLOID; // Comparison results in boolean
+    (*op_expr).opretset = false;
+    (*op_expr).opcollid = pg_sys::InvalidOid;
+    (*op_expr).inputcollid = pg_sys::InvalidOid;
+
+    // Create argument list
+    let mut args: *mut pg_sys::List = std::ptr::null_mut();
+    args = pg_sys::lappend(args, left_arg as *mut std::ffi::c_void);
+    args = pg_sys::lappend(args, right_arg as *mut std::ffi::c_void);
+    (*op_expr).args = args;
+
+    Ok(op_expr as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL Filter plan node from Substrait filter specification
+pub unsafe fn create_filter_node(
+    input_plan: *mut pg_sys::Plan,
+    condition_expr: *mut pg_sys::Expr,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // In PostgreSQL, filters are typically implemented as Result nodes with a qual condition
+    // For more complex filtering, we might need a custom scan node
+
+    let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
+    (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
+    (*result_node).plan.lefttree = input_plan;
+
+    // Pass through the target list from input
+    (*result_node).plan.targetlist = (*input_plan).targetlist;
+
+    // Set the filter condition as a qualification
+    let mut qual_list: *mut pg_sys::List = std::ptr::null_mut();
+    qual_list = pg_sys::lappend(qual_list, condition_expr as *mut std::ffi::c_void);
+    (*result_node).plan.qual = qual_list;
+
+    Ok(result_node as *mut pg_sys::Plan)
 }
