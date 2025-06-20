@@ -32,6 +32,26 @@ fn get_relation_type_name(rel_type: &RelType) -> &'static str {
     }
 }
 
+/// Get a human-readable name for a Substrait expression type
+fn get_expression_type_name(rex_type: &substrait::proto::expression::RexType) -> &'static str {
+    use substrait::proto::expression::RexType;
+    match rex_type {
+        RexType::Literal(_) => "Literal",
+        RexType::Selection(_) => "Selection",
+        RexType::ScalarFunction(_) => "ScalarFunction",
+        RexType::WindowFunction(_) => "WindowFunction",
+        RexType::IfThen(_) => "IfThen",
+        RexType::SwitchExpression(_) => "SwitchExpression",
+        RexType::SingularOrList(_) => "SingularOrList",
+        RexType::MultiOrList(_) => "MultiOrList",
+        RexType::Cast(_) => "Cast",
+        RexType::Subquery(_) => "Subquery",
+        RexType::Nested(_) => "Nested",
+        RexType::Enum(_) => "Enum",
+        RexType::DynamicParameter(_) => "DynamicParameter",
+    }
+}
+
 #[derive(Debug)]
 pub struct ExecutionResult {
     pub columns: Vec<ColumnInfo>,
@@ -1363,7 +1383,15 @@ pub unsafe fn convert_expression_to_postgres_with_context(
             // TODO: Implement proper type casting
             Ok(input_expr)
         }
-        _ => Err("Unsupported expression type in filter condition".into()),
+        Some(rex_type) => {
+            let type_name = get_expression_type_name(rex_type);
+            Err(format!(
+                "Unsupported expression type in filter condition: {}",
+                type_name
+            )
+            .into())
+        }
+        None => Err("Expression missing rex_type".into()),
     }
 }
 
