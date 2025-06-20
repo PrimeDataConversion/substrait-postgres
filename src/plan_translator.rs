@@ -1,5 +1,6 @@
 use anyhow::Result;
 use pgrx::pg_sys;
+use std::collections::HashMap;
 use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Plan, PlanRel, Rel};
 
@@ -54,6 +55,17 @@ pub fn translate_substrait_plan(
         "DEBUG: translate_substrait_plan called with {} relations",
         plan.relations.len()
     );
+
+    // Build function extension map for reference lookup
+    let function_map = build_function_extension_map(&plan);
+    eprintln!(
+        "DEBUG: Built function map with {} functions",
+        function_map.len()
+    );
+    for (ref_id, func_name) in &function_map {
+        eprintln!("  Function ref {}: {}", ref_id, func_name);
+    }
+
     // Validate the plan has exactly one relation
     if plan.relations.len() != 1 {
         return Err(format!(
@@ -75,7 +87,7 @@ pub fn translate_substrait_plan(
 
     // Convert Substrait relation to PostgreSQL plan tree
     unsafe {
-        let plan_tree = convert_plan_relation_to_plan_tree(relation)?;
+        let plan_tree = convert_plan_relation_to_plan_tree_with_context(relation, &function_map)?;
 
         // Debug: Print the PostgreSQL plan tree structure
         let plan_str = pg_sys::nodeToString(plan_tree as *const std::ffi::c_void);
@@ -795,6 +807,21 @@ pub unsafe fn create_scalar_function_expr(
     // For now, create a simple comparison operation
     // In a full implementation, we'd need to map Substrait function references to PostgreSQL operators
 
+    // Debug: Extract function information for better error reporting
+    let function_reference = func.function_reference;
+    let argument_count = func.arguments.len();
+
+    // Debug the actual argument structure
+    eprintln!("DEBUG: Scalar function details:");
+    eprintln!("  function_reference: {}", function_reference);
+    eprintln!("  arguments.len(): {}", argument_count);
+    eprintln!("  args field len: {}", func.args.len());
+    eprintln!("  Function should be 'lte:date_date' based on plan");
+
+    for (i, arg) in func.arguments.iter().enumerate() {
+        eprintln!("  arg[{}]: has_arg_type={}", i, arg.arg_type.is_some());
+    }
+
     if func.arguments.len() == 2 {
         // Binary comparison - assume it's a less-than-equal comparison for dates
         let left_arg = if let Some(arg) = func.arguments.get(0) {
@@ -830,7 +857,11 @@ pub unsafe fn create_scalar_function_expr(
         // Create a binary operation expression (less-than-equal for now)
         create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(1058)) // DATE_LE_OP
     } else {
-        Err("Unsupported scalar function with non-binary arguments".into())
+        Err(format!(
+            "Unsupported scalar function with non-binary arguments (function_reference={}, args_count={})",
+            function_reference, argument_count
+        )
+        .into())
     }
 }
 
@@ -974,4 +1005,591 @@ unsafe fn create_combined_target_list(
     }
 
     Ok(combined_list)
+}
+
+/// Build a map of function references to their names from the plan's extensions
+fn build_function_extension_map(plan: &Plan) -> HashMap<u32, String> {
+    let mut function_map = HashMap::new();
+
+    for extension in &plan.extensions {
+        if let Some(ext_type) = &extension.mapping_type {
+            match ext_type {
+                substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(func) => {
+                    function_map.insert(func.function_anchor, func.name.clone());
+                }
+                _ => {} // Handle other extension types as needed
+            }
+        }
+    }
+
+    function_map
+}
+
+/// Convert plan relation with function context
+pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
+    relation: &PlanRel,
+    _function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(rel_type) = &relation.rel_type {
+        match rel_type {
+            substrait::proto::plan_rel::RelType::Root(root) => {
+                if let Some(input) = &root.input {
+                    convert_rel_to_plan_tree_with_context(input, _function_map)
+                } else {
+                    Err("Root relation missing input".into())
+                }
+            }
+            _ => Err("Only root relations are currently supported".into()),
+        }
+    } else {
+        Err("Relation missing rel_type".into())
+    }
+}
+
+/// Convert relation with function context
+pub unsafe fn convert_rel_to_plan_tree_with_context(
+    rel: &Rel,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::rel::RelType;
+
+    match &rel.rel_type {
+        Some(RelType::Project(project)) => {
+            // Handle projection - create a Result node
+            let input_plan = if let Some(input) = &project.input {
+                convert_rel_to_plan_tree_with_context(input, function_map)?
+            } else {
+                std::ptr::null_mut()
+            };
+
+            // Convert expressions to PostgreSQL target entries
+            let target_list = convert_expressions_to_target_list_with_context(
+                &project.expressions,
+                function_map,
+            )?;
+
+            // Create a Result plan node using PostgreSQL's memory allocator
+            let result_node =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
+            (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
+            (*result_node).plan.lefttree = input_plan;
+            (*result_node).plan.targetlist = target_list;
+
+            Ok(result_node as *mut pg_sys::Plan)
+        }
+        Some(RelType::Read(read)) => {
+            // Handle table reads
+            if let Some(read_type) = &read.read_type {
+                match read_type {
+                    substrait::proto::read_rel::ReadType::VirtualTable(_vt) => {
+                        // Virtual table - create a Values scan node
+                        create_values_scan_node()
+                    }
+                    substrait::proto::read_rel::ReadType::NamedTable(nt) => {
+                        // Named table - create a SeqScan node
+                        let table_name = nt.names.join(".");
+                        create_seqscan_node(&table_name)
+                    }
+                    _ => Err("Unsupported read type".into()),
+                }
+            } else {
+                Err("Read relation missing read type".into())
+            }
+        }
+        Some(RelType::Sort(sort)) => {
+            // Handle sort relation - create a Sort node
+            let input_plan = if let Some(input) = &sort.input {
+                convert_rel_to_plan_tree_with_context(input, function_map)?
+            } else {
+                return Err("Sort relation missing input".into());
+            };
+
+            create_sort_node(input_plan, &sort.sorts)
+        }
+        Some(RelType::Fetch(fetch)) => {
+            // Handle fetch relation - create a Limit node
+            let input_plan = if let Some(input) = &fetch.input {
+                convert_rel_to_plan_tree_with_context(input, function_map)?
+            } else {
+                return Err("Fetch relation missing input".into());
+            };
+
+            // Extract offset and count from the fetch relation using expression conversion
+            let offset_expr = if let Some(offset_mode) = &fetch.offset_mode {
+                use substrait::proto::fetch_rel::OffsetMode;
+                match offset_mode {
+                    OffsetMode::OffsetExpr(expr) => Some(
+                        convert_expression_to_postgres_with_context(expr, function_map)?,
+                    ),
+                    OffsetMode::Offset(_) => {
+                        return Err(
+                            "Deprecated constant offset not supported, use offset_expr instead"
+                                .into(),
+                        );
+                    }
+                }
+            } else {
+                None // No offset limit
+            };
+
+            let count_expr = if let Some(count_mode) = &fetch.count_mode {
+                use substrait::proto::fetch_rel::CountMode;
+                match count_mode {
+                    CountMode::CountExpr(expr) => Some(
+                        convert_expression_to_postgres_with_context(expr, function_map)?,
+                    ),
+                    CountMode::Count(_) => {
+                        return Err(
+                            "Deprecated constant count not supported, use count_expr instead"
+                                .into(),
+                        );
+                    }
+                }
+            } else {
+                None // No count limit
+            };
+
+            create_limit_node_with_expressions(input_plan, offset_expr, count_expr)
+        }
+        Some(RelType::Filter(filter)) => {
+            // Handle filter relation - create a Filter node
+            let input_plan = if let Some(input) = &filter.input {
+                convert_rel_to_plan_tree_with_context(input, function_map)?
+            } else {
+                return Err("Filter relation missing input".into());
+            };
+
+            // Convert the filter condition to a PostgreSQL expression
+            let condition_expr = if let Some(condition) = &filter.condition {
+                convert_expression_to_postgres_with_context(condition, function_map)?
+            } else {
+                return Err("Filter relation missing condition".into());
+            };
+
+            create_filter_node(input_plan, condition_expr)
+        }
+        Some(RelType::Cross(cross)) => {
+            // Handle cross relation - create a NestLoop node for Cartesian product
+            let left_plan = if let Some(left) = &cross.left {
+                convert_rel_to_plan_tree_with_context(left, function_map)?
+            } else {
+                return Err("Cross relation missing left input".into());
+            };
+
+            let right_plan = if let Some(right) = &cross.right {
+                convert_rel_to_plan_tree_with_context(right, function_map)?
+            } else {
+                return Err("Cross relation missing right input".into());
+            };
+
+            create_cross_join_node(left_plan, right_plan)
+        }
+        Some(rel_type) => {
+            let type_name = get_relation_type_name(rel_type);
+            Err(format!(
+                "Unsupported relation type: {} (implementation needed)",
+                type_name
+            )
+            .into())
+        }
+        None => Err("Relation missing rel_type".into()),
+    }
+}
+
+/// Convert expressions to target list with function context
+pub unsafe fn convert_expressions_to_target_list_with_context(
+    expressions: &[Expression],
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
+    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+
+    for (i, expr) in expressions.iter().enumerate() {
+        let target_entry = convert_expression_to_target_entry_with_context(expr, i, function_map)?;
+        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+    }
+
+    Ok(target_list)
+}
+
+/// Convert expression to target entry with function context
+unsafe fn convert_expression_to_target_entry_with_context(
+    expr: &Expression,
+    index: usize,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::TargetEntry, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            // Handle literal values
+            if let Some(literal_type) = &literal.literal_type {
+                let const_expr = match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        create_int4_const(*val)?
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        create_int8_const(*val)?
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        create_text_const(val)?
+                    }
+                    _ => {
+                        return Err(
+                            format!("Unsupported literal type for expression {}", index).into()
+                        )
+                    }
+                };
+
+                // Create TargetEntry
+                let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                    as *mut pg_sys::TargetEntry;
+                (*target_entry).expr = const_expr;
+                (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
+                (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
+                (*target_entry).resjunk = false;
+
+                Ok(target_entry)
+            } else {
+                Err(format!("Literal expression {} missing literal type", index).into())
+            }
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            // Handle scalar function expressions
+            let func_expr = create_scalar_function_expr_with_context(func, function_map)?;
+
+            // Create TargetEntry
+            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            (*target_entry).expr = func_expr;
+            (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
+            (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
+            (*target_entry).resjunk = false;
+
+            Ok(target_entry)
+        }
+        Some(RexType::Selection(selection)) => {
+            // Handle column references
+            let selection_expr = convert_selection_to_postgres(selection)?;
+
+            // Create TargetEntry
+            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            (*target_entry).expr = selection_expr;
+            (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
+            (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
+            (*target_entry).resjunk = false;
+
+            Ok(target_entry)
+        }
+        _ => Err(format!("Unsupported expression type at index {}", index).into()),
+    }
+}
+
+/// Convert selection expression to PostgreSQL
+unsafe fn convert_selection_to_postgres(
+    selection: &substrait::proto::expression::FieldReference,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ref_type) = &selection.reference_type {
+        match ref_type {
+            substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                direct_ref,
+            ) => {
+                if let Some(struct_field) = &direct_ref.reference_type {
+                    match struct_field {
+                        substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
+                            create_var_node(field.field as i32 + 1) // 1-based indexing
+                        }
+                        _ => Err("Unsupported reference type in selection".into()),
+                    }
+                } else {
+                    Err("Missing reference type in direct reference".into())
+                }
+            }
+            _ => Err("Unsupported field reference type in selection".into()),
+        }
+    } else {
+        Err("Missing reference type in selection".into())
+    }
+}
+
+/// Convert expression to PostgreSQL with function context
+pub unsafe fn convert_expression_to_postgres_with_context(
+    expr: &Expression,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            // Handle literal values
+            if let Some(literal_type) = &literal.literal_type {
+                match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        create_int8_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        // For now, treat date as int32 (days since epoch)
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
+                        create_text_const(val)
+                    }
+                    _ => Err("Unsupported literal type in filter condition".into()),
+                }
+            } else {
+                Err("Literal expression missing literal type".into())
+            }
+        }
+        Some(RexType::Selection(selection)) => convert_selection_to_postgres(selection),
+        Some(RexType::ScalarFunction(func)) => {
+            // Handle scalar functions (e.g., comparison operators)
+            create_scalar_function_expr_with_context(func, function_map)
+        }
+        Some(RexType::Cast(cast)) => {
+            // Handle type casts
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres_with_context(input, function_map)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            // For now, just return the input expression without casting
+            // TODO: Implement proper type casting
+            Ok(input_expr)
+        }
+        _ => Err("Unsupported expression type in filter condition".into()),
+    }
+}
+
+/// Create scalar function expression with function context
+pub unsafe fn create_scalar_function_expr_with_context(
+    func: &substrait::proto::expression::ScalarFunction,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let function_reference = func.function_reference;
+    let argument_count = func.arguments.len();
+
+    // Look up function name from extension map
+    let function_name = function_map
+        .get(&function_reference)
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    eprintln!("DEBUG: Scalar function details:");
+    eprintln!("  function_reference: {}", function_reference);
+    eprintln!("  function_name: {}", function_name);
+    eprintln!("  arguments.len(): {}", argument_count);
+
+    // Handle specific function types based on name
+    match function_name {
+        "lte:date_date" => {
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lte:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lte:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in lte:date_date function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lte:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lte:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in lte:date_date function".into());
+                };
+
+                // Create a binary operation expression for date less-than-equal
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(1058))
+            // DATE_LE_OP
+            } else {
+                Err(format!(
+                    "lte:date_date function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "and:bool" => {
+            // Handle variadic logical AND function using PostgreSQL's BoolExpr
+            if func.arguments.len() >= 2 {
+                // Convert all arguments to PostgreSQL expressions
+                let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
+                for arg in &func.arguments {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                let pg_expr = convert_expression_to_postgres_with_context(
+                                    expr,
+                                    function_map,
+                                )?;
+                                pg_args =
+                                    pg_sys::lappend(pg_args, pg_expr as *mut std::ffi::c_void);
+                            }
+                            _ => {
+                                return Err("Unsupported argument type in and:bool function".into())
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in and:bool function".into());
+                    }
+                }
+
+                // Create a BoolExpr node for variadic AND
+                let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
+                    as *mut pg_sys::BoolExpr;
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::AND_EXPR;
+                (*bool_expr).args = pg_args;
+
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(format!(
+                    "and:bool function expects at least 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "equal:any_any" => {
+            // Handle equality comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in equal:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in equal:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in equal:any_any function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in equal:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in equal:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in equal:any_any function".into());
+                };
+
+                // Create a binary operation expression for equality
+                // Use a generic equality operator - PostgreSQL will resolve the correct one based on types
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(96))
+            // INT4EQ_OP as a generic placeholder
+            } else {
+                Err(format!(
+                    "equal:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "like:str_str" => {
+            // Handle string LIKE pattern matching function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in like:str_str function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in like:str_str function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in like:str_str function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in like:str_str function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in like:str_str function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in like:str_str function".into());
+                };
+
+                // Create a binary operation expression for LIKE
+                // PostgreSQL LIKE operator OID is 15 (TEXTLIKE_OP)
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(15))
+            // TEXTLIKE_OP
+            } else {
+                Err(format!(
+                    "like:str_str function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        _ => Err(format!(
+            "Unsupported scalar function: {} (function_reference={}, args_count={})",
+            function_name, function_reference, argument_count
+        )
+        .into()),
+    }
 }
