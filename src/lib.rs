@@ -912,10 +912,13 @@ mod tests {
                 let file_path = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join(concat!("testdata/tpch/", $file_name));
 
-                // Skip test if file doesn't exist (optional test data)
-                if !file_path.exists() {
-                    return;
-                }
+                // Fail test if file doesn't exist - we need to know about missing test data
+                assert!(
+                    file_path.exists(),
+                    "TPC-H test file {} does not exist at path: {}",
+                    $file_name,
+                    file_path.display()
+                );
 
                 // Read and validate JSON
                 let content =
@@ -949,8 +952,7 @@ mod tests {
                         clause
                     }
                     Err(e) => {
-                        pgrx::info!("{} - Schema discovery failed: {}", $file_name, e);
-                        return;
+                        panic!("{} - Schema discovery failed: {}", $file_name, e);
                     }
                 };
 

@@ -1,6 +1,35 @@
 use anyhow::Result;
 use pgrx::pg_sys;
+use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Plan, PlanRel, Rel};
+
+/// Get a human-readable name for a Substrait relation type
+fn get_relation_type_name(rel_type: &RelType) -> &'static str {
+    match rel_type {
+        RelType::Project(_) => "Project",
+        RelType::Read(_) => "Read",
+        RelType::Aggregate(_) => "Aggregate",
+        RelType::Sort(_) => "Sort",
+        RelType::Filter(_) => "Filter",
+        RelType::Join(_) => "Join",
+        RelType::Cross(_) => "Cross",
+        RelType::Fetch(_) => "Fetch",
+        RelType::Window(_) => "Window",
+        RelType::Exchange(_) => "Exchange",
+        RelType::HashJoin(_) => "HashJoin",
+        RelType::MergeJoin(_) => "MergeJoin",
+        RelType::NestedLoopJoin(_) => "NestedLoopJoin",
+        RelType::Set(_) => "Set",
+        RelType::ExtensionSingle(_) => "ExtensionSingle",
+        RelType::ExtensionMulti(_) => "ExtensionMulti",
+        RelType::ExtensionLeaf(_) => "ExtensionLeaf",
+        RelType::Ddl(_) => "DDL",
+        RelType::Write(_) => "Write",
+        RelType::Reference(_) => "Reference",
+        RelType::Update(_) => "Update",
+        RelType::Expand(_) => "Expand",
+    }
+}
 
 #[derive(Debug)]
 pub struct ExecutionResult {
@@ -21,6 +50,10 @@ pub struct ColumnInfo {
 pub fn translate_substrait_plan(
     plan: Plan,
 ) -> Result<(&'static pg_sys::Plan, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: translate_substrait_plan called with {} relations",
+        plan.relations.len()
+    );
     // Validate the plan has exactly one relation
     if plan.relations.len() != 1 {
         return Err(format!(
@@ -43,6 +76,18 @@ pub fn translate_substrait_plan(
     // Convert Substrait relation to PostgreSQL plan tree
     unsafe {
         let plan_tree = convert_plan_relation_to_plan_tree(relation)?;
+
+        // Debug: Print the PostgreSQL plan tree structure
+        let plan_str = pg_sys::nodeToString(plan_tree as *const std::ffi::c_void);
+        if !plan_str.is_null() {
+            let plan_cstr = std::ffi::CStr::from_ptr(plan_str);
+            if let Ok(plan_string) = plan_cstr.to_str() {
+                eprintln!("DEBUG: PostgreSQL Plan Tree: {}", plan_string);
+                pgrx::info!("PostgreSQL Plan Tree: {}", plan_string);
+            }
+            pg_sys::pfree(plan_str as *mut std::ffi::c_void);
+        }
+
         Ok((&*plan_tree, column_names))
     }
 }
@@ -138,7 +183,15 @@ pub unsafe fn convert_rel_to_plan_tree(
                 Err("Read relation missing read type".into())
             }
         }
-        _ => Err("Unsupported relation type".into()),
+        Some(rel_type) => {
+            let type_name = get_relation_type_name(rel_type);
+            Err(format!(
+                "Unsupported relation type: {} (implementation needed)",
+                type_name
+            )
+            .into())
+        }
+        None => Err("Relation missing rel_type".into()),
     }
 }
 
