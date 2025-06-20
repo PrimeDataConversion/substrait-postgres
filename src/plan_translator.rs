@@ -201,22 +201,38 @@ pub unsafe fn convert_rel_to_plan_tree(
                 return Err("Fetch relation missing input".into());
             };
 
-            // Extract offset and count from the fetch relation
-            let offset = if let Some(offset_expr) = &fetch.offset_mode {
-                // For now, assume literal offset values
-                0 // TODO: evaluate expression properly
+            // Extract offset and count from the fetch relation using expression conversion
+            let offset_expr = if let Some(offset_mode) = &fetch.offset_mode {
+                use substrait::proto::fetch_rel::OffsetMode;
+                match offset_mode {
+                    OffsetMode::OffsetExpr(expr) => Some(convert_expression_to_postgres(expr)?),
+                    OffsetMode::Offset(_) => {
+                        return Err(
+                            "Deprecated constant offset not supported, use offset_expr instead"
+                                .into(),
+                        );
+                    }
+                }
             } else {
-                0
+                None // No offset limit
             };
 
-            let count = if let Some(count_expr) = &fetch.count_mode {
-                // For now, assume literal count values
-                100 // TODO: evaluate expression properly
+            let count_expr = if let Some(count_mode) = &fetch.count_mode {
+                use substrait::proto::fetch_rel::CountMode;
+                match count_mode {
+                    CountMode::CountExpr(expr) => Some(convert_expression_to_postgres(expr)?),
+                    CountMode::Count(_) => {
+                        return Err(
+                            "Deprecated constant count not supported, use count_expr instead"
+                                .into(),
+                        );
+                    }
+                }
             } else {
-                0
+                None // No count limit
             };
 
-            create_limit_node(input_plan, offset, count)
+            create_limit_node_with_expressions(input_plan, offset_expr, count_expr)
         }
         Some(RelType::Filter(filter)) => {
             // Handle filter relation - create a Filter node
@@ -630,6 +646,37 @@ pub unsafe fn create_limit_node(
     } else {
         (*limit_node).limitOffset = std::ptr::null_mut();
     }
+
+    Ok(limit_node as *mut pg_sys::Plan)
+}
+
+/// Create a PostgreSQL Limit plan node with expression-based offset and count
+pub unsafe fn create_limit_node_with_expressions(
+    input_plan: *mut pg_sys::Plan,
+    offset_expr: Option<*mut pg_sys::Expr>,
+    count_expr: Option<*mut pg_sys::Expr>,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a Limit plan node
+    let limit_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Limit>()) as *mut pg_sys::Limit;
+    (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
+    (*limit_node).plan.lefttree = input_plan;
+
+    // Pass through the target list from input
+    (*limit_node).plan.targetlist = (*input_plan).targetlist;
+
+    // Set limit count from expression
+    (*limit_node).limitCount = if let Some(count_expr) = count_expr {
+        count_expr as *mut pg_sys::Node
+    } else {
+        std::ptr::null_mut()
+    };
+
+    // Set limit offset from expression
+    (*limit_node).limitOffset = if let Some(offset_expr) = offset_expr {
+        offset_expr as *mut pg_sys::Node
+    } else {
+        std::ptr::null_mut()
+    };
 
     Ok(limit_node as *mut pg_sys::Plan)
 }
