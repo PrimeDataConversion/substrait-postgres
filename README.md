@@ -72,7 +72,7 @@ cargo pgrx package
 -- Create the extension
 CREATE EXTENSION IF NOT EXISTS pg_substrait;
 
--- Execute a simple literal plan (AS clause is optional - schema is auto-detected)
+-- Execute a simple literal plan
 SELECT * FROM from_substrait_json('{
   "version": {"minorNumber": 54},
   "relations": [{
@@ -87,10 +87,10 @@ SELECT * FROM from_substrait_json('{
       }
     }
   }]
-}');
+}') AS t(value int);
 -- Returns: 42
 
--- Execute a plan with multiple columns (AS clause still optional)
+-- Execute a plan with multiple columns
 SELECT * FROM from_substrait_json('{
   "version": {"minorNumber": 54},
   "relations": [{
@@ -106,28 +106,14 @@ SELECT * FROM from_substrait_json('{
       }
     }
   }]
-}');
+}') AS t(value int, message string);
 -- Returns: 123 | hello
 
--- You can still use the AS clause for explicit type control (backward compatibility)
-SELECT * FROM from_substrait_json('{
-  "version": {"minorNumber": 54},
-  "relations": [{
-    "root": {
-      "names": ["value"],
-      "input": {
-        "project": {
-          "expressions": [{"literal": {"i32": 999}}]
-        }
-      }
-    }
-  }]
-}') AS t(value int);
--- Returns: 999
-
--- Execute from binary protobuf (schema auto-detected)
-SELECT * FROM from_substrait(decode('...', 'hex'));
+-- Execute from binary protobuf
+SELECT * FROM from_substrait(decode('...', 'hex')) AS (...);
 ```
+
+If the provided AS clause is incorrect, a correct one will be returned as part of the error message.  If no AS clause is provided, the default Postgres missing AS clause message will be returned.
 
 ### Available Functions
 

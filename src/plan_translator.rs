@@ -154,161 +154,17 @@ pub fn execute_substrait_plan(
 pub unsafe fn convert_plan_relation_to_plan_tree(
     relation: &PlanRel,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(rel_type) = &relation.rel_type {
-        match rel_type {
-            substrait::proto::plan_rel::RelType::Root(root) => {
-                if let Some(input) = &root.input {
-                    convert_rel_to_plan_tree(input)
-                } else {
-                    Err("Root relation missing input".into())
-                }
-            }
-            _ => Err("Only root relations are currently supported".into()),
-        }
-    } else {
-        Err("Relation missing rel_type".into())
-    }
+    // Use an empty function map for backward compatibility
+    let empty_function_map = HashMap::new();
+    convert_plan_relation_to_plan_tree_with_context(relation, &empty_function_map)
 }
 
 pub unsafe fn convert_rel_to_plan_tree(
     rel: &Rel,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    use substrait::proto::rel::RelType;
-
-    match &rel.rel_type {
-        Some(RelType::Project(project)) => {
-            // Handle projection - create a Result node
-            let input_plan = if let Some(input) = &project.input {
-                convert_rel_to_plan_tree(input)?
-            } else {
-                std::ptr::null_mut()
-            };
-
-            // Convert expressions to PostgreSQL target entries
-            let target_list = convert_expressions_to_target_list(&project.expressions)?;
-
-            // Create a Result plan node using PostgreSQL's memory allocator
-            let result_node =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-            (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-            (*result_node).plan.lefttree = input_plan;
-            (*result_node).plan.targetlist = target_list;
-
-            Ok(result_node as *mut pg_sys::Plan)
-        }
-        Some(RelType::Read(read)) => {
-            // Handle table reads
-            if let Some(read_type) = &read.read_type {
-                match read_type {
-                    substrait::proto::read_rel::ReadType::VirtualTable(_vt) => {
-                        // Virtual table - create a Values scan node
-                        create_values_scan_node()
-                    }
-                    substrait::proto::read_rel::ReadType::NamedTable(nt) => {
-                        // Named table - create a SeqScan node
-                        let table_name = nt.names.join(".");
-                        create_seqscan_node(&table_name)
-                    }
-                    _ => Err("Unsupported read type".into()),
-                }
-            } else {
-                Err("Read relation missing read type".into())
-            }
-        }
-        Some(RelType::Sort(sort)) => {
-            // Handle sort relation - create a Sort node
-            let input_plan = if let Some(input) = &sort.input {
-                convert_rel_to_plan_tree(input)?
-            } else {
-                return Err("Sort relation missing input".into());
-            };
-
-            create_sort_node(input_plan, &sort.sorts)
-        }
-        Some(RelType::Fetch(fetch)) => {
-            // Handle fetch relation - create a Limit node
-            let input_plan = if let Some(input) = &fetch.input {
-                convert_rel_to_plan_tree(input)?
-            } else {
-                return Err("Fetch relation missing input".into());
-            };
-
-            // Extract offset and count from the fetch relation using expression conversion
-            let offset_expr = if let Some(offset_mode) = &fetch.offset_mode {
-                use substrait::proto::fetch_rel::OffsetMode;
-                match offset_mode {
-                    OffsetMode::OffsetExpr(expr) => Some(convert_expression_to_postgres(expr)?),
-                    OffsetMode::Offset(_) => {
-                        return Err(
-                            "Deprecated constant offset not supported, use offset_expr instead"
-                                .into(),
-                        );
-                    }
-                }
-            } else {
-                None // No offset limit
-            };
-
-            let count_expr = if let Some(count_mode) = &fetch.count_mode {
-                use substrait::proto::fetch_rel::CountMode;
-                match count_mode {
-                    CountMode::CountExpr(expr) => Some(convert_expression_to_postgres(expr)?),
-                    CountMode::Count(_) => {
-                        return Err(
-                            "Deprecated constant count not supported, use count_expr instead"
-                                .into(),
-                        );
-                    }
-                }
-            } else {
-                None // No count limit
-            };
-
-            create_limit_node_with_expressions(input_plan, offset_expr, count_expr)
-        }
-        Some(RelType::Filter(filter)) => {
-            // Handle filter relation - create a Filter node
-            let input_plan = if let Some(input) = &filter.input {
-                convert_rel_to_plan_tree(input)?
-            } else {
-                return Err("Filter relation missing input".into());
-            };
-
-            // Convert the filter condition to a PostgreSQL expression
-            let condition_expr = if let Some(condition) = &filter.condition {
-                convert_expression_to_postgres(condition)?
-            } else {
-                return Err("Filter relation missing condition".into());
-            };
-
-            create_filter_node(input_plan, condition_expr)
-        }
-        Some(RelType::Cross(cross)) => {
-            // Handle cross relation - create a NestLoop node for Cartesian product
-            let left_plan = if let Some(left) = &cross.left {
-                convert_rel_to_plan_tree(left)?
-            } else {
-                return Err("Cross relation missing left input".into());
-            };
-
-            let right_plan = if let Some(right) = &cross.right {
-                convert_rel_to_plan_tree(right)?
-            } else {
-                return Err("Cross relation missing right input".into());
-            };
-
-            create_cross_join_node(left_plan, right_plan)
-        }
-        Some(rel_type) => {
-            let type_name = get_relation_type_name(rel_type);
-            Err(format!(
-                "Unsupported relation type: {} (implementation needed)",
-                type_name
-            )
-            .into())
-        }
-        None => Err("Relation missing rel_type".into()),
-    }
+    // Use an empty function map for backward compatibility
+    let empty_function_map = HashMap::new();
+    convert_rel_to_plan_tree_with_context(rel, &empty_function_map)
 }
 
 pub unsafe fn convert_expressions_to_target_list(
@@ -449,6 +305,19 @@ pub unsafe fn create_values_scan_node(
     let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
     (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
     (*result_node).plan.lefttree = std::ptr::null_mut();
+    (*result_node).plan.righttree = std::ptr::null_mut();
+    (*result_node).plan.initPlan = std::ptr::null_mut();
+    (*result_node).plan.extParam = std::ptr::null_mut();
+    (*result_node).plan.allParam = std::ptr::null_mut();
+    (*result_node).plan.startup_cost = 0.0;
+    (*result_node).plan.total_cost = 1.0;
+    (*result_node).plan.plan_rows = 1.0;
+    (*result_node).plan.plan_width = 32;
+    (*result_node).plan.parallel_aware = false;
+    (*result_node).plan.parallel_safe = true;
+    (*result_node).plan.async_capable = false;
+    (*result_node).plan.plan_node_id = 0;
+    (*result_node).plan.qual = std::ptr::null_mut();
     (*result_node).plan.targetlist = std::ptr::null_mut();
 
     Ok(result_node as *mut pg_sys::Plan)
@@ -467,6 +336,20 @@ pub unsafe fn create_seqscan_node(
     #[cfg(any(feature = "pg13", feature = "pg14"))]
     {
         (*seqscan_node).plan.type_ = pg_sys::NodeTag::T_SeqScan;
+        (*seqscan_node).plan.lefttree = std::ptr::null_mut();
+        (*seqscan_node).plan.righttree = std::ptr::null_mut();
+        (*seqscan_node).plan.initPlan = std::ptr::null_mut();
+        (*seqscan_node).plan.extParam = std::ptr::null_mut();
+        (*seqscan_node).plan.allParam = std::ptr::null_mut();
+        (*seqscan_node).plan.startup_cost = 0.0;
+        (*seqscan_node).plan.total_cost = 1000.0;
+        (*seqscan_node).plan.plan_rows = 1000.0;
+        (*seqscan_node).plan.plan_width = 32;
+        (*seqscan_node).plan.parallel_aware = false;
+        (*seqscan_node).plan.parallel_safe = true;
+        (*seqscan_node).plan.async_capable = false;
+        (*seqscan_node).plan.plan_node_id = 0;
+        (*seqscan_node).plan.qual = std::ptr::null_mut();
         (*seqscan_node).scanrelid = table_oid.into();
 
         // Create target list for the table's columns
@@ -476,6 +359,20 @@ pub unsafe fn create_seqscan_node(
     #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
     {
         (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+        (*seqscan_node).scan.plan.lefttree = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.righttree = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.initPlan = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.extParam = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.allParam = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.startup_cost = 0.0;
+        (*seqscan_node).scan.plan.total_cost = 1000.0;
+        (*seqscan_node).scan.plan.plan_rows = 1000.0;
+        (*seqscan_node).scan.plan.plan_width = 32;
+        (*seqscan_node).scan.plan.parallel_aware = false;
+        (*seqscan_node).scan.plan.parallel_safe = true;
+        (*seqscan_node).scan.plan.async_capable = false;
+        (*seqscan_node).scan.plan.plan_node_id = 0;
+        (*seqscan_node).scan.plan.qual = std::ptr::null_mut();
         (*seqscan_node).scan.scanrelid = table_oid.into();
 
         // Create target list for the table's columns
@@ -584,6 +481,19 @@ pub unsafe fn create_sort_node(
     let sort_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Sort>()) as *mut pg_sys::Sort;
     (*sort_node).plan.type_ = pg_sys::NodeTag::T_Sort;
     (*sort_node).plan.lefttree = input_plan;
+    (*sort_node).plan.righttree = std::ptr::null_mut();
+    (*sort_node).plan.initPlan = std::ptr::null_mut();
+    (*sort_node).plan.extParam = std::ptr::null_mut();
+    (*sort_node).plan.allParam = std::ptr::null_mut();
+    (*sort_node).plan.startup_cost = 0.0;
+    (*sort_node).plan.total_cost = 1000.0;
+    (*sort_node).plan.plan_rows = 100.0;
+    (*sort_node).plan.plan_width = 32;
+    (*sort_node).plan.parallel_aware = false;
+    (*sort_node).plan.parallel_safe = true;
+    (*sort_node).plan.async_capable = false;
+    (*sort_node).plan.plan_node_id = 0;
+    (*sort_node).plan.qual = std::ptr::null_mut();
 
     // For now, pass through the target list from the input plan
     (*sort_node).plan.targetlist = (*input_plan).targetlist;
@@ -656,10 +566,54 @@ pub unsafe fn create_sort_node(
     (*sort_node).sortColIdx = if sorts.is_empty() {
         std::ptr::null_mut()
     } else {
-        // For now, return a basic sort node structure
-        // A full implementation would need to properly set up sort columns
-        pg_sys::palloc0(sorts.len() * std::mem::size_of::<pg_sys::AttrNumber>())
-            as *mut pg_sys::AttrNumber
+        // Allocate and populate the sort column indices array
+        let sort_col_array = pg_sys::palloc(sorts.len() * std::mem::size_of::<pg_sys::AttrNumber>())
+            as *mut pg_sys::AttrNumber;
+        for (i, _sort_field) in sorts.iter().enumerate() {
+            // For now, sort by column position (1-based indexing)
+            // In a full implementation, we'd evaluate the sort expression to get the actual column
+            *sort_col_array.offset(i as isize) = (i + 1) as pg_sys::AttrNumber;
+        }
+        sort_col_array
+    };
+
+    // Set other required sort node fields by converting lists to arrays
+    (*sort_node).sortOperators = if sorts.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        // Convert List to array for sortOperators
+        let ops_array =
+            pg_sys::palloc(sorts.len() * std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
+        for (i, _sort_field) in sorts.iter().enumerate() {
+            let op_oid = pg_sys::list_nth_oid(sort_operators, i as i32);
+            *ops_array.offset(i as isize) = op_oid;
+        }
+        ops_array
+    };
+
+    (*sort_node).collations = if sorts.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        // Convert List to array for collations
+        let collations_array =
+            pg_sys::palloc(sorts.len() * std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
+        for (i, _sort_field) in sorts.iter().enumerate() {
+            let collation_oid = pg_sys::list_nth_oid(sort_collations, i as i32);
+            *collations_array.offset(i as isize) = collation_oid;
+        }
+        collations_array
+    };
+
+    (*sort_node).nullsFirst = if sorts.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        // Convert List to array for nullsFirst
+        let nulls_array = pg_sys::palloc(sorts.len() * std::mem::size_of::<bool>()) as *mut bool;
+        for (i, _sort_field) in sorts.iter().enumerate() {
+            let nulls_first = pg_sys::list_nth_int(sort_nulls_first, i as i32) != 0;
+            *nulls_array.offset(i as isize) = nulls_first;
+        }
+        nulls_array
     };
 
     Ok(sort_node as *mut pg_sys::Plan)
@@ -675,6 +629,19 @@ pub unsafe fn create_limit_node(
     let limit_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Limit>()) as *mut pg_sys::Limit;
     (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
     (*limit_node).plan.lefttree = input_plan;
+    (*limit_node).plan.righttree = std::ptr::null_mut();
+    (*limit_node).plan.initPlan = std::ptr::null_mut();
+    (*limit_node).plan.extParam = std::ptr::null_mut();
+    (*limit_node).plan.allParam = std::ptr::null_mut();
+    (*limit_node).plan.startup_cost = 0.0;
+    (*limit_node).plan.total_cost = 1000.0;
+    (*limit_node).plan.plan_rows = 100.0;
+    (*limit_node).plan.plan_width = 32;
+    (*limit_node).plan.parallel_aware = false;
+    (*limit_node).plan.parallel_safe = true;
+    (*limit_node).plan.async_capable = false;
+    (*limit_node).plan.plan_node_id = 0;
+    (*limit_node).plan.qual = std::ptr::null_mut();
 
     // Pass through the target list from input
     (*limit_node).plan.targetlist = (*input_plan).targetlist;
@@ -708,6 +675,19 @@ pub unsafe fn create_limit_node_with_expressions(
     let limit_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Limit>()) as *mut pg_sys::Limit;
     (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
     (*limit_node).plan.lefttree = input_plan;
+    (*limit_node).plan.righttree = std::ptr::null_mut();
+    (*limit_node).plan.initPlan = std::ptr::null_mut();
+    (*limit_node).plan.extParam = std::ptr::null_mut();
+    (*limit_node).plan.allParam = std::ptr::null_mut();
+    (*limit_node).plan.startup_cost = 0.0;
+    (*limit_node).plan.total_cost = 1000.0;
+    (*limit_node).plan.plan_rows = 100.0;
+    (*limit_node).plan.plan_width = 32;
+    (*limit_node).plan.parallel_aware = false;
+    (*limit_node).plan.parallel_safe = true;
+    (*limit_node).plan.async_capable = false;
+    (*limit_node).plan.plan_node_id = 0;
+    (*limit_node).plan.qual = std::ptr::null_mut();
 
     // Pass through the target list from input
     (*limit_node).plan.targetlist = (*input_plan).targetlist;
@@ -875,7 +855,12 @@ pub unsafe fn create_scalar_function_expr(
         };
 
         // Create a binary operation expression (less-than-equal for now)
-        create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(1058)) // DATE_LE_OP
+        create_binary_op_expr(
+            left_arg,
+            right_arg,
+            pg_sys::Oid::from(1058),
+            pg_sys::BOOLOID,
+        ) // DATE_LE_OP
     } else {
         Err(format!(
             "Unsupported scalar function with non-binary arguments (function_reference={}, args_count={})",
@@ -890,12 +875,13 @@ pub unsafe fn create_binary_op_expr(
     left_arg: *mut pg_sys::Expr,
     right_arg: *mut pg_sys::Expr,
     operator_oid: pg_sys::Oid,
+    result_type: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     let op_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::OpExpr>()) as *mut pg_sys::OpExpr;
     (*op_expr).xpr.type_ = pg_sys::NodeTag::T_OpExpr;
     (*op_expr).opno = operator_oid;
     (*op_expr).opfuncid = pg_sys::InvalidOid; // Will be resolved during planning
-    (*op_expr).opresulttype = pg_sys::BOOLOID; // Comparison results in boolean
+    (*op_expr).opresulttype = result_type;
     (*op_expr).opretset = false;
     (*op_expr).opcollid = pg_sys::InvalidOid;
     (*op_expr).inputcollid = pg_sys::InvalidOid;
@@ -920,6 +906,18 @@ pub unsafe fn create_filter_node(
     let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
     (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
     (*result_node).plan.lefttree = input_plan;
+    (*result_node).plan.righttree = std::ptr::null_mut();
+    (*result_node).plan.initPlan = std::ptr::null_mut();
+    (*result_node).plan.extParam = std::ptr::null_mut();
+    (*result_node).plan.allParam = std::ptr::null_mut();
+    (*result_node).plan.startup_cost = 0.0;
+    (*result_node).plan.total_cost = 1000.0;
+    (*result_node).plan.plan_rows = 100.0;
+    (*result_node).plan.plan_width = 32;
+    (*result_node).plan.parallel_aware = false;
+    (*result_node).plan.parallel_safe = true;
+    (*result_node).plan.async_capable = false;
+    (*result_node).plan.plan_node_id = 0;
 
     // Pass through the target list from input
     (*result_node).plan.targetlist = (*input_plan).targetlist;
@@ -943,6 +941,18 @@ pub unsafe fn create_cross_join_node(
     (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
     (*nestloop_node).join.plan.lefttree = left_plan;
     (*nestloop_node).join.plan.righttree = right_plan;
+    (*nestloop_node).join.plan.initPlan = std::ptr::null_mut();
+    (*nestloop_node).join.plan.extParam = std::ptr::null_mut();
+    (*nestloop_node).join.plan.allParam = std::ptr::null_mut();
+    (*nestloop_node).join.plan.startup_cost = 0.0;
+    (*nestloop_node).join.plan.total_cost = 1000.0;
+    (*nestloop_node).join.plan.plan_rows = 1000.0;
+    (*nestloop_node).join.plan.plan_width = 64;
+    (*nestloop_node).join.plan.parallel_aware = false;
+    (*nestloop_node).join.plan.parallel_safe = true;
+    (*nestloop_node).join.plan.async_capable = false;
+    (*nestloop_node).join.plan.plan_node_id = 0;
+    (*nestloop_node).join.plan.qual = std::ptr::null_mut();
 
     // Set join type to INNER for cross join
     (*nestloop_node).join.jointype = pg_sys::JoinType::JOIN_INNER;
@@ -1204,6 +1214,16 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 
             create_cross_join_node(left_plan, right_plan)
         }
+        Some(RelType::Aggregate(aggregate)) => {
+            // Handle aggregate relation - create an Agg node for GROUP BY and aggregate functions
+            let input_plan = if let Some(input) = &aggregate.input {
+                convert_rel_to_plan_tree_with_context(input, function_map)?
+            } else {
+                return Err("Aggregate relation missing input".into());
+            };
+
+            create_aggregate_node(input_plan, aggregate, function_map)
+        }
         Some(rel_type) => {
             let type_name = get_relation_type_name(rel_type);
             Err(format!(
@@ -1383,6 +1403,10 @@ pub unsafe fn convert_expression_to_postgres_with_context(
             // TODO: Implement proper type casting
             Ok(input_expr)
         }
+        Some(RexType::Subquery(subquery)) => {
+            // Handle subquery expressions
+            create_subquery_expr(subquery, function_map)
+        }
         Some(rex_type) => {
             let type_name = get_expression_type_name(rex_type);
             Err(format!(
@@ -1393,6 +1417,189 @@ pub unsafe fn convert_expression_to_postgres_with_context(
         }
         None => Err("Expression missing rex_type".into()),
     }
+}
+
+/// Create a PostgreSQL Agg plan node for aggregate operations with GROUP BY
+pub unsafe fn create_aggregate_node(
+    input_plan: *mut pg_sys::Plan,
+    aggregate: &substrait::proto::AggregateRel,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create an Agg plan node
+    let agg_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Agg>()) as *mut pg_sys::Agg;
+    (*agg_node).plan.type_ = pg_sys::NodeTag::T_Agg;
+    (*agg_node).plan.lefttree = input_plan;
+    (*agg_node).plan.righttree = std::ptr::null_mut();
+    (*agg_node).plan.initPlan = std::ptr::null_mut();
+    (*agg_node).plan.extParam = std::ptr::null_mut();
+    (*agg_node).plan.allParam = std::ptr::null_mut();
+    (*agg_node).plan.startup_cost = 0.0;
+    (*agg_node).plan.total_cost = 1000.0;
+    (*agg_node).plan.plan_rows = 100.0;
+    (*agg_node).plan.plan_width = 32;
+    (*agg_node).plan.parallel_aware = false;
+    (*agg_node).plan.parallel_safe = true;
+    (*agg_node).plan.async_capable = false;
+    (*agg_node).plan.plan_node_id = 0;
+    (*agg_node).plan.qual = std::ptr::null_mut();
+
+    // Determine aggregation strategy (for now, use plain aggregation)
+    (*agg_node).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
+
+    // Process GROUP BY columns
+    let mut num_group_cols = 0;
+    let mut group_col_indices: Vec<pg_sys::AttrNumber> = Vec::new();
+
+    if !aggregate.groupings.is_empty() {
+        let grouping = &aggregate.groupings[0]; // Take the first grouping set
+        for group_expr in &grouping.grouping_expressions {
+            if let Some(substrait::proto::expression::RexType::Selection(selection)) =
+                &group_expr.rex_type
+            {
+                if let Some(
+                    substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                        direct_ref,
+                    ),
+                ) = &selection.reference_type
+                {
+                    if let Some(
+                        substrait::proto::expression::reference_segment::ReferenceType::StructField(
+                            field,
+                        ),
+                    ) = &direct_ref.reference_type
+                    {
+                        group_col_indices.push((field.field + 1) as pg_sys::AttrNumber); // 1-based indexing
+                        num_group_cols += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    (*agg_node).numCols = num_group_cols;
+    if num_group_cols > 0 {
+        // Allocate memory for group column indices
+        let group_cols_ptr =
+            pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::AttrNumber>())
+                as *mut pg_sys::AttrNumber;
+        for (i, &col_idx) in group_col_indices.iter().enumerate() {
+            *group_cols_ptr.offset(i as isize) = col_idx;
+        }
+        (*agg_node).grpColIdx = group_cols_ptr;
+    } else {
+        (*agg_node).grpColIdx = std::ptr::null_mut();
+    }
+
+    // Build target list including GROUP BY columns and aggregate functions
+    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+    let mut resno = 1;
+
+    // Add GROUP BY columns to target list
+    for &group_col in &group_col_indices {
+        let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+        (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
+        (*var_node).varno = 1; // Input relation number
+        (*var_node).varattno = group_col;
+        (*var_node).vartype = pg_sys::UNKNOWNOID; // Will be resolved during planning
+        (*var_node).vartypmod = -1;
+        (*var_node).varcollid = pg_sys::InvalidOid;
+        (*var_node).varlevelsup = 0;
+
+        let target_entry =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
+        (*target_entry).expr = var_node as *mut pg_sys::Expr;
+        (*target_entry).resno = resno;
+        (*target_entry).resname = create_cstring(&format!("group_col_{}", resno));
+        (*target_entry).resjunk = false;
+
+        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+        resno += 1;
+    }
+
+    // Add aggregate functions to target list
+    for measure in &aggregate.measures {
+        if let Some(agg_func) = &measure.measure {
+            // Create an Aggref node for the aggregate function
+            let aggref_node =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::Aggref>()) as *mut pg_sys::Aggref;
+            (*aggref_node).xpr.type_ = pg_sys::NodeTag::T_Aggref;
+
+            // Map function reference to PostgreSQL aggregate function OID using function_map
+            let function_name = function_map
+                .get(&agg_func.function_reference)
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+
+            let agg_func_oid = match function_name {
+                "sum:fp64" => pg_sys::Oid::from(2108), // SUM function for float8
+                "avg:fp64" => pg_sys::Oid::from(2100), // AVG function for float8
+                "count:" => pg_sys::Oid::from(2803),   // COUNT(*) function
+                _ => {
+                    eprintln!(
+                        "DEBUG: Unknown aggregate function: {} (ref={})",
+                        function_name, agg_func.function_reference
+                    );
+                    pg_sys::Oid::from(2803) // Default to COUNT(*)
+                }
+            };
+
+            (*aggref_node).aggfnoid = agg_func_oid;
+            (*aggref_node).aggtype = pg_sys::UNKNOWNOID; // Will be resolved
+            (*aggref_node).aggcollid = pg_sys::InvalidOid;
+            (*aggref_node).inputcollid = pg_sys::InvalidOid;
+            (*aggref_node).aggdirectargs = std::ptr::null_mut();
+            (*aggref_node).aggdistinct = std::ptr::null_mut();
+            (*aggref_node).aggfilter = std::ptr::null_mut();
+            (*aggref_node).aggstar = agg_func.arguments.is_empty(); // COUNT(*) if no arguments
+            (*aggref_node).aggvariadic = false;
+            (*aggref_node).aggkind = 'n' as i8; // Normal aggregate
+            (*aggref_node).agglevelsup = 0;
+            (*aggref_node).aggsplit = pg_sys::AggSplit::AGGSPLIT_SIMPLE;
+
+            // Process aggregate function arguments
+            let mut agg_args: *mut pg_sys::List = std::ptr::null_mut();
+            for arg in &agg_func.arguments {
+                if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
+                    &arg.arg_type
+                {
+                    if let Some(substrait::proto::expression::RexType::Selection(selection)) =
+                        &expr.rex_type
+                    {
+                        if let Some(substrait::proto::expression::field_reference::ReferenceType::DirectReference(direct_ref)) = &selection.reference_type {
+                            if let Some(substrait::proto::expression::reference_segment::ReferenceType::StructField(field)) = &direct_ref.reference_type {
+                                let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+                                (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
+                                (*var_node).varno = 1;
+                                (*var_node).varattno = (field.field + 1) as pg_sys::AttrNumber;
+                                (*var_node).vartype = pg_sys::UNKNOWNOID;
+                                (*var_node).vartypmod = -1;
+                                (*var_node).varcollid = pg_sys::InvalidOid;
+                                (*var_node).varlevelsup = 0;
+
+                                agg_args = pg_sys::lappend(agg_args, var_node as *mut std::ffi::c_void);
+                            }
+                        }
+                    }
+                }
+            }
+            (*aggref_node).args = agg_args;
+
+            // Create target entry for the aggregate function
+            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            (*target_entry).expr = aggref_node as *mut pg_sys::Expr;
+            (*target_entry).resno = resno;
+            (*target_entry).resname = create_cstring(&format!("agg_func_{}", resno));
+            (*target_entry).resjunk = false;
+
+            target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+            resno += 1;
+        }
+    }
+
+    (*agg_node).plan.targetlist = target_list;
+
+    Ok(agg_node as *mut pg_sys::Plan)
 }
 
 /// Create scalar function expression with function context
@@ -1457,8 +1664,13 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 };
 
                 // Create a binary operation expression for date less-than-equal
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(1058))
-            // DATE_LE_OP
+                // PostgreSQL date <= operator OID is 1095 (DATE_LE_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1095),
+                    pg_sys::BOOLOID,
+                )
             } else {
                 Err(format!(
                     "lte:date_date function expects 2 arguments, got {}",
@@ -1551,11 +1763,186 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 // Create a binary operation expression for equality
                 // Use a generic equality operator - PostgreSQL will resolve the correct one based on types
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(96))
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(96), pg_sys::BOOLOID)
             // INT4EQ_OP as a generic placeholder
             } else {
                 Err(format!(
                     "equal:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "multiply:fp64_fp64" => {
+            // Handle floating point multiplication
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in multiply:fp64_fp64 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in multiply:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in multiply:fp64_fp64 function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in multiply:fp64_fp64 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in multiply:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in multiply:fp64_fp64 function".into());
+                };
+
+                // Create a binary operation expression for multiplication
+                // PostgreSQL float8 * operator OID is 594 (FLOAT8MUL_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(594),
+                    pg_sys::FLOAT8OID,
+                )
+            } else {
+                Err(format!(
+                    "multiply:fp64_fp64 function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "subtract:fp64_fp64" => {
+            // Handle floating point subtraction
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in subtract:fp64_fp64 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in subtract:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in subtract:fp64_fp64 function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in subtract:fp64_fp64 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in subtract:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in subtract:fp64_fp64 function".into());
+                };
+
+                // Create a binary operation expression for subtraction
+                // PostgreSQL float8 - operator OID is 593 (FLOAT8MI_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(593),
+                    pg_sys::FLOAT8OID,
+                )
+            } else {
+                Err(format!(
+                    "subtract:fp64_fp64 function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "add:fp64_fp64" => {
+            // Handle floating point addition
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in add:fp64_fp64 function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in add:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in add:fp64_fp64 function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in add:fp64_fp64 function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in add:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in add:fp64_fp64 function".into());
+                };
+
+                // Create a binary operation expression for addition
+                // PostgreSQL float8 + operator OID is 591 (FLOAT8PL_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(591),
+                    pg_sys::FLOAT8OID,
+                )
+            } else {
+                Err(format!(
+                    "add:fp64_fp64 function expects 2 arguments, got {}",
                     argument_count
                 )
                 .into())
@@ -1604,7 +1991,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 // Create a binary operation expression for LIKE
                 // PostgreSQL LIKE operator OID is 15 (TEXTLIKE_OP)
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(15))
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(15), pg_sys::BOOLOID)
             // TEXTLIKE_OP
             } else {
                 Err(format!(
@@ -1620,4 +2007,17 @@ pub unsafe fn create_scalar_function_expr_with_context(
         )
         .into()),
     }
+}
+
+/// Create a PostgreSQL subquery expression from Substrait subquery
+pub unsafe fn create_subquery_expr(
+    _subquery: &substrait::proto::expression::Subquery,
+    _function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // For now, return an error indicating subqueries are not yet implemented
+    // In a full implementation, this would:
+    // 1. Convert the subquery relation to a PostgreSQL SubPlan
+    // 2. Create a SubLink node that references the SubPlan
+    // 3. Handle correlation between outer and inner queries
+    Err("Subquery expressions are not yet implemented".into())
 }
