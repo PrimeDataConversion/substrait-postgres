@@ -943,7 +943,14 @@ mod tests {
                     $file_name
                 );
 
-                // Step 1: Execute plan to get schema information
+                // Step 1: Set up TPC-H database first (needed for schema discovery)
+                pgrx::info!(
+                    "{} - Setting up TPC-H database for schema discovery",
+                    $file_name
+                );
+                setup_tpch_database_if_needed();
+
+                // Step 2: Execute plan to get schema information
                 let plan_result = execute_substrait_plan(plan);
                 let as_clause = match plan_result {
                     Ok(result_data) => {
@@ -955,13 +962,6 @@ mod tests {
                         panic!("{} - Schema discovery failed: {}", $file_name, e);
                     }
                 };
-
-                // Step 2: Set up TPC-H database for result validation
-                pgrx::info!(
-                    "{} - Setting up TPC-H database for result validation",
-                    $file_name
-                );
-                setup_tpch_database_if_needed();
 
                 // Step 3: Execute the Substrait plan and validate results with golden values
                 let execution_query = format!(
@@ -1205,17 +1205,17 @@ mod tests {
         );
     }
 
-    /// Sets up TPC-H database if needed (checks if lineitem table exists)
+    /// Sets up TPC-H database if needed (checks if LINEITEM table exists)
     fn setup_tpch_database_if_needed() {
-        // Check if lineitem table already exists
+        // Check if LINEITEM table already exists (uppercase to match Substrait)
         let table_exists = Spi::get_one::<bool>(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'lineitem')",
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'LINEITEM')",
         )
         .unwrap_or(Some(false))
         .unwrap_or(false);
 
         if table_exists {
-            pgrx::info!("TPC-H lineitem table already exists, skipping setup");
+            pgrx::info!("TPC-H LINEITEM table already exists, skipping setup");
             return;
         }
 
@@ -1231,15 +1231,29 @@ mod tests {
             panic!("TPC-H setup script not found at: {}", script_path.display());
         }
 
-        // Get connection details for the test database
-        let db_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost/pgrx_tests".to_string());
+        // Get the actual test database connection details from pgrx
+        let (host, port, database, user) = get_test_db_connection_info();
 
-        // Run the setup script
+        pgrx::info!(
+            "Using test database connection: host={}, port={}, database={}, user={}",
+            host,
+            port,
+            database,
+            user
+        );
+
+        // Build the DATABASE_URL for the test database
+        let db_url = format!("postgres://{}@{}:{}/{}", user, host, port, database);
+
+        // Run the setup script with the correct connection parameters
         let output = Command::new("bash")
             .arg(&script_path)
-            .arg("pgrx_tests") // Pass the test database name
+            .arg(&database) // Pass the actual test database name
             .env("DATABASE_URL", &db_url)
+            .env("PGHOST", &host)
+            .env("PGPORT", &port.to_string())
+            .env("PGDATABASE", &database)
+            .env("PGUSER", &user)
             .output()
             .expect("Failed to execute TPC-H setup script");
 
@@ -1254,6 +1268,61 @@ mod tests {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         pgrx::info!("TPC-H setup completed: {}", stdout);
+
+        // Verify that the tables were actually created
+        let table_exists_after = Spi::get_one::<bool>(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'LINEITEM')",
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        let part_table_exists = Spi::get_one::<bool>(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'PART')",
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        pgrx::info!(
+            "After setup - LINEITEM exists: {}, PART exists: {}",
+            table_exists_after,
+            part_table_exists
+        );
+
+        // List all tables to debug
+        let table_list = Spi::get_one::<String>(
+            "SELECT string_agg(table_name, ', ') FROM information_schema.tables WHERE table_schema = 'public'"
+        ).unwrap_or(Some("no tables found".to_string())).unwrap_or("query failed".to_string());
+
+        pgrx::info!("All tables in public schema: {}", table_list);
+    }
+
+    /// Get the connection information for the current pgrx test database
+    fn get_test_db_connection_info() -> (String, u16, String, String) {
+        // These values match what pgrx uses internally for test databases
+
+        // Host is always localhost for pgrx tests
+        let host = "localhost".to_string();
+
+        // Database name is always "pgrx_tests" for pgrx tests
+        let database = "pgrx_tests".to_string();
+
+        // Get the PostgreSQL major version to calculate the test port
+        // pgrx uses BASE_POSTGRES_TESTING_PORT_NO (32200) + major_version
+        let pg_major_version = (pgrx::pg_sys::PG_VERSION_NUM / 10000) as u16;
+        let port = 32200 + pg_major_version; // This matches BASE_POSTGRES_TESTING_PORT_NO from pgrx
+
+        // Get the user from environment variables (matches pgrx's get_pg_user logic)
+        let user = std::env::var("CARGO_PGRX_TEST_RUNAS")
+            .or_else(|_| {
+                #[cfg(target_family = "unix")]
+                let varname = "USER";
+                #[cfg(target_os = "windows")]
+                let varname = "USERNAME";
+                std::env::var(varname)
+            })
+            .unwrap_or_else(|_| "postgres".to_string());
+
+        (host, port, database, user)
     }
 }
 

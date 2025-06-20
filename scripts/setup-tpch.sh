@@ -56,30 +56,30 @@ echo "Creating PostgreSQL tables and loading data..."
 # Create TPC-H schema in PostgreSQL and load data
 psql -d "$DB_NAME" << EOF
 -- Drop existing tables if they exist
-DROP TABLE IF EXISTS lineitem CASCADE;
-DROP TABLE IF EXISTS orders CASCADE;
-DROP TABLE IF EXISTS customer CASCADE;
-DROP TABLE IF EXISTS part CASCADE;
-DROP TABLE IF EXISTS supplier CASCADE;
-DROP TABLE IF EXISTS partsupp CASCADE;
-DROP TABLE IF EXISTS nation CASCADE;
-DROP TABLE IF EXISTS region CASCADE;
+DROP TABLE IF EXISTS "LINEITEM" CASCADE;
+DROP TABLE IF EXISTS "ORDERS" CASCADE;
+DROP TABLE IF EXISTS "CUSTOMER" CASCADE;
+DROP TABLE IF EXISTS "PART" CASCADE;
+DROP TABLE IF EXISTS "SUPPLIER" CASCADE;
+DROP TABLE IF EXISTS "PARTSUPP" CASCADE;
+DROP TABLE IF EXISTS "NATION" CASCADE;
+DROP TABLE IF EXISTS "REGION" CASCADE;
 
--- Create TPC-H tables with proper schema
-CREATE TABLE region (
+-- Create TPC-H tables with proper schema (uppercase names to match Substrait plans)
+CREATE TABLE "REGION" (
     r_regionkey INTEGER NOT NULL,
     r_name CHAR(25) NOT NULL,
     r_comment VARCHAR(152)
 );
 
-CREATE TABLE nation (
+CREATE TABLE "NATION" (
     n_nationkey INTEGER NOT NULL,
     n_name CHAR(25) NOT NULL,
     n_regionkey INTEGER NOT NULL,
     n_comment VARCHAR(152)
 );
 
-CREATE TABLE supplier (
+CREATE TABLE "SUPPLIER" (
     s_suppkey INTEGER NOT NULL,
     s_name CHAR(25) NOT NULL,
     s_address VARCHAR(40) NOT NULL,
@@ -89,7 +89,7 @@ CREATE TABLE supplier (
     s_comment VARCHAR(101) NOT NULL
 );
 
-CREATE TABLE customer (
+CREATE TABLE "CUSTOMER" (
     c_custkey INTEGER NOT NULL,
     c_name VARCHAR(25) NOT NULL,
     c_address VARCHAR(40) NOT NULL,
@@ -100,7 +100,7 @@ CREATE TABLE customer (
     c_comment VARCHAR(117) NOT NULL
 );
 
-CREATE TABLE part (
+CREATE TABLE "PART" (
     p_partkey INTEGER NOT NULL,
     p_name VARCHAR(55) NOT NULL,
     p_mfgr CHAR(25) NOT NULL,
@@ -112,7 +112,7 @@ CREATE TABLE part (
     p_comment VARCHAR(23) NOT NULL
 );
 
-CREATE TABLE partsupp (
+CREATE TABLE "PARTSUPP" (
     ps_partkey INTEGER NOT NULL,
     ps_suppkey INTEGER NOT NULL,
     ps_availqty INTEGER NOT NULL,
@@ -120,7 +120,7 @@ CREATE TABLE partsupp (
     ps_comment VARCHAR(199) NOT NULL
 );
 
-CREATE TABLE orders (
+CREATE TABLE "ORDERS" (
     o_orderkey INTEGER NOT NULL,
     o_custkey INTEGER NOT NULL,
     o_orderstatus CHAR(1) NOT NULL,
@@ -132,7 +132,7 @@ CREATE TABLE orders (
     o_comment VARCHAR(79) NOT NULL
 );
 
-CREATE TABLE lineitem (
+CREATE TABLE "LINEITEM" (
     l_orderkey INTEGER NOT NULL,
     l_partkey INTEGER NOT NULL,
     l_suppkey INTEGER NOT NULL,
@@ -157,13 +157,15 @@ echo "Loading CSV data into PostgreSQL tables..."
 
 for table in region nation supplier customer part partsupp orders lineitem; do
     echo "Loading $table..."
-    psql -d "$DB_NAME" -c "\\COPY $table FROM '$CSV_DIR/$table.csv' WITH (FORMAT CSV, HEADER);"
+    # Convert to uppercase and quote for PostgreSQL
+    upper_table=$(echo "$table" | tr '[:lower:]' '[:upper:]')
+    psql -d "$DB_NAME" -c "\\COPY \"$upper_table\" FROM '$CSV_DIR/$table.csv' WITH (FORMAT CSV, HEADER);"
 done
 
 # Verify data was loaded
 echo "Verifying data load..."
-LINEITEM_COUNT=$(psql -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM lineitem;" | tr -d ' ')
-echo "Loaded $LINEITEM_COUNT rows into lineitem table"
+LINEITEM_COUNT=$(psql -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM \"LINEITEM\";" | tr -d ' ')
+echo "Loaded $LINEITEM_COUNT rows into LINEITEM table"
 
 if [ "$LINEITEM_COUNT" -eq 0 ]; then
     echo "Warning: No data loaded. Check DuckDB and PostgreSQL connection."

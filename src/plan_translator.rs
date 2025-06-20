@@ -251,6 +251,22 @@ pub unsafe fn convert_rel_to_plan_tree(
 
             create_filter_node(input_plan, condition_expr)
         }
+        Some(RelType::Cross(cross)) => {
+            // Handle cross relation - create a NestLoop node for Cartesian product
+            let left_plan = if let Some(left) = &cross.left {
+                convert_rel_to_plan_tree(left)?
+            } else {
+                return Err("Cross relation missing left input".into());
+            };
+
+            let right_plan = if let Some(right) = &cross.right {
+                convert_rel_to_plan_tree(right)?
+            } else {
+                return Err("Cross relation missing right input".into());
+            };
+
+            create_cross_join_node(left_plan, right_plan)
+        }
         Some(rel_type) => {
             let type_name = get_relation_type_name(rel_type);
             Err(format!(
@@ -863,4 +879,99 @@ pub unsafe fn create_filter_node(
     (*result_node).plan.qual = qual_list;
 
     Ok(result_node as *mut pg_sys::Plan)
+}
+
+/// Create a PostgreSQL NestLoop plan node for Cross (Cartesian product) join
+pub unsafe fn create_cross_join_node(
+    left_plan: *mut pg_sys::Plan,
+    right_plan: *mut pg_sys::Plan,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a NestLoop plan node for Cartesian product (cross join)
+    let nestloop_node =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::NestLoop>()) as *mut pg_sys::NestLoop;
+    (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
+    (*nestloop_node).join.plan.lefttree = left_plan;
+    (*nestloop_node).join.plan.righttree = right_plan;
+
+    // Set join type to INNER for cross join
+    (*nestloop_node).join.jointype = pg_sys::JoinType::JOIN_INNER;
+
+    // No join conditions for cross join (Cartesian product)
+    (*nestloop_node).join.joinqual = std::ptr::null_mut();
+    (*nestloop_node).join.plan.qual = std::ptr::null_mut();
+
+    // Create target list combining both input relations
+    let combined_target_list = create_combined_target_list(left_plan, right_plan)?;
+    (*nestloop_node).join.plan.targetlist = combined_target_list;
+
+    Ok(nestloop_node as *mut pg_sys::Plan)
+}
+
+/// Create a combined target list for join operations
+unsafe fn create_combined_target_list(
+    left_plan: *mut pg_sys::Plan,
+    right_plan: *mut pg_sys::Plan,
+) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
+    let mut combined_list: *mut pg_sys::List = std::ptr::null_mut();
+    let mut resno = 1;
+
+    // Add target entries from left plan
+    if !(*left_plan).targetlist.is_null() {
+        let left_list = (*left_plan).targetlist;
+        let length = (*left_list).length as usize;
+
+        for i in 0..length {
+            let target_entry = pg_sys::list_nth(left_list, i as i32) as *mut pg_sys::TargetEntry;
+
+            // Create a copy of the target entry with updated resno and varno
+            let new_target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            *new_target_entry = *target_entry; // Copy the structure
+            (*new_target_entry).resno = resno;
+
+            // Update varno in the expression if it's a Var node
+            if !(*new_target_entry).expr.is_null() {
+                let expr = (*new_target_entry).expr;
+                if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                    let var_node = expr as *mut pg_sys::Var;
+                    (*var_node).varno = 1; // Left relation
+                }
+            }
+
+            combined_list =
+                pg_sys::lappend(combined_list, new_target_entry as *mut std::ffi::c_void);
+            resno += 1;
+        }
+    }
+
+    // Add target entries from right plan
+    if !(*right_plan).targetlist.is_null() {
+        let right_list = (*right_plan).targetlist;
+        let length = (*right_list).length as usize;
+
+        for i in 0..length {
+            let target_entry = pg_sys::list_nth(right_list, i as i32) as *mut pg_sys::TargetEntry;
+
+            // Create a copy of the target entry with updated resno and varno
+            let new_target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            *new_target_entry = *target_entry; // Copy the structure
+            (*new_target_entry).resno = resno;
+
+            // Update varno in the expression if it's a Var node
+            if !(*new_target_entry).expr.is_null() {
+                let expr = (*new_target_entry).expr;
+                if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                    let var_node = expr as *mut pg_sys::Var;
+                    (*var_node).varno = 2; // Right relation
+                }
+            }
+
+            combined_list =
+                pg_sys::lappend(combined_list, new_target_entry as *mut std::ffi::c_void);
+            resno += 1;
+        }
+    }
+
+    Ok(combined_list)
 }
