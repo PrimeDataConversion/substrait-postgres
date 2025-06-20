@@ -183,6 +183,41 @@ pub unsafe fn convert_rel_to_plan_tree(
                 Err("Read relation missing read type".into())
             }
         }
+        Some(RelType::Sort(sort)) => {
+            // Handle sort relation - create a Sort node
+            let input_plan = if let Some(input) = &sort.input {
+                convert_rel_to_plan_tree(input)?
+            } else {
+                return Err("Sort relation missing input".into());
+            };
+
+            create_sort_node(input_plan, &sort.sorts)
+        }
+        Some(RelType::Fetch(fetch)) => {
+            // Handle fetch relation - create a Limit node
+            let input_plan = if let Some(input) = &fetch.input {
+                convert_rel_to_plan_tree(input)?
+            } else {
+                return Err("Fetch relation missing input".into());
+            };
+
+            // Extract offset and count from the fetch relation
+            let offset = if let Some(offset_expr) = &fetch.offset_mode {
+                // For now, assume literal offset values
+                0 // TODO: evaluate expression properly
+            } else {
+                0
+            };
+
+            let count = if let Some(count_expr) = &fetch.count_mode {
+                // For now, assume literal count values
+                100 // TODO: evaluate expression properly
+            } else {
+                0
+            };
+
+            create_limit_node(input_plan, offset, count)
+        }
         Some(rel_type) => {
             let type_name = get_relation_type_name(rel_type);
             Err(format!(
@@ -457,4 +492,127 @@ pub unsafe fn create_cstring(s: &str) -> *mut i8 {
     let ptr = pg_sys::palloc(len) as *mut i8;
     std::ptr::copy_nonoverlapping(cstr.as_ptr(), ptr, len);
     ptr
+}
+
+/// Create a PostgreSQL Sort plan node from Substrait sort specification
+pub unsafe fn create_sort_node(
+    input_plan: *mut pg_sys::Plan,
+    sorts: &[substrait::proto::SortField],
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a Sort plan node
+    let sort_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Sort>()) as *mut pg_sys::Sort;
+    (*sort_node).plan.type_ = pg_sys::NodeTag::T_Sort;
+    (*sort_node).plan.lefttree = input_plan;
+
+    // For now, pass through the target list from the input plan
+    (*sort_node).plan.targetlist = (*input_plan).targetlist;
+
+    // Convert Substrait sort fields to PostgreSQL sort keys
+    let mut sort_keys: *mut pg_sys::List = std::ptr::null_mut();
+    let mut sort_operators: *mut pg_sys::List = std::ptr::null_mut();
+    let mut sort_collations: *mut pg_sys::List = std::ptr::null_mut();
+    let mut sort_nulls_first: *mut pg_sys::List = std::ptr::null_mut();
+
+    for (i, sort_field) in sorts.iter().enumerate() {
+        // For now, assume we're sorting by column position (simplified)
+        // In a full implementation, we'd need to evaluate the sort expression
+        let col_index = i + 1; // 1-based indexing for PostgreSQL
+
+        // Add to sort keys list
+        sort_keys = pg_sys::lappend_int(sort_keys, col_index as i32);
+
+        // Determine sort operator based on direction
+        // For now, use a simple integer comparison operator
+        // In a real implementation, we'd need to determine the correct operator based on data type
+        let sort_op = match &sort_field.sort_kind {
+            Some(substrait::proto::sort_field::SortKind::Direction(dir)) => {
+                match *dir {
+                    // TODO: Replace 97 with its Postgres enum equivalent.
+                    x if x == substrait::proto::sort_field::SortDirection::AscNullsFirst as i32 => {
+                        97
+                    }
+                    x if x == substrait::proto::sort_field::SortDirection::AscNullsLast as i32 => {
+                        97
+                    } // INT4_LT_OP
+                    x if x
+                        == substrait::proto::sort_field::SortDirection::DescNullsFirst as i32 =>
+                    {
+                        521
+                    }
+                    x if x == substrait::proto::sort_field::SortDirection::DescNullsLast as i32 => {
+                        521
+                    } // INT4_GT_OP
+                    _ => 97, // Default to ascending (INT4_LT_OP)
+                }
+            }
+            _ => 97, // Default to ascending (INT4_LT_OP)
+        };
+        sort_operators = pg_sys::lappend_oid(sort_operators, pg_sys::Oid::from(sort_op));
+
+        // Add collation (use default for now)
+        sort_collations = pg_sys::lappend_oid(sort_collations, pg_sys::DEFAULT_COLLATION_OID);
+
+        // Handle nulls first/last
+        let nulls_first = match &sort_field.sort_kind {
+            Some(substrait::proto::sort_field::SortKind::Direction(dir)) => {
+                match *dir {
+                    x if x
+                        == substrait::proto::sort_field::SortDirection::DescNullsFirst as i32
+                        || x == substrait::proto::sort_field::SortDirection::AscNullsFirst
+                            as i32 =>
+                    {
+                        true
+                    }
+                    _ => false, // Default to nulls last
+                }
+            }
+            _ => false, // Default to nulls last
+        };
+        sort_nulls_first = pg_sys::lappend_int(sort_nulls_first, if nulls_first { 1 } else { 0 });
+    }
+
+    (*sort_node).numCols = sorts.len() as i32;
+    (*sort_node).sortColIdx = if sorts.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        // For now, return a basic sort node structure
+        // A full implementation would need to properly set up sort columns
+        pg_sys::palloc0(sorts.len() * std::mem::size_of::<pg_sys::AttrNumber>())
+            as *mut pg_sys::AttrNumber
+    };
+
+    Ok(sort_node as *mut pg_sys::Plan)
+}
+
+/// Create a PostgreSQL Limit plan node from Substrait fetch specification
+pub unsafe fn create_limit_node(
+    input_plan: *mut pg_sys::Plan,
+    offset: i64,
+    count: i64,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a Limit plan node
+    let limit_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Limit>()) as *mut pg_sys::Limit;
+    (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
+    (*limit_node).plan.lefttree = input_plan;
+
+    // Pass through the target list from input
+    (*limit_node).plan.targetlist = (*input_plan).targetlist;
+
+    // Set limit count
+    if count > 0 {
+        let count_const = create_int8_const(count)?;
+        (*limit_node).limitCount = count_const as *mut pg_sys::Node;
+    } else {
+        (*limit_node).limitCount = std::ptr::null_mut();
+    }
+
+    // Set limit offset
+    if offset > 0 {
+        let offset_const = create_int8_const(offset)?;
+        (*limit_node).limitOffset = offset_const as *mut pg_sys::Node;
+    } else {
+        (*limit_node).limitOffset = std::ptr::null_mut();
+    }
+
+    Ok(limit_node as *mut pg_sys::Plan)
 }
