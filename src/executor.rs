@@ -120,6 +120,134 @@ pub unsafe fn execute_plan_tree_structured(
                 nulls: vec![row_nulls],
             })
         }
+        pg_sys::NodeTag::T_ValuesScan => {
+            let values_node = plan as *const pg_sys::Plan as *const pg_sys::ValuesScan;
+
+            // Handle different PostgreSQL versions for accessing target list
+            #[cfg(any(feature = "pg13", feature = "pg14"))]
+            let target_list = (*values_node).plan.targetlist;
+            #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+            let target_list = (*values_node).scan.plan.targetlist;
+
+            if target_list.is_null() {
+                return Ok(ExecutionResult {
+                    columns: vec![],
+                    rows: vec![],
+                    nulls: vec![],
+                });
+            }
+
+            // Extract column information from target list
+            let mut columns = Vec::new();
+            let list_length = (*target_list).length;
+
+            for i in 0..list_length {
+                let target_entry = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+                if !target_entry.is_null() {
+                    let col_name = extract_column_name(target_entry);
+
+                    // For ValuesScan, we need to determine column type from the values_lists
+                    // For now, we'll extract the type from the first value in the first row
+                    let values_lists = (*values_node).values_lists;
+                    if !values_lists.is_null() && (*values_lists).length > 0 {
+                        let first_row = pg_sys::list_nth(values_lists, 0) as *mut pg_sys::List;
+                        if !first_row.is_null() && i < (*first_row).length {
+                            let value_expr = pg_sys::list_nth(first_row, i) as *mut pg_sys::Node;
+                            let (type_oid, type_mod) = if !value_expr.is_null()
+                                && (*value_expr).type_ == pg_sys::NodeTag::T_Const
+                            {
+                                let const_node = value_expr as *mut pg_sys::Const;
+                                let const_type = (*const_node).consttype;
+
+                                eprintln!("DEBUG: ValuesScan const node type_oid: {}", const_type);
+
+                                if const_type == pg_sys::InvalidOid || const_type == 0.into() {
+                                    return Err(format!(
+                                        "Invalid type OID {} for const expression in ValuesScan",
+                                        const_type
+                                    )
+                                    .into());
+                                }
+                                (const_type, (*const_node).consttypmod)
+                            } else {
+                                return Err("Expected const expression in ValuesScan but found different node type".into());
+                            };
+
+                            if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+                                return Err(format!(
+                                    "About to create ColumnInfo with invalid type OID {} for ValuesScan column '{}' at index {}",
+                                    type_oid, col_name, i
+                                ).into());
+                            }
+
+                            let column_info = ColumnInfo {
+                                name: col_name.clone(),
+                                type_oid,
+                                type_mod,
+                                attr_number: i as pg_sys::AttrNumber + 1,
+                            };
+
+                            eprintln!(
+                                "DEBUG: Created ValuesScan ColumnInfo - name: '{}', type_oid: {}, type_mod: {}",
+                                column_info.name, column_info.type_oid, column_info.type_mod
+                            );
+
+                            columns.push(column_info);
+                        } else {
+                            return Err(
+                                format!("No value found for column {} in ValuesScan", i).into()
+                            );
+                        }
+                    } else {
+                        return Err("ValuesScan has no values_lists".into());
+                    }
+                }
+            }
+
+            // Extract all rows of data from values_lists
+            let mut all_rows = Vec::new();
+            let mut all_nulls = Vec::new();
+
+            let values_lists = (*values_node).values_lists;
+            if !values_lists.is_null() {
+                let num_rows = (*values_lists).length;
+
+                for row_idx in 0..num_rows {
+                    let row_list = pg_sys::list_nth(values_lists, row_idx) as *mut pg_sys::List;
+                    if !row_list.is_null() {
+                        let mut row_values = Vec::new();
+                        let mut row_nulls = Vec::new();
+
+                        let num_cols = (*row_list).length;
+                        for col_idx in 0..num_cols {
+                            let value_expr =
+                                pg_sys::list_nth(row_list, col_idx) as *mut pg_sys::Node;
+                            if !value_expr.is_null()
+                                && (*value_expr).type_ == pg_sys::NodeTag::T_Const
+                            {
+                                let const_node = value_expr as *mut pg_sys::Const;
+                                let is_null = (*const_node).constisnull;
+
+                                row_values.push((*const_node).constvalue);
+                                row_nulls.push(is_null);
+                            } else {
+                                row_values.push(pg_sys::Datum::null());
+                                row_nulls.push(true);
+                            }
+                        }
+
+                        all_rows.push(row_values);
+                        all_nulls.push(row_nulls);
+                    }
+                }
+            }
+
+            Ok(ExecutionResult {
+                columns,
+                rows: all_rows,
+                nulls: all_nulls,
+            })
+        }
         pg_sys::NodeTag::T_SeqScan => {
             let seqscan_node = plan as *const pg_sys::Plan as *const pg_sys::SeqScan;
             // Handle different PostgreSQL versions

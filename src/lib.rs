@@ -567,7 +567,7 @@ mod tests {
 
     #[pg_test]
     #[should_panic(expected = "Invalid Substrait plan: empty bytea provided")]
-    fn test_from_substrait_basic() {
+    fn test_from_substrait_empty_plan() {
         // Test that the function panics with proper error message for empty bytea
         let _ =
             Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait(''::bytea) AS t(result int)");
@@ -596,13 +596,6 @@ mod tests {
         let function_info = result.unwrap().unwrap();
         assert!(function_info.contains("bytea"));
         assert!(function_info.contains("SETOF"));
-    }
-
-    #[pg_test]
-    #[should_panic(expected = "Invalid Substrait plan: empty bytea provided")]
-    fn test_from_substrait_empty_bytea_error() {
-        // Test that the function returns the correct error for empty bytea
-        let _ = Spi::get_one::<i64>("SELECT COUNT(*) FROM from_substrait('') AS t(result int)");
     }
 
     #[pg_test]

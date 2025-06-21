@@ -323,6 +323,82 @@ pub unsafe fn create_values_scan_node(
     Ok(result_node as *mut pg_sys::Plan)
 }
 
+/// Create a Values scan node with specific target list for literal projections
+pub unsafe fn create_values_scan_with_target_list(
+    target_list: *mut pg_sys::List,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a ValuesScan plan node specifically for literal values
+    let values_scan =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::ValuesScan>()) as *mut pg_sys::ValuesScan;
+
+    // Set up the scan portion (for PostgreSQL 15+)
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    {
+        (*values_scan).scan.plan.type_ = pg_sys::NodeTag::T_ValuesScan;
+        (*values_scan).scan.plan.lefttree = std::ptr::null_mut();
+        (*values_scan).scan.plan.righttree = std::ptr::null_mut();
+        (*values_scan).scan.plan.initPlan = std::ptr::null_mut();
+        (*values_scan).scan.plan.extParam = std::ptr::null_mut();
+        (*values_scan).scan.plan.allParam = std::ptr::null_mut();
+        (*values_scan).scan.plan.startup_cost = 0.0;
+        (*values_scan).scan.plan.total_cost = 1.0;
+        (*values_scan).scan.plan.plan_rows = 1.0;
+        (*values_scan).scan.plan.plan_width = 32;
+        (*values_scan).scan.plan.parallel_aware = false;
+        (*values_scan).scan.plan.parallel_safe = true;
+        (*values_scan).scan.plan.async_capable = false;
+        (*values_scan).scan.plan.plan_node_id = 0;
+        (*values_scan).scan.plan.qual = std::ptr::null_mut();
+        (*values_scan).scan.plan.targetlist = target_list;
+        (*values_scan).scan.scanrelid = 0; // No base relation
+    }
+
+    // For PostgreSQL 13/14 (different structure)
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    {
+        (*values_scan).plan.type_ = pg_sys::NodeTag::T_ValuesScan;
+        (*values_scan).plan.lefttree = std::ptr::null_mut();
+        (*values_scan).plan.righttree = std::ptr::null_mut();
+        (*values_scan).plan.initPlan = std::ptr::null_mut();
+        (*values_scan).plan.extParam = std::ptr::null_mut();
+        (*values_scan).plan.allParam = std::ptr::null_mut();
+        (*values_scan).plan.startup_cost = 0.0;
+        (*values_scan).plan.total_cost = 1.0;
+        (*values_scan).plan.plan_rows = 1.0;
+        (*values_scan).plan.plan_width = 32;
+        (*values_scan).plan.parallel_aware = false;
+        (*values_scan).plan.parallel_safe = true;
+        (*values_scan).plan.async_capable = false;
+        (*values_scan).plan.plan_node_id = 0;
+        (*values_scan).plan.qual = std::ptr::null_mut();
+        (*values_scan).plan.targetlist = target_list;
+        (*values_scan).scanrelid = 0; // No base relation
+    }
+
+    // Create a values list from the target entries
+    let mut values_lists: *mut pg_sys::List = std::ptr::null_mut();
+    let mut row_values: *mut pg_sys::List = std::ptr::null_mut();
+
+    // Extract literal values from target entries
+    if !target_list.is_null() {
+        let list_len = (*target_list).length;
+        for i in 0..list_len {
+            let target_entry = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+            if !target_entry.is_null() && !(*target_entry).expr.is_null() {
+                // Add the expression to the row values
+                row_values =
+                    pg_sys::lappend(row_values, (*target_entry).expr as *mut std::ffi::c_void);
+            }
+        }
+    }
+
+    // Add this single row to the values lists
+    values_lists = pg_sys::lappend(values_lists, row_values as *mut std::ffi::c_void);
+    (*values_scan).values_lists = values_lists;
+
+    Ok(values_scan as *mut pg_sys::Plan)
+}
+
 pub unsafe fn create_seqscan_node(
     table_name: &str,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
@@ -1086,26 +1162,47 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
     match &rel.rel_type {
         Some(RelType::Project(project)) => {
             // Handle projection - create a Result node
-            let input_plan = if let Some(input) = &project.input {
-                convert_rel_to_plan_tree_with_context(input, function_map)?
+            if let Some(input) = &project.input {
+                // Project with input - create Result node with input as left tree
+                let input_plan = convert_rel_to_plan_tree_with_context(input, function_map)?;
+
+                // Convert expressions to PostgreSQL target entries
+                let target_list = convert_expressions_to_target_list_with_context(
+                    &project.expressions,
+                    function_map,
+                )?;
+
+                // Create a Result plan node using PostgreSQL's memory allocator
+                let result_node =
+                    pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
+                (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
+                (*result_node).plan.lefttree = input_plan;
+                (*result_node).plan.targetlist = target_list;
+                (*result_node).plan.righttree = std::ptr::null_mut();
+                (*result_node).plan.initPlan = std::ptr::null_mut();
+                (*result_node).plan.extParam = std::ptr::null_mut();
+                (*result_node).plan.allParam = std::ptr::null_mut();
+                (*result_node).plan.startup_cost = 0.0;
+                (*result_node).plan.total_cost = 1.0;
+                (*result_node).plan.plan_rows = 1.0;
+                (*result_node).plan.plan_width = 32;
+                (*result_node).plan.parallel_aware = false;
+                (*result_node).plan.parallel_safe = true;
+                (*result_node).plan.async_capable = false;
+                (*result_node).plan.plan_node_id = 0;
+                (*result_node).plan.qual = std::ptr::null_mut();
+
+                Ok(result_node as *mut pg_sys::Plan)
             } else {
-                std::ptr::null_mut()
-            };
+                // Project with no input (literal projections) - create Values scan node
+                let target_list = convert_expressions_to_target_list_with_context(
+                    &project.expressions,
+                    function_map,
+                )?;
 
-            // Convert expressions to PostgreSQL target entries
-            let target_list = convert_expressions_to_target_list_with_context(
-                &project.expressions,
-                function_map,
-            )?;
-
-            // Create a Result plan node using PostgreSQL's memory allocator
-            let result_node =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-            (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-            (*result_node).plan.lefttree = input_plan;
-            (*result_node).plan.targetlist = target_list;
-
-            Ok(result_node as *mut pg_sys::Plan)
+                // Create a ValuesScan plan node for literal projections
+                create_values_scan_with_target_list(target_list)
+            }
         }
         Some(RelType::Read(read)) => {
             // Handle table reads
