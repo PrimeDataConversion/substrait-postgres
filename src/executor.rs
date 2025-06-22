@@ -64,13 +64,28 @@ pub unsafe fn execute_plan_directly(
     Ok((tupdesc, tuplestore))
 }
 
+/// Executes a PostgreSQL plan tree and returns the results
+pub unsafe fn execute_postgres_plan(
+    plan_tree: &pg_sys::Plan,
+    column_names: Vec<String>,
+) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
+    // Use PostgreSQL's native executor instead of our custom implementation
+    execute_plan_with_postgres_executor(plan_tree, column_names)
+}
+
 /// Compatibility wrapper that converts PostgreSQL's native execution results
 /// back to ExecutionResult format for backward compatibility.
 pub unsafe fn execute_plan_with_postgres_executor(
     plan_tree: &pg_sys::Plan,
     column_names: Vec<String>,
 ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Use the direct execution approach
+    // Check if this is a ValuesScan node - if so, use the legacy approach
+    // because the new direct executor can hang on ValuesScan nodes
+    if plan_tree.type_ == pg_sys::NodeTag::T_ValuesScan {
+        return execute_plan_tree_structured(plan_tree);
+    }
+
+    // Use the direct execution approach for other node types
     let (tupdesc, tuplestore) = execute_plan_directly(plan_tree, column_names)?;
 
     // Convert tuple descriptor to ColumnInfo
