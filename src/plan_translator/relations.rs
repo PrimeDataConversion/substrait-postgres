@@ -144,11 +144,12 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     OffsetMode::OffsetExpr(expr) => Some(
                         convert_expression_to_postgres_with_context(expr, function_map)?,
                     ),
-                    OffsetMode::Offset(_) => {
-                        return Err(
-                            "Deprecated constant offset not supported, use offset_expr instead"
-                                .into(),
-                        );
+                    OffsetMode::Offset(constant_offset) => {
+                        // Support deprecated constant offset by converting to expression
+                        eprintln!("WARNING: Using deprecated constant offset field. Consider migrating to offset_expr.");
+                        Some(unsafe {
+                            super::expressions::create_int8_const(*constant_offset as i64)?
+                        })
                     }
                 }
             } else {
@@ -161,11 +162,12 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     CountMode::CountExpr(expr) => Some(
                         convert_expression_to_postgres_with_context(expr, function_map)?,
                     ),
-                    CountMode::Count(_) => {
-                        return Err(
-                            "Deprecated constant count not supported, use count_expr instead"
-                                .into(),
-                        );
+                    CountMode::Count(constant_count) => {
+                        // Support deprecated constant count by converting to expression
+                        eprintln!("WARNING: Using deprecated constant count field. Consider migrating to count_expr.");
+                        Some(unsafe {
+                            super::expressions::create_int8_const(*constant_count as i64)?
+                        })
                     }
                 }
             } else {
