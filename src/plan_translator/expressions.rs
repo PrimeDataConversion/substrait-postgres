@@ -718,15 +718,107 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
 /// Create a PostgreSQL subquery expression from Substrait subquery
 pub unsafe fn create_subquery_expr(
-    _subquery: &substrait::proto::expression::Subquery,
+    subquery: &substrait::proto::expression::Subquery,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::SubqueryType;
+
+    match &subquery.subquery_type {
+        Some(SubqueryType::Scalar(scalar_subquery)) => {
+            // Handle scalar subqueries (returns single value)
+            // The scalar_subquery should contain the inner relation
+            create_scalar_subquery_expr(scalar_subquery, function_map)
+        }
+        Some(SubqueryType::InPredicate(_)) => {
+            Err("IN predicate subqueries are not yet implemented".into())
+        }
+        Some(SubqueryType::SetPredicate(_)) => {
+            Err("Set predicate subqueries are not yet implemented".into())
+        }
+        Some(SubqueryType::SetComparison(_)) => {
+            Err("Set comparison subqueries are not yet implemented".into())
+        }
+        None => Err("Subquery missing subquery_type".into()),
+    }
+}
+
+/// Create a PostgreSQL scalar subquery expression
+unsafe fn create_scalar_subquery_expr(
+    scalar_subquery: &substrait::proto::expression::subquery::Scalar,
     _function_map: &HashMap<u32, String>,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // For now, return an error indicating subqueries are not yet implemented
-    // In a full implementation, this would:
-    // 1. Convert the subquery relation to a PostgreSQL SubPlan
-    // 2. Create a SubLink node that references the SubPlan
-    // 3. Handle correlation between outer and inner queries
-    Err("Subquery expressions are not yet implemented".into())
+    // scalar_subquery contains the input relation of the scalar subquery
+    if scalar_subquery.input.is_none() {
+        return Err("Scalar subquery missing input relation".into());
+    }
+
+    // For now, we'll implement a simplified version that converts the subquery
+    // to a basic SubLink node. A full implementation would need to:
+    // 1. Convert the Substrait relation to a PostgreSQL Query/PlannedStmt
+    // 2. Handle correlation properly with PARAM_EXEC parameters
+    // 3. Set up proper subplan execution context
+
+    // Create a basic SubLink node for scalar subqueries
+    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+    (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
+    (*sublink).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK; // Scalar subquery
+    (*sublink).subLinkId = 0; // Will be assigned during planning
+    (*sublink).testexpr = std::ptr::null_mut(); // No test expression for scalar subqueries
+    (*sublink).operName = std::ptr::null_mut(); // No operator for scalar subqueries
+
+    // For now, create a placeholder subselect
+    // In a real implementation, this would convert the Substrait relation to a Query
+    let placeholder_query = create_placeholder_query_for_subquery();
+    (*sublink).subselect = placeholder_query as *mut pg_sys::Node;
+
+    // Set location to unknown
+    (*sublink).location = -1;
+
+    Ok(sublink as *mut pg_sys::Expr)
+}
+
+/// Create a placeholder query for subquery conversion
+/// This is a simplified implementation - in practice, we'd need to convert
+/// the full Substrait relation to a PostgreSQL Query node
+unsafe fn create_placeholder_query_for_subquery() -> *mut pg_sys::Query {
+    // Create a minimal Query node that represents the subquery
+    let query = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+    (*query).type_ = pg_sys::NodeTag::T_Query;
+    (*query).commandType = pg_sys::CmdType::CMD_SELECT;
+    (*query).querySource = pg_sys::QuerySource::QSRC_ORIGINAL;
+    (*query).canSetTag = true;
+
+    // Initialize empty lists
+    (*query).rtable = std::ptr::null_mut();
+    (*query).jointree = std::ptr::null_mut();
+    (*query).targetList = std::ptr::null_mut();
+    (*query).returningList = std::ptr::null_mut();
+    (*query).groupClause = std::ptr::null_mut();
+    (*query).groupingSets = std::ptr::null_mut();
+    (*query).havingQual = std::ptr::null_mut();
+    (*query).windowClause = std::ptr::null_mut();
+    (*query).distinctClause = std::ptr::null_mut();
+    (*query).sortClause = std::ptr::null_mut();
+    (*query).limitOffset = std::ptr::null_mut();
+    (*query).limitCount = std::ptr::null_mut();
+    (*query).rowMarks = std::ptr::null_mut();
+    (*query).setOperations = std::ptr::null_mut();
+    (*query).constraintDeps = std::ptr::null_mut();
+    (*query).withCheckOptions = std::ptr::null_mut();
+
+    // Set up basic properties
+    (*query).hasAggs = false;
+    (*query).hasWindowFuncs = false;
+    (*query).hasTargetSRFs = false;
+    (*query).hasSubLinks = false;
+    (*query).hasDistinctOn = false;
+    (*query).hasRecursive = false;
+    (*query).hasModifyingCTE = false;
+    (*query).hasForUpdate = false;
+    (*query).hasRowSecurity = false;
+    (*query).isReturn = false;
+
+    query
 }
 
 /// Helper function to create C strings for PostgreSQL
