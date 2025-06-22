@@ -671,6 +671,7 @@ pub unsafe fn create_aggregate_node(
 
         let target_entry =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
+        (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
         (*target_entry).expr = var_node as *mut pg_sys::Expr;
         (*target_entry).resno = resno;
         (*target_entry).resname = create_cstring(&format!("group_col_{}", resno));
@@ -751,6 +752,7 @@ pub unsafe fn create_aggregate_node(
             // Create target entry for the aggregate function
             let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
                 as *mut pg_sys::TargetEntry;
+            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
             (*target_entry).expr = aggref_node as *mut pg_sys::Expr;
             (*target_entry).resno = resno;
             (*target_entry).resname = create_cstring(&format!("agg_func_{}", resno));

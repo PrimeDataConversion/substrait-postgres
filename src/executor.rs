@@ -38,16 +38,26 @@ pub unsafe fn execute_plan_directly(
         return Err("Failed to create tuplestore".into());
     }
 
-    // Create executor state and start execution
+    // Create executor state and start execution with proper error handling
     let estate = pg_sys::CreateExecutorState();
+    if estate.is_null() {
+        return Err("Failed to create executor state".into());
+    }
+
     let plan_state = pg_sys::ExecInitNode(
         plan_tree as *const pg_sys::Plan as *mut pg_sys::Plan,
         estate,
         0,
     );
+    if plan_state.is_null() {
+        pg_sys::FreeExecutorState(estate);
+        return Err("Failed to initialize plan node for execution".into());
+    }
 
-    // Execute the plan and collect tuples into tuplestore
+    // Execute the plan and collect tuples into tuplestore with error handling
+    let mut tuple_count = 0;
     loop {
+        // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
         let slot = pg_sys::ExecProcNode(plan_state);
         if slot.is_null() {
             break; // No more tuples
@@ -55,6 +65,14 @@ pub unsafe fn execute_plan_directly(
 
         // Store tuple directly in tuplestore
         pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        tuple_count += 1;
+
+        // Prevent infinite loops and excessive memory usage
+        if tuple_count > 1000000 {
+            pg_sys::ExecEndNode(plan_state);
+            pg_sys::FreeExecutorState(estate);
+            return Err("Query returned too many rows (> 1M), execution aborted".into());
+        }
     }
 
     // Clean up executor
@@ -83,6 +101,21 @@ pub unsafe fn execute_plan_with_postgres_executor(
     // because the new direct executor can hang on ValuesScan nodes
     if plan_tree.type_ == pg_sys::NodeTag::T_ValuesScan {
         return execute_plan_tree_structured(plan_tree);
+    }
+
+    // For complex plan types (joins, aggregates, etc.), execution is not yet fully supported
+    match plan_tree.type_ {
+        pg_sys::NodeTag::T_NestLoop
+        | pg_sys::NodeTag::T_Sort
+        | pg_sys::NodeTag::T_Limit
+        | pg_sys::NodeTag::T_Agg => {
+            return Err(format!(
+                "Execution of complex plan node type {:?} is not yet fully implemented. \
+                Translation succeeded but execution is limited to simple projections and table scans.",
+                plan_tree.type_
+            ).into());
+        }
+        _ => {}
     }
 
     // Use the direct execution approach for other node types

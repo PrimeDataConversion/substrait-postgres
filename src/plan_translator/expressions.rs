@@ -298,6 +298,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
             // Create TargetEntry
             let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
                 as *mut pg_sys::TargetEntry;
+            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
             (*target_entry).expr = selection_expr;
             (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
             (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
