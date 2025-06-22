@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use substrait::proto::rel::RelType;
 use substrait::proto::{Expression, Plan, PlanRel, Rel};
 
+use crate::executor::execute_plan_with_postgres_executor;
+
 /// Get a human-readable name for a Substrait relation type
 fn get_relation_type_name(rel_type: &RelType) -> &'static str {
     match rel_type {
@@ -129,18 +131,8 @@ pub unsafe fn execute_postgres_plan(
     plan_tree: &pg_sys::Plan,
     column_names: Vec<String>,
 ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
-    let mut result = crate::executor::execute_plan_tree_structured(plan_tree)?;
-
-    // Update column names with the ones from the plan schema.
-    // This ensures the returned schema matches the shape of the Substrait plan.
-    // TODO: Make sure this works with complex types.
-    for (i, column) in result.columns.iter_mut().enumerate() {
-        if i < column_names.len() {
-            column.name = column_names[i].clone();
-        }
-    }
-
-    Ok(result)
+    // Use PostgreSQL's native executor instead of our custom implementation
+    execute_plan_with_postgres_executor(plan_tree, column_names)
 }
 
 /// Legacy function for backward compatibility - combines translation and execution
@@ -210,6 +202,7 @@ unsafe fn convert_expression_to_target_entry(
                 // Create TargetEntry
                 let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
                     as *mut pg_sys::TargetEntry;
+                (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
                 (*target_entry).expr = const_expr;
                 (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
                 (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
@@ -522,6 +515,7 @@ unsafe fn create_target_list_for_table(
         // Create target entry
         let target_entry =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
+        (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
         (*target_entry).expr = var_node as *mut pg_sys::Expr;
         (*target_entry).resno = (*attr).attnum;
 
@@ -1380,6 +1374,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
                 // Create TargetEntry
                 let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
                     as *mut pg_sys::TargetEntry;
+                (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
                 (*target_entry).expr = const_expr;
                 (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
                 (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
@@ -1397,6 +1392,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
             // Create TargetEntry
             let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
                 as *mut pg_sys::TargetEntry;
+            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
             (*target_entry).expr = func_expr;
             (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
             (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));

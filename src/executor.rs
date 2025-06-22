@@ -3,17 +3,132 @@ use pgrx::pg_sys;
 
 use crate::plan_translator::{ColumnInfo, ExecutionResult};
 
-/// Helper function to extract column name from a target entry
-unsafe fn extract_column_name(target_entry: *mut pg_sys::TargetEntry) -> String {
-    if !(*target_entry).resname.is_null() {
-        let c_str = std::ffi::CStr::from_ptr((*target_entry).resname);
-        c_str.to_string_lossy().to_string()
-    } else {
-        "result".to_string()
+/// Executes a PostgreSQL plan tree using PostgreSQL's native executor
+/// and returns the tuple descriptor and tuplestore directly.
+/// This is the simplified approach that minimizes unpacking/packing operations.
+pub unsafe fn execute_plan_directly(
+    plan_tree: &pg_sys::Plan,
+    column_names: Vec<String>,
+) -> Result<
+    (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    // Get the tuple descriptor from the plan's target list
+    let tupdesc = pg_sys::ExecTypeFromTL((*plan_tree).targetlist);
+    if tupdesc.is_null() {
+        return Err("Failed to create tuple descriptor from plan".into());
     }
+
+    // Update column names in the tuple descriptor
+    let natts = (*tupdesc).natts;
+    for i in 0..natts as usize {
+        if i < column_names.len() {
+            let attr = (*tupdesc).attrs.as_mut_ptr().offset(i as isize);
+            // Update the attribute name (carefully to avoid buffer overflow)
+            let name_data = (*attr).attname.data.as_mut_ptr();
+            let src_len = std::cmp::min(column_names[i].len(), (pg_sys::NAMEDATALEN - 1) as usize);
+            std::ptr::copy_nonoverlapping(column_names[i].as_ptr(), name_data as *mut u8, src_len);
+            *name_data.offset(src_len as isize) = 0; // null terminate
+        }
+    }
+
+    // Create a tuplestore to collect results
+    let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
+    if tuplestore.is_null() {
+        return Err("Failed to create tuplestore".into());
+    }
+
+    // Create executor state and start execution
+    let estate = pg_sys::CreateExecutorState();
+    let plan_state = pg_sys::ExecInitNode(
+        plan_tree as *const pg_sys::Plan as *mut pg_sys::Plan,
+        estate,
+        0,
+    );
+
+    // Execute the plan and collect tuples into tuplestore
+    loop {
+        let slot = pg_sys::ExecProcNode(plan_state);
+        if slot.is_null() {
+            break; // No more tuples
+        }
+
+        // Store tuple directly in tuplestore
+        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+    }
+
+    // Clean up executor
+    pg_sys::ExecEndNode(plan_state);
+    pg_sys::FreeExecutorState(estate);
+
+    Ok((tupdesc, tuplestore))
 }
 
-/// Executes a PostgreSQL plan tree and returns structured results
+/// Compatibility wrapper that converts PostgreSQL's native execution results
+/// back to ExecutionResult format for backward compatibility.
+pub unsafe fn execute_plan_with_postgres_executor(
+    plan_tree: &pg_sys::Plan,
+    column_names: Vec<String>,
+) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
+    // Use the direct execution approach
+    let (tupdesc, tuplestore) = execute_plan_directly(plan_tree, column_names)?;
+
+    // Convert tuple descriptor to ColumnInfo
+    let mut columns = Vec::new();
+    let natts = (*tupdesc).natts;
+    for i in 0..natts {
+        let attr = (*tupdesc).attrs.as_ptr().offset(i as isize);
+        let name_cstr = std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr());
+        let name = name_cstr.to_string_lossy().to_string();
+
+        columns.push(ColumnInfo {
+            name,
+            type_oid: (*attr).atttypid,
+            type_mod: (*attr).atttypmod,
+            attr_number: (*attr).attnum,
+        });
+    }
+
+    // Extract rows from tuplestore
+    let mut rows = Vec::new();
+    let mut nulls = Vec::new();
+
+    // Set up tuplestore for reading
+    let slot = pg_sys::MakeTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+    pg_sys::tuplestore_rescan(tuplestore);
+
+    while pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
+        let mut row_values = Vec::new();
+        let mut row_nulls = Vec::new();
+
+        // Extract values from slot
+        for i in 1..=natts {
+            let mut is_null = false;
+            let datum = pg_sys::slot_getattr(slot, i, &mut is_null);
+            row_values.push(datum);
+            row_nulls.push(is_null);
+        }
+
+        rows.push(row_values);
+        nulls.push(row_nulls);
+    }
+
+    // Clean up slot
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+
+    // Clean up tuplestore
+    pg_sys::tuplestore_end(tuplestore);
+
+    Ok(ExecutionResult {
+        columns,
+        rows,
+        nulls,
+    })
+}
+
+/// Legacy function for backward compatibility - executes a PostgreSQL plan tree
+/// and returns structured results using the old approach.
+/// This function is deprecated in favor of execute_plan_with_postgres_executor.
 pub unsafe fn execute_plan_tree_structured(
     plan: &pg_sys::Plan,
 ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -329,6 +444,16 @@ pub unsafe fn execute_plan_tree_structured(
             })
         }
         _ => Err(format!("Unsupported plan node type: {:?}", plan.type_).into()),
+    }
+}
+
+/// Helper function to extract column name from a target entry
+unsafe fn extract_column_name(target_entry: *mut pg_sys::TargetEntry) -> String {
+    if !(*target_entry).resname.is_null() {
+        let c_str = std::ffi::CStr::from_ptr((*target_entry).resname);
+        c_str.to_string_lossy().to_string()
+    } else {
+        "result".to_string()
     }
 }
 
