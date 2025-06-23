@@ -107,7 +107,7 @@ pub extern "C" fn pg_finfo_from_substrait_json_wrapper() -> &'static pg_sys::Pg_
 
 /// Helper function to generate schema information for dynamic functions
 #[allow(dead_code)]
-fn extract_plan_schema(plan: Plan) -> String {
+fn extract_plan_schema(plan: &Plan) -> String {
     // Extract schema information from a Substrait plan
     // Use separate translation and execution
     match translate_substrait_plan(plan) {
@@ -202,7 +202,7 @@ unsafe fn extract_bytea_arg(fcinfo: pg_sys::FunctionCallInfo, arg_num: i32) -> &
 unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan) -> pg_sys::Datum {
     pgrx::info!("Starting execute_substrait_as_srf");
     // Use separate translation and execution
-    match translate_substrait_plan(plan) {
+    match translate_substrait_plan(&plan) {
         Ok((postgres_plan, column_names)) => {
             match execute_postgres_plan(postgres_plan, column_names) {
                 Ok(result_data) => {
@@ -960,7 +960,8 @@ mod tests {
                 setup_tpch_database_if_needed();
 
                 // Step 2: Execute plan to get schema information
-                let as_clause = match translate_substrait_plan(plan) {
+                pgrx::info!("{} - About to call translate_substrait_plan", $file_name);
+                let as_clause = match translate_substrait_plan(&plan) {
                     Ok((postgres_plan, column_names)) => {
                         match unsafe { execute_postgres_plan(postgres_plan, column_names) } {
                             Ok(result_data) => {

@@ -11,19 +11,44 @@ use super::plan_nodes::*;
 
 /// Build a map of function references to their names from the plan's extensions
 pub fn build_function_extension_map(plan: &Plan) -> HashMap<u32, String> {
+    eprintln!("DEBUG: Starting build_function_extension_map");
     let mut function_map = HashMap::new();
 
-    for extension in &plan.extensions {
+    // Safely check if extensions exist and can be accessed
+    eprintln!("DEBUG: Checking plan structure");
+
+    // Try to access extensions length in a safer way
+    let extensions_len = plan.extensions.len();
+    eprintln!("DEBUG: Plan has {} extensions", extensions_len);
+
+    if extensions_len == 0 {
+        eprintln!("DEBUG: No extensions found in plan, returning empty function map");
+        return function_map;
+    }
+
+    eprintln!("DEBUG: Processing {} extensions", extensions_len);
+    for (i, extension) in plan.extensions.iter().enumerate() {
+        eprintln!("DEBUG: Processing extension {}", i);
         if let Some(ext_type) = &extension.mapping_type {
+            eprintln!("DEBUG: Extension {} has mapping_type", i);
             match ext_type {
                 substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(func) => {
+                    eprintln!("DEBUG: Found function {} with anchor {}", func.name, func.function_anchor);
                     function_map.insert(func.function_anchor, func.name.clone());
                 }
-                _ => {} // Handle other extension types as needed
+                _ => {
+                    eprintln!("DEBUG: Extension {} has non-function mapping type", i);
+                } // Handle other extension types as needed
             }
+        } else {
+            eprintln!("DEBUG: Extension {} has no mapping_type", i);
         }
     }
 
+    eprintln!(
+        "DEBUG: build_function_extension_map completed with {} functions",
+        function_map.len()
+    );
     function_map
 }
 

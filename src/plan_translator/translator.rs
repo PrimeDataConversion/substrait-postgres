@@ -8,15 +8,24 @@ use super::relations::{
 
 /// Translates a Substrait plan to a PostgreSQL plan tree without executing it
 pub fn translate_substrait_plan(
-    plan: Plan,
+    plan: &Plan,
 ) -> Result<(&'static pg_sys::Plan, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    pgrx::info!(
+        "DEBUG: translate_substrait_plan called with {} relations",
+        plan.relations.len()
+    );
     eprintln!(
         "DEBUG: translate_substrait_plan called with {} relations",
         plan.relations.len()
     );
 
+    eprintln!("DEBUG: About to build function extension map");
+    pgrx::info!("DEBUG: About to build function extension map");
+
     // Build function extension map for reference lookup
     let function_map = build_function_extension_map(&plan);
+
+    eprintln!("DEBUG: Function map built successfully");
     eprintln!(
         "DEBUG: Built function map with {} functions",
         function_map.len()
