@@ -120,8 +120,8 @@ fn extract_plan_schema(plan: &Plan) -> String {
     // Extract schema information from a Substrait plan
     // Use separate translation and execution
     match translate_substrait_plan(plan) {
-        Ok((postgres_plan, column_names)) => {
-            match unsafe { execute_postgres_plan(postgres_plan, column_names) } {
+        Ok((postgres_plan, column_names, range_table)) => {
+            match unsafe { execute_postgres_plan(postgres_plan, column_names, range_table) } {
                 Ok(result_data) => {
                     let schema = result_data
                         .columns
@@ -212,8 +212,8 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
     pgrx::info!("Starting execute_substrait_as_srf");
     // Use separate translation and execution
     match translate_substrait_plan(&plan) {
-        Ok((postgres_plan, column_names)) => {
-            match execute_postgres_plan(postgres_plan, column_names) {
+        Ok((postgres_plan, column_names, range_table)) => {
+            match execute_postgres_plan(postgres_plan, column_names, range_table) {
                 Ok(result_data) => {
                     pgrx::info!(
                         "Successfully got result_data with {} columns",
@@ -240,8 +240,8 @@ unsafe fn execute_substrait_as_srf_with_function_map(
     pgrx::info!("Starting execute_substrait_as_srf_with_function_map");
     // Use translation with pre-built function map to avoid memory context issues
     match plan_translator::translate_substrait_plan_with_function_map(&plan, function_map) {
-        Ok((postgres_plan, column_names)) => {
-            match execute_postgres_plan(postgres_plan, column_names) {
+        Ok((postgres_plan, column_names, range_table)) => {
+            match execute_postgres_plan(postgres_plan, column_names, range_table) {
                 Ok(result_data) => {
                     pgrx::info!(
                         "Successfully got result_data with {} columns",
@@ -1014,8 +1014,10 @@ mod tests {
                     &plan,
                     function_map,
                 ) {
-                    Ok((postgres_plan, column_names)) => {
-                        match unsafe { execute_postgres_plan(postgres_plan, column_names) } {
+                    Ok((postgres_plan, column_names, range_table)) => {
+                        match unsafe {
+                            execute_postgres_plan(postgres_plan, column_names, range_table)
+                        } {
                             Ok(result_data) => {
                                 let clause = generate_as_clause(&result_data);
                                 pgrx::info!("{} - Generated AS clause: {}", $file_name, clause);

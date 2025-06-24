@@ -106,11 +106,14 @@ pub unsafe fn create_values_scan_with_target_list(
 }
 
 /// Create a PostgreSQL SeqScan node for table scans
-/// This function creates a SeqScan node and stores the table OID in the plan_node_id field
-/// for later retrieval during execution.
-pub unsafe fn create_seqscan_node(
+/// This function creates a SeqScan node and a range table entry.
+/// Returns both the plan node and the range table entry.
+/// The scanrelid parameter specifies the 1-based index in the range table.
+pub unsafe fn create_seqscan_node_with_scanrelid(
     table_name: &str,
-) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    scanrelid: pg_sys::Index,
+) -> Result<(*mut pg_sys::Plan, *mut pg_sys::RangeTblEntry), Box<dyn std::error::Error + Send + Sync>>
+{
     eprintln!(
         "DEBUG: create_seqscan_node called for table: {}",
         table_name
@@ -156,7 +159,7 @@ pub unsafe fn create_seqscan_node(
         (*seqscan_node).plan.async_capable = false;
         (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for later retrieval
         (*seqscan_node).plan.qual = std::ptr::null_mut();
-        (*seqscan_node).scanrelid = table_oid.to_u32() as pg_sys::Index; // Use table OID directly as scanrelid
+        (*seqscan_node).scanrelid = scanrelid; // Range table index
 
         // Create target list for the table's columns
         let target_list = create_target_list_for_table(table_oid)?;
@@ -179,14 +182,17 @@ pub unsafe fn create_seqscan_node(
         (*seqscan_node).scan.plan.async_capable = false;
         (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for later retrieval
         (*seqscan_node).scan.plan.qual = std::ptr::null_mut();
-        (*seqscan_node).scan.scanrelid = table_oid.to_u32() as pg_sys::Index; // Use table OID directly as scanrelid
+        (*seqscan_node).scan.scanrelid = scanrelid; // Range table index
 
         // Create target list for the table's columns
         let target_list = create_target_list_for_table(table_oid)?;
         (*seqscan_node).scan.plan.targetlist = target_list;
     }
 
-    Ok(seqscan_node as *mut pg_sys::Plan)
+    // Create a range table entry for this table
+    let rte = create_range_table_entry(table_oid, table_name)?;
+
+    Ok((seqscan_node as *mut pg_sys::Plan, rte))
 }
 
 /// Look up a table OID by name
@@ -220,6 +226,55 @@ unsafe fn lookup_table_oid(
     }
 
     Ok(relation_oid)
+}
+
+/// Create a range table entry for a table
+unsafe fn create_range_table_entry(
+    table_oid: pg_sys::Oid,
+    table_name: &str,
+) -> Result<*mut pg_sys::RangeTblEntry, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: create_range_table_entry called for table: {} with OID: {}",
+        table_name, table_oid
+    );
+    pgrx::info!(
+        "DEBUG: create_range_table_entry called for table: {} with OID: {}",
+        table_name,
+        table_oid
+    );
+
+    // Create RangeTblEntry
+    let rte =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeTblEntry>()) as *mut pg_sys::RangeTblEntry;
+
+    (*rte).type_ = pg_sys::NodeTag::T_RangeTblEntry;
+    (*rte).rtekind = pg_sys::RTEKind::RTE_RELATION;
+    (*rte).relid = table_oid;
+    (*rte).relkind = pg_sys::RELKIND_RELATION as i8;
+    (*rte).rellockmode = pg_sys::AccessShareLock as i32;
+    (*rte).lateral = false;
+    (*rte).inh = true; // Include inheritance
+    (*rte).inFromCl = true; // This table is in the FROM clause
+
+    // Create an alias for the table
+    let alias = pg_sys::palloc0(std::mem::size_of::<pg_sys::Alias>()) as *mut pg_sys::Alias;
+    (*alias).type_ = pg_sys::NodeTag::T_Alias;
+    (*alias).aliasname = create_cstring(table_name);
+    (*alias).colnames = std::ptr::null_mut(); // Will be filled in by planner if needed
+    (*rte).eref = alias;
+    (*rte).alias = std::ptr::null_mut(); // No explicit alias
+
+    // Initialize other fields
+    (*rte).selectedCols = std::ptr::null_mut();
+    (*rte).insertedCols = std::ptr::null_mut();
+    (*rte).updatedCols = std::ptr::null_mut();
+    (*rte).extraUpdatedCols = std::ptr::null_mut();
+    (*rte).securityQuals = std::ptr::null_mut();
+
+    eprintln!("DEBUG: Range table entry created successfully");
+    pgrx::info!("DEBUG: Range table entry created successfully");
+
+    Ok(rte)
 }
 
 /// Create a target list for a table's columns
@@ -1074,4 +1129,42 @@ pub unsafe fn create_aggregate_node(
     (*agg_node).plan.targetlist = target_list;
 
     Ok(agg_node as *mut pg_sys::Plan)
+}
+
+/// Create a range table entry from a table OID
+pub unsafe fn create_range_table_entry_from_oid(
+    table_oid: pg_sys::Oid,
+) -> Result<*mut pg_sys::RangeTblEntry, Box<dyn std::error::Error + Send + Sync>> {
+    // Get table name from OID
+    let table_name = get_table_name_from_oid(table_oid)?;
+    create_range_table_entry(table_oid, &table_name)
+}
+
+/// Get table name from OID
+unsafe fn get_table_name_from_oid(
+    table_oid: pg_sys::Oid,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Get the relation tuple
+    let rel_tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::RELOID as i32,
+        pg_sys::Datum::from(table_oid),
+    );
+
+    if rel_tuple.is_null() {
+        return Err(format!("Table with OID {} not found", table_oid).into());
+    }
+
+    // Extract the relation name
+    let form_rel = pg_sys::GETSTRUCT(rel_tuple) as *mut pg_sys::Form_pg_class;
+    let name_data = &(*(*form_rel)).relname;
+
+    // Convert NameData to string
+    let table_name = std::ffi::CStr::from_ptr(name_data.data.as_ptr())
+        .to_string_lossy()
+        .to_string();
+
+    // Release the syscache tuple
+    pg_sys::ReleaseSysCache(rel_tuple);
+
+    Ok(table_name)
 }

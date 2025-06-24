@@ -1,7 +1,6 @@
-use substrait::proto::rel::RelType;
-
 /// Get a human-readable name for a Substrait relation type
-pub fn get_relation_type_name(rel_type: &RelType) -> &'static str {
+pub fn get_relation_type_name(rel_type: &substrait::proto::rel::RelType) -> &'static str {
+    use substrait::proto::rel::RelType;
     match rel_type {
         RelType::Project(_) => "Project",
         RelType::Read(_) => "Read",

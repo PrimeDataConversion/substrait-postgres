@@ -268,7 +268,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                             table_name
                         );
 
-                        let result = create_seqscan_node(&table_name);
+                        let (plan, _rte) = create_seqscan_node_with_scanrelid(&table_name, 1)?;
 
                         eprintln!(
                             "DEBUG: SeqScan node creation completed for table: {}",
@@ -282,7 +282,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                         eprintln!("DEBUG: About to return from NamedTable processing");
                         pgrx::info!("DEBUG: About to return from NamedTable processing");
 
-                        result
+                        Ok(plan)
                     }
                     _ => {
                         eprintln!("DEBUG: Unsupported read type encountered");

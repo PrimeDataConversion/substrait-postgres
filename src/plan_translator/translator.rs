@@ -1,5 +1,6 @@
 use anyhow::Result;
 use pgrx::pg_sys;
+use std::collections::HashMap;
 use substrait::proto::Plan;
 
 use super::relations::{
@@ -9,7 +10,10 @@ use super::relations::{
 /// Translates a Substrait plan to a PostgreSQL plan tree without executing it
 pub fn translate_substrait_plan(
     plan: &Plan,
-) -> Result<(&'static pg_sys::Plan, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (*mut pg_sys::Plan, Vec<String>, *mut pg_sys::List),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     pgrx::info!(
         "DEBUG: translate_substrait_plan called with {} relations",
         plan.relations.len()
@@ -39,7 +43,10 @@ pub fn translate_substrait_plan(
 pub fn translate_substrait_plan_with_function_map(
     plan: &Plan,
     function_map: std::collections::HashMap<u32, String>,
-) -> Result<(&'static pg_sys::Plan, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (*mut pg_sys::Plan, Vec<String>, *mut pg_sys::List),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     pgrx::info!(
         "DEBUG: translate_substrait_plan_with_function_map called with {} plan relations and {} functions",
         plan.relations.len(),
@@ -143,11 +150,85 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: About to create return value");
         pgrx::info!("DEBUG: About to create return value");
 
-        let result = (&*plan_tree, column_names);
+        // Build range table by collecting RTEs from the plan tree
+        let range_table = collect_range_table_from_plan_tree(plan_tree);
+
+        eprintln!("DEBUG: Built range table during translation");
+        pgrx::info!("DEBUG: Built range table during translation");
+
+        let result = (plan_tree, column_names, range_table);
 
         eprintln!("DEBUG: Return value created, about to return");
         pgrx::info!("DEBUG: Return value created, about to return");
 
         Ok(result)
+    }
+}
+
+/// Collect range table entries from a plan tree
+/// This function traverses the plan tree and builds a range table with proper scanrelid assignments
+unsafe fn collect_range_table_from_plan_tree(plan_tree: *mut pg_sys::Plan) -> *mut pg_sys::List {
+    let mut range_table = std::ptr::null_mut::<pg_sys::List>();
+    let mut current_scanrelid = 1u32;
+
+    // Traverse the plan tree and collect all SeqScan nodes
+    collect_seqscan_nodes_recursive(plan_tree, &mut range_table, &mut current_scanrelid);
+
+    range_table
+}
+
+/// Recursively traverse plan tree to collect SeqScan nodes and build range table
+unsafe fn collect_seqscan_nodes_recursive(
+    plan: *mut pg_sys::Plan,
+    range_table: &mut *mut pg_sys::List,
+    current_scanrelid: &mut u32,
+) {
+    if plan.is_null() {
+        return;
+    }
+
+    match (*plan).type_ {
+        pg_sys::NodeTag::T_SeqScan => {
+            // Get table OID from plan_node_id (stored during SeqScan creation)
+            let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
+
+            // Create range table entry for this table
+            if let Ok(rte) = super::plan_nodes::create_range_table_entry_from_oid(table_oid) {
+                *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
+
+                // Update the SeqScan node to use the correct scanrelid
+                let seqscan = plan as *mut pg_sys::SeqScan;
+
+                #[cfg(any(feature = "pg13", feature = "pg14"))]
+                {
+                    (*seqscan).scanrelid = *current_scanrelid;
+                }
+                #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+                {
+                    (*seqscan).scan.scanrelid = *current_scanrelid;
+                }
+
+                eprintln!(
+                    "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",
+                    *current_scanrelid, table_oid
+                );
+                pgrx::info!(
+                    "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",
+                    *current_scanrelid,
+                    table_oid
+                );
+
+                *current_scanrelid += 1;
+            }
+        }
+        _ => {
+            // For other node types, recurse into child nodes
+            if !(*plan).lefttree.is_null() {
+                collect_seqscan_nodes_recursive((*plan).lefttree, range_table, current_scanrelid);
+            }
+            if !(*plan).righttree.is_null() {
+                collect_seqscan_nodes_recursive((*plan).righttree, range_table, current_scanrelid);
+            }
+        }
     }
 }
