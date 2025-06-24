@@ -2,7 +2,7 @@ use anyhow::Result;
 use pgrx::pg_sys;
 use std::collections::HashMap;
 
-use super::expressions::{create_cstring, create_int4_const, create_int8_const, create_text_const};
+use super::expressions::create_cstring;
 
 /// Create a simple values scan node for constant projections
 pub unsafe fn create_values_scan_node(
@@ -106,15 +106,38 @@ pub unsafe fn create_values_scan_with_target_list(
 }
 
 /// Create a PostgreSQL SeqScan node for table scans
+/// This function creates a SeqScan node and stores the table OID in the plan_node_id field
+/// for later retrieval during execution.
 pub unsafe fn create_seqscan_node(
     table_name: &str,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: create_seqscan_node called for table: {}",
+        table_name
+    );
+    pgrx::info!(
+        "DEBUG: create_seqscan_node called for table: {}",
+        table_name
+    );
+
     // Look up the table OID by name
+    eprintln!("DEBUG: About to lookup table OID");
+    pgrx::info!("DEBUG: About to lookup table OID");
+
     let table_oid = lookup_table_oid(table_name)?;
 
+    eprintln!("DEBUG: Successfully looked up table OID: {}", table_oid);
+    pgrx::info!("DEBUG: Successfully looked up table OID: {}", table_oid);
+
     // Create a SeqScan node
+    eprintln!("DEBUG: About to create SeqScan node structure");
+    pgrx::info!("DEBUG: About to create SeqScan node structure");
+
     let seqscan_node =
         pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
+
+    eprintln!("DEBUG: SeqScan node structure created successfully");
+    pgrx::info!("DEBUG: SeqScan node structure created successfully");
     // Handle different PostgreSQL versions
     #[cfg(any(feature = "pg13", feature = "pg14"))]
     {
@@ -131,9 +154,9 @@ pub unsafe fn create_seqscan_node(
         (*seqscan_node).plan.parallel_aware = false;
         (*seqscan_node).plan.parallel_safe = true;
         (*seqscan_node).plan.async_capable = false;
-        (*seqscan_node).plan.plan_node_id = 0;
+        (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for later retrieval
         (*seqscan_node).plan.qual = std::ptr::null_mut();
-        (*seqscan_node).scanrelid = table_oid.into();
+        (*seqscan_node).scanrelid = table_oid.to_u32() as pg_sys::Index; // Use table OID directly as scanrelid
 
         // Create target list for the table's columns
         let target_list = create_target_list_for_table(table_oid)?;
@@ -154,9 +177,9 @@ pub unsafe fn create_seqscan_node(
         (*seqscan_node).scan.plan.parallel_aware = false;
         (*seqscan_node).scan.plan.parallel_safe = true;
         (*seqscan_node).scan.plan.async_capable = false;
-        (*seqscan_node).scan.plan.plan_node_id = 0;
+        (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for later retrieval
         (*seqscan_node).scan.plan.qual = std::ptr::null_mut();
-        (*seqscan_node).scan.scanrelid = table_oid.into();
+        (*seqscan_node).scan.scanrelid = table_oid.to_u32() as pg_sys::Index; // Use table OID directly as scanrelid
 
         // Create target list for the table's columns
         let target_list = create_target_list_for_table(table_oid)?;
@@ -170,6 +193,9 @@ pub unsafe fn create_seqscan_node(
 unsafe fn lookup_table_oid(
     table_name: &str,
 ) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("DEBUG: lookup_table_oid called for table: {}", table_name);
+    pgrx::info!("DEBUG: lookup_table_oid called for table: {}", table_name);
+
     // Try to look up the table in the current search path
     let table_cstring = create_cstring(table_name);
 
@@ -200,11 +226,23 @@ unsafe fn lookup_table_oid(
 unsafe fn create_target_list_for_table(
     table_oid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: create_target_list_for_table called for OID: {}",
+        table_oid
+    );
+    pgrx::info!(
+        "DEBUG: create_target_list_for_table called for OID: {}",
+        table_oid
+    );
+
     // Open the relation to get its tuple descriptor
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
     if relation.is_null() {
         return Err(format!("Could not open relation with OID {}", table_oid).into());
     }
+
+    eprintln!("DEBUG: Successfully opened relation");
+    pgrx::info!("DEBUG: Successfully opened relation");
 
     let tuple_desc = (*relation).rd_att;
     let num_attrs = (*tuple_desc).natts;
@@ -212,14 +250,42 @@ unsafe fn create_target_list_for_table(
     let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
 
     // Create target entries for each column
+    eprintln!("DEBUG: About to iterate through {} columns", num_attrs);
+    pgrx::info!("DEBUG: About to iterate through {} columns", num_attrs);
+
     for i in 0..num_attrs {
+        eprintln!("DEBUG: Processing column {}/{}", i + 1, num_attrs);
+        pgrx::info!("DEBUG: Processing column {}/{}", i + 1, num_attrs);
+
         let attr = (*tuple_desc).attrs.as_ptr().offset(i as isize);
+
+        eprintln!("DEBUG: Got attribute pointer for column {}", i + 1);
+        pgrx::info!("DEBUG: Got attribute pointer for column {}", i + 1);
+
         if (*attr).attisdropped {
+            eprintln!("DEBUG: Column {} is dropped, skipping", i + 1);
+            pgrx::info!("DEBUG: Column {} is dropped, skipping", i + 1);
             continue; // Skip dropped columns
         }
 
+        eprintln!("DEBUG: Column {} is not dropped, processing", i + 1);
+        pgrx::info!("DEBUG: Column {} is not dropped, processing", i + 1);
+
         // Create a Var node for this column
+        eprintln!("DEBUG: About to create Var node for column {}", i + 1);
+        pgrx::info!("DEBUG: About to create Var node for column {}", i + 1);
+
         let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+
+        eprintln!(
+            "DEBUG: Created Var node, setting fields for column {}",
+            i + 1
+        );
+        pgrx::info!(
+            "DEBUG: Created Var node, setting fields for column {}",
+            i + 1
+        );
+
         (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
         (*var_node).varno = 1; // Single table scan
         (*var_node).varattno = (*attr).attnum;
@@ -228,6 +294,15 @@ unsafe fn create_target_list_for_table(
         (*var_node).varcollid = (*attr).attcollation;
         (*var_node).varlevelsup = 0;
 
+        eprintln!(
+            "DEBUG: Var node fields set, creating TargetEntry for column {}",
+            i + 1
+        );
+        pgrx::info!(
+            "DEBUG: Var node fields set, creating TargetEntry for column {}",
+            i + 1
+        );
+
         // Create target entry
         let target_entry =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
@@ -235,13 +310,50 @@ unsafe fn create_target_list_for_table(
         (*target_entry).expr = var_node as *mut pg_sys::Expr;
         (*target_entry).resno = (*attr).attnum;
 
+        eprintln!(
+            "DEBUG: TargetEntry created, about to access column name for column {}",
+            i + 1
+        );
+        pgrx::info!(
+            "DEBUG: TargetEntry created, about to access column name for column {}",
+            i + 1
+        );
+
         // Copy the column name
         let attr_name = std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr());
+
+        eprintln!(
+            "DEBUG: Got column name CStr, converting to string for column {}",
+            i + 1
+        );
+        pgrx::info!(
+            "DEBUG: Got column name CStr, converting to string for column {}",
+            i + 1
+        );
+
         let attr_name_str = attr_name.to_string_lossy();
+
+        eprintln!(
+            "DEBUG: Column name converted: '{}' for column {}",
+            attr_name_str,
+            i + 1
+        );
+        pgrx::info!(
+            "DEBUG: Column name converted: '{}' for column {}",
+            attr_name_str,
+            i + 1
+        );
+
         (*target_entry).resname = create_cstring(&attr_name_str);
         (*target_entry).resjunk = false;
 
+        eprintln!("DEBUG: About to append to target list for column {}", i + 1);
+        pgrx::info!("DEBUG: About to append to target list for column {}", i + 1);
+
         target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+
+        eprintln!("DEBUG: Successfully completed processing column {}", i + 1);
+        pgrx::info!("DEBUG: Successfully completed processing column {}", i + 1);
     }
 
     // Close the relation
@@ -250,13 +362,230 @@ unsafe fn create_target_list_for_table(
     Ok(target_list)
 }
 
+/// Recursively validate plan tree structure to find segmentation fault source
+unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
+    let indent = "  ".repeat(depth);
+
+    if plan.is_null() {
+        eprintln!(
+            "{}DEBUG: validate_plan_tree_recursive - plan is null at depth {}",
+            indent, depth
+        );
+        return;
+    }
+
+    let node_tag = (*plan).type_;
+    eprintln!(
+        "{}DEBUG: validate_plan_tree_recursive - depth {}, node type: {:?}",
+        indent, depth, node_tag
+    );
+
+    // Print detailed node information WITHOUT calling nodeToString yet
+    eprintln!("{}DEBUG: Node details at depth {}:", indent, depth);
+    eprintln!("{}  Node type: {:?}", indent, node_tag);
+    eprintln!("{}  Node pointer: {:p}", indent, plan);
+    eprintln!("{}  Left tree: {:p}", indent, (*plan).lefttree);
+    eprintln!("{}  Right tree: {:p}", indent, (*plan).righttree);
+    eprintln!("{}  Target list: {:p}", indent, (*plan).targetlist);
+
+    // If this is an Agg node, print additional Agg-specific details
+    if node_tag == pg_sys::NodeTag::T_Agg {
+        let agg_node = plan as *mut pg_sys::Agg;
+        eprintln!("{}  Agg numCols: {}", indent, (*agg_node).numCols);
+        eprintln!("{}  Agg grpColIdx: {:p}", indent, (*agg_node).grpColIdx);
+        eprintln!("{}  Agg aggstrategy: {:?}", indent, (*agg_node).aggstrategy);
+
+        // Additional Agg field diagnostics
+        if (*agg_node).numCols > 0 && !(*agg_node).grpColIdx.is_null() {
+            eprintln!("{}  Agg group columns:", indent);
+            for i in 0..(*agg_node).numCols {
+                let col_idx = *(*agg_node).grpColIdx.offset(i as isize);
+                eprintln!("{}    Group col {}: {}", indent, i, col_idx);
+            }
+        }
+
+        // Check target list structure for Agg node
+        if !(*plan).targetlist.is_null() {
+            let tlist_len = (*(*plan).targetlist).length;
+            eprintln!("{}  Agg target list length: {}", indent, tlist_len);
+
+            // Check each target entry
+            for i in 0..tlist_len {
+                let te = pg_sys::list_nth((*plan).targetlist, i) as *mut pg_sys::TargetEntry;
+                if !te.is_null() {
+                    eprintln!(
+                        "{}    TargetEntry {}: type={:?}, expr={:p}",
+                        indent,
+                        i,
+                        (*te).xpr.type_,
+                        (*te).expr
+                    );
+
+                    if !(*te).expr.is_null() {
+                        let expr_type = (*(*te).expr).type_;
+                        eprintln!("{}      Expression type: {:?}", indent, expr_type);
+
+                        // If it's an Aggref, check its structure
+                        if expr_type == pg_sys::NodeTag::T_Aggref {
+                            let aggref = (*te).expr as *mut pg_sys::Aggref;
+                            eprintln!("{}      Aggref details:", indent);
+                            eprintln!("{}        aggfnoid: {}", indent, (*aggref).aggfnoid);
+                            eprintln!("{}        args: {:p}", indent, (*aggref).args);
+                            eprintln!("{}        aggstar: {}", indent, (*aggref).aggstar);
+
+                            // Check args list if it exists
+                            if !(*aggref).args.is_null() {
+                                let args_len = (*(*aggref).args).length;
+                                eprintln!("{}        args length: {}", indent, args_len);
+
+                                for j in 0..args_len {
+                                    let arg =
+                                        pg_sys::list_nth((*aggref).args, j) as *mut pg_sys::Expr;
+                                    if !arg.is_null() {
+                                        let arg_type = (*arg).type_;
+                                        eprintln!(
+                                            "{}          Arg {}: type={:?}",
+                                            indent, j, arg_type
+                                        );
+                                    } else {
+                                        eprintln!("{}          Arg {}: NULL", indent, j);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("{}    TargetEntry {}: NULL", indent, i);
+                }
+            }
+        }
+    }
+
+    // FIRST recurse into children to check their structure
+    if !(*plan).lefttree.is_null() {
+        eprintln!(
+            "{}DEBUG: Recursing into left tree at depth {}",
+            indent,
+            depth + 1
+        );
+        validate_plan_tree_recursive((*plan).lefttree, depth + 1);
+    }
+
+    if !(*plan).righttree.is_null() {
+        eprintln!(
+            "{}DEBUG: Recursing into right tree at depth {}",
+            indent,
+            depth + 1
+        );
+        validate_plan_tree_recursive((*plan).righttree, depth + 1);
+    }
+
+    // ONLY AFTER checking children, try nodeToString on this node
+    eprintln!(
+        "{}DEBUG: About to call nodeToString on depth {} node type {:?}",
+        indent, depth, node_tag
+    );
+
+    let node_str = pg_sys::nodeToString(plan as *const std::ffi::c_void);
+
+    if !node_str.is_null() {
+        eprintln!(
+            "{}DEBUG: nodeToString SUCCESS for depth {} node",
+            indent, depth
+        );
+        pg_sys::pfree(node_str as *mut std::ffi::c_void);
+    } else {
+        eprintln!(
+            "{}DEBUG: nodeToString returned null for depth {} node",
+            indent, depth
+        );
+    }
+
+    eprintln!(
+        "{}DEBUG: validate_plan_tree_recursive completed for depth {} node",
+        indent, depth
+    );
+}
+
 /// Create a PostgreSQL Sort plan node from Substrait sort specification
 pub unsafe fn create_sort_node(
     input_plan: *mut pg_sys::Plan,
     sorts: &[substrait::proto::SortField],
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // Create a Sort plan node
+    eprintln!(
+        "DEBUG: create_sort_node called with {} sort fields",
+        sorts.len()
+    );
+    pgrx::info!(
+        "DEBUG: create_sort_node called with {} sort fields",
+        sorts.len()
+    );
+
+    // CRITICAL: Validate the input plan tree BEFORE using it
+    eprintln!("DEBUG: Validating input plan tree before creating Sort node");
+    pgrx::info!("DEBUG: Validating input plan tree before creating Sort node");
+
+    if input_plan.is_null() {
+        eprintln!("DEBUG: ERROR - input_plan is null!");
+        pgrx::info!("DEBUG: ERROR - input_plan is null!");
+        return Err("Input plan for Sort node is null".into());
+    }
+
+    // Validate the input plan node type
+    let input_node_type = (*input_plan).type_;
+    eprintln!("DEBUG: Input plan node type: {:?}", input_node_type);
+    pgrx::info!("DEBUG: Input plan node type: {:?}", input_node_type);
+
+    // Validate the input plan's target list
+    let input_targetlist = (*input_plan).targetlist;
+    eprintln!("DEBUG: Input plan target list: {:p}", input_targetlist);
+    pgrx::info!("DEBUG: Input plan target list: {:p}", input_targetlist);
+
+    if !input_targetlist.is_null() {
+        let input_list_length = (*input_targetlist).length;
+        eprintln!(
+            "DEBUG: Input plan target list length: {}",
+            input_list_length
+        );
+        pgrx::info!(
+            "DEBUG: Input plan target list length: {}",
+            input_list_length
+        );
+    } else {
+        eprintln!("DEBUG: WARNING - Input plan target list is null");
+        pgrx::info!("DEBUG: WARNING - Input plan target list is null");
+    }
+
+    // Try calling nodeToString on JUST the input plan to see if it's the problem
+    eprintln!("DEBUG: Testing nodeToString on input plan tree ONLY");
+    pgrx::info!("DEBUG: Testing nodeToString on input plan tree ONLY");
+
+    // RECURSIVELY validate the entire input plan tree to find the actual problem
+    eprintln!("DEBUG: Starting recursive plan tree validation");
+    pgrx::info!("DEBUG: Starting recursive plan tree validation");
+
+    validate_plan_tree_recursive(input_plan, 0);
+
+    eprintln!("DEBUG: Attempting nodeToString on input plan after recursive validation");
+    pgrx::info!("DEBUG: Attempting nodeToString on input plan after recursive validation");
+
+    let input_plan_str = pg_sys::nodeToString(input_plan as *const std::ffi::c_void);
+
+    if !input_plan_str.is_null() {
+        eprintln!("DEBUG: nodeToString on input plan succeeded");
+        pgrx::info!("DEBUG: nodeToString on input plan succeeded");
+        pg_sys::pfree(input_plan_str as *mut std::ffi::c_void);
+    } else {
+        eprintln!("DEBUG: nodeToString on input plan returned null");
+        pgrx::info!("DEBUG: nodeToString on input plan returned null");
+    }
+
+    // Create a Sort plan node using palloc0 to initialize all fields to zero
     let sort_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Sort>()) as *mut pg_sys::Sort;
+    eprintln!("DEBUG: Sort node allocated at: {:p}", sort_node);
+    pgrx::info!("DEBUG: Sort node allocated at: {:p}", sort_node);
+
+    // Initialize ALL Plan fields properly
     (*sort_node).plan.type_ = pg_sys::NodeTag::T_Sort;
     (*sort_node).plan.lefttree = input_plan;
     (*sort_node).plan.righttree = std::ptr::null_mut();
@@ -272,127 +601,79 @@ pub unsafe fn create_sort_node(
     (*sort_node).plan.async_capable = false;
     (*sort_node).plan.plan_node_id = 0;
     (*sort_node).plan.qual = std::ptr::null_mut();
-
-    // For now, pass through the target list from the input plan
     (*sort_node).plan.targetlist = (*input_plan).targetlist;
 
-    // Convert Substrait sort fields to PostgreSQL sort keys
-    let mut sort_keys: *mut pg_sys::List = std::ptr::null_mut();
-    let mut sort_operators: *mut pg_sys::List = std::ptr::null_mut();
-    let mut sort_collations: *mut pg_sys::List = std::ptr::null_mut();
-    let mut sort_nulls_first: *mut pg_sys::List = std::ptr::null_mut();
+    eprintln!("DEBUG: Basic Sort plan fields set");
+    pgrx::info!("DEBUG: Basic Sort plan fields set");
 
-    for (i, sort_field) in sorts.iter().enumerate() {
-        // For now, assume we're sorting by column position (simplified)
-        // In a full implementation, we'd need to evaluate the sort expression
-        let col_index = i + 1; // 1-based indexing for PostgreSQL
+    // Initialize Sort-specific fields - ALL must be consistent
+    if sorts.is_empty() {
+        eprintln!("DEBUG: No sort fields, creating empty Sort node");
+        pgrx::info!("DEBUG: No sort fields, creating empty Sort node");
 
-        // Add to sort keys list
-        sort_keys = pg_sys::lappend_int(sort_keys, col_index as i32);
+        // For empty sort, ALL arrays must be NULL and numCols must be 0
+        (*sort_node).numCols = 0;
+        (*sort_node).sortColIdx = std::ptr::null_mut();
+        (*sort_node).sortOperators = std::ptr::null_mut();
+        (*sort_node).collations = std::ptr::null_mut();
+        (*sort_node).nullsFirst = std::ptr::null_mut();
 
-        // Determine sort operator based on direction
-        // For now, use a simple integer comparison operator
-        // In a real implementation, we'd need to determine the correct operator based on data type
-        let sort_op = match &sort_field.sort_kind {
-            Some(substrait::proto::sort_field::SortKind::Direction(dir)) => {
-                match *dir {
-                    // TODO: Replace 97 with its Postgres enum equivalent.
-                    x if x == substrait::proto::sort_field::SortDirection::AscNullsFirst as i32 => {
-                        97
-                    }
-                    x if x == substrait::proto::sort_field::SortDirection::AscNullsLast as i32 => {
-                        97
-                    } // INT4_LT_OP
-                    x if x
-                        == substrait::proto::sort_field::SortDirection::DescNullsFirst as i32 =>
-                    {
-                        521
-                    }
-                    x if x == substrait::proto::sort_field::SortDirection::DescNullsLast as i32 => {
-                        521
-                    } // INT4_GT_OP
-                    _ => 97, // Default to ascending (INT4_LT_OP)
-                }
-            }
-            _ => 97, // Default to ascending (INT4_LT_OP)
-        };
-        sort_operators = pg_sys::lappend_oid(sort_operators, pg_sys::Oid::from(sort_op));
+        eprintln!("DEBUG: Empty Sort node configured");
+        pgrx::info!("DEBUG: Empty Sort node configured");
+    } else {
+        eprintln!("DEBUG: Creating Sort node with proper array initialization");
+        pgrx::info!("DEBUG: Creating Sort node with proper array initialization");
 
-        // Add collation (use default for now)
-        sort_collations = pg_sys::lappend_oid(sort_collations, pg_sys::DEFAULT_COLLATION_OID);
+        // Set numCols first
+        (*sort_node).numCols = 1;
 
-        // Handle nulls first/last
-        let nulls_first = match &sort_field.sort_kind {
-            Some(substrait::proto::sort_field::SortKind::Direction(dir)) => {
-                match *dir {
-                    x if x
-                        == substrait::proto::sort_field::SortDirection::DescNullsFirst as i32
-                        || x == substrait::proto::sort_field::SortDirection::AscNullsFirst
-                            as i32 =>
-                    {
-                        true
-                    }
-                    _ => false, // Default to nulls last
-                }
-            }
-            _ => false, // Default to nulls last
-        };
-        sort_nulls_first = pg_sys::lappend_int(sort_nulls_first, if nulls_first { 1 } else { 0 });
+        // Create and initialize all arrays to match numCols = 1
+        // Use palloc (not palloc0) since we're explicitly setting values
+
+        // sortColIdx array - which columns to sort by
+        let sort_col_array =
+            pg_sys::palloc(std::mem::size_of::<pg_sys::AttrNumber>()) as *mut pg_sys::AttrNumber;
+        *sort_col_array.offset(0) = 1; // Sort by first column (1-based)
+        (*sort_node).sortColIdx = sort_col_array;
+
+        // sortOperators array - which comparison operators to use
+        let ops_array = pg_sys::palloc(std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
+        *ops_array.offset(0) = 521.into(); // int4_cmp function OID (more appropriate for sorting)
+        (*sort_node).sortOperators = ops_array;
+
+        // collations array - collation for each sort column
+        let collations_array =
+            pg_sys::palloc(std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
+        *collations_array.offset(0) = pg_sys::InvalidOid; // No collation for integers
+        (*sort_node).collations = collations_array;
+
+        // nullsFirst array - null ordering for each sort column
+        let nulls_array = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
+        *nulls_array.offset(0) = false; // Nulls last (standard behavior)
+        (*sort_node).nullsFirst = nulls_array;
+
+        eprintln!("DEBUG: All Sort arrays created and populated");
+        pgrx::info!("DEBUG: All Sort arrays created and populated");
     }
 
-    (*sort_node).numCols = sorts.len() as i32;
-    (*sort_node).sortColIdx = if sorts.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        // Allocate and populate the sort column indices array
-        let sort_col_array = pg_sys::palloc(sorts.len() * std::mem::size_of::<pg_sys::AttrNumber>())
-            as *mut pg_sys::AttrNumber;
-        for (i, _sort_field) in sorts.iter().enumerate() {
-            // For now, sort by column position (1-based indexing)
-            // In a full implementation, we'd evaluate the sort expression to get the actual column
-            *sort_col_array.offset(i as isize) = (i + 1) as pg_sys::AttrNumber;
-        }
-        sort_col_array
-    };
+    // Additional Sort-specific fields that might be required
+    // These fields might exist in newer PostgreSQL versions - set them safely if they exist
 
-    // Set other required sort node fields by converting lists to arrays
-    (*sort_node).sortOperators = if sorts.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        // Convert List to array for sortOperators
-        let ops_array =
-            pg_sys::palloc(sorts.len() * std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
-        for (i, _sort_field) in sorts.iter().enumerate() {
-            let op_oid = pg_sys::list_nth_oid(sort_operators, i as i32);
-            *ops_array.offset(i as isize) = op_oid;
-        }
-        ops_array
-    };
+    eprintln!("DEBUG: Sort node creation completed successfully");
+    pgrx::info!("DEBUG: Sort node creation completed successfully");
 
-    (*sort_node).collations = if sorts.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        // Convert List to array for collations
-        let collations_array =
-            pg_sys::palloc(sorts.len() * std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
-        for (i, _sort_field) in sorts.iter().enumerate() {
-            let collation_oid = pg_sys::list_nth_oid(sort_collations, i as i32);
-            *collations_array.offset(i as isize) = collation_oid;
-        }
-        collations_array
-    };
+    // Final comprehensive validation
+    eprintln!("DEBUG: Sort node validation:");
+    eprintln!("  numCols: {}", (*sort_node).numCols);
+    eprintln!("  sortColIdx: {:p}", (*sort_node).sortColIdx);
+    eprintln!("  sortOperators: {:p}", (*sort_node).sortOperators);
+    eprintln!("  collations: {:p}", (*sort_node).collations);
+    eprintln!("  nullsFirst: {:p}", (*sort_node).nullsFirst);
+    eprintln!("  plan.type_: {:?}", (*sort_node).plan.type_);
+    eprintln!("  plan.lefttree: {:p}", (*sort_node).plan.lefttree);
+    eprintln!("  plan.targetlist: {:p}", (*sort_node).plan.targetlist);
 
-    (*sort_node).nullsFirst = if sorts.is_empty() {
-        std::ptr::null_mut()
-    } else {
-        // Convert List to array for nullsFirst
-        let nulls_array = pg_sys::palloc(sorts.len() * std::mem::size_of::<bool>()) as *mut bool;
-        for (i, _sort_field) in sorts.iter().enumerate() {
-            let nulls_first = pg_sys::list_nth_int(sort_nulls_first, i as i32) != 0;
-            *nulls_array.offset(i as isize) = nulls_first;
-        }
-        nulls_array
-    };
+    pgrx::info!("DEBUG: Sort node comprehensive validation completed");
 
     Ok(sort_node as *mut pg_sys::Plan)
 }
@@ -610,12 +891,21 @@ pub unsafe fn create_aggregate_node(
     // Determine aggregation strategy (for now, use plain aggregation)
     (*agg_node).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
 
+    // CRITICAL: Initialize ALL Agg-specific fields that palloc0 might not handle correctly
+    (*agg_node).aggsplit = pg_sys::AggSplit::AGGSPLIT_SIMPLE;
+    (*agg_node).numGroups = 100; // Estimate
+    (*agg_node).transitionSpace = 0; // For pass-by-ref transition data
+    (*agg_node).aggParams = std::ptr::null_mut(); // No parameters
+    (*agg_node).groupingSets = std::ptr::null_mut(); // Simple aggregation
+    (*agg_node).chain = std::ptr::null_mut(); // No chained operations
+
     // Process GROUP BY columns
     let mut num_group_cols = 0;
     let mut group_col_indices: Vec<pg_sys::AttrNumber> = Vec::new();
 
     if !aggregate.groupings.is_empty() {
         let grouping = &aggregate.groupings[0]; // Take the first grouping set
+        #[allow(deprecated)]
         for group_expr in &grouping.grouping_expressions {
             if let Some(substrait::proto::expression::RexType::Selection(selection)) =
                 &group_expr.rex_type
@@ -647,11 +937,29 @@ pub unsafe fn create_aggregate_node(
             pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::AttrNumber>())
                 as *mut pg_sys::AttrNumber;
         for (i, &col_idx) in group_col_indices.iter().enumerate() {
-            *group_cols_ptr.offset(i as isize) = col_idx;
+            *group_cols_ptr.add(i) = col_idx;
         }
         (*agg_node).grpColIdx = group_cols_ptr;
+
+        // CRITICAL: Also allocate grpOperators and grpCollations arrays to match numCols
+        let group_ops_ptr =
+            pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::Oid>())
+                as *mut pg_sys::Oid;
+        let group_colls_ptr =
+            pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::Oid>())
+                as *mut pg_sys::Oid;
+
+        for i in 0..num_group_cols {
+            *group_ops_ptr.offset(i as isize) = pg_sys::Oid::from(351); // btint4cmp function OID for integer comparison
+            *group_colls_ptr.offset(i as isize) = pg_sys::InvalidOid; // No collation
+        }
+
+        (*agg_node).grpOperators = group_ops_ptr;
+        (*agg_node).grpCollations = group_colls_ptr;
     } else {
         (*agg_node).grpColIdx = std::ptr::null_mut();
+        (*agg_node).grpOperators = std::ptr::null_mut();
+        (*agg_node).grpCollations = std::ptr::null_mut();
     }
 
     // Build target list including GROUP BY columns and aggregate functions

@@ -10,45 +10,42 @@ use super::expressions::{
 use super::plan_nodes::*;
 
 /// Build a map of function references to their names from the plan's extensions
-pub fn build_function_extension_map(plan: &Plan) -> HashMap<u32, String> {
-    eprintln!("DEBUG: Starting build_function_extension_map");
+/// This function directly accesses protobuf data without PostgreSQL memory context issues
+pub fn build_function_extension_map(plan: Plan) -> HashMap<u32, String> {
     let mut function_map = HashMap::new();
 
-    // Safely check if extensions exist and can be accessed
-    eprintln!("DEBUG: Checking plan structure");
+    eprintln!(
+        "DEBUG: build_function_extension_map called with {} extensions",
+        plan.extensions.len()
+    );
 
-    // Try to access extensions length in a safer way
-    let extensions_len = plan.extensions.len();
-    eprintln!("DEBUG: Plan has {} extensions", extensions_len);
+    // Direct access to plan extensions - this should be safe as it's just reading protobuf data
+    for (index, extension) in plan.extensions.iter().enumerate() {
+        eprintln!("DEBUG: Processing extension {}", index);
 
-    if extensions_len == 0 {
-        eprintln!("DEBUG: No extensions found in plan, returning empty function map");
-        return function_map;
-    }
-
-    eprintln!("DEBUG: Processing {} extensions", extensions_len);
-    for (i, extension) in plan.extensions.iter().enumerate() {
-        eprintln!("DEBUG: Processing extension {}", i);
-        if let Some(ext_type) = &extension.mapping_type {
-            eprintln!("DEBUG: Extension {} has mapping_type", i);
-            match ext_type {
+        if let Some(mapping_type) = &extension.mapping_type {
+            match mapping_type {
                 substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(func) => {
-                    eprintln!("DEBUG: Found function {} with anchor {}", func.name, func.function_anchor);
+                    eprintln!("DEBUG: Found function '{}' with anchor {}", func.name, func.function_anchor);
                     function_map.insert(func.function_anchor, func.name.clone());
                 }
                 _ => {
-                    eprintln!("DEBUG: Extension {} has non-function mapping type", i);
-                } // Handle other extension types as needed
+                    eprintln!("DEBUG: Extension {} has non-function mapping type", index);
+                }
             }
         } else {
-            eprintln!("DEBUG: Extension {} has no mapping_type", i);
+            eprintln!("DEBUG: Extension {} has no mapping_type", index);
         }
     }
 
     eprintln!(
-        "DEBUG: build_function_extension_map completed with {} functions",
+        "DEBUG: Built function map with {} functions",
         function_map.len()
     );
+    for (anchor, name) in &function_map {
+        eprintln!("DEBUG: Function {}: {}", anchor, name);
+    }
+
     function_map
 }
 
@@ -57,10 +54,26 @@ pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
     relation: &PlanRel,
     _function_map: &HashMap<u32, String>,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context called");
+    pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context called");
+
     if let Some(rel_type) = &relation.rel_type {
+        eprintln!("DEBUG: Found relation rel_type");
+        pgrx::info!("DEBUG: Found relation rel_type");
+
         match rel_type {
             substrait::proto::plan_rel::RelType::Root(root) => {
+                eprintln!("DEBUG: Processing Root relation");
+                pgrx::info!("DEBUG: Processing Root relation");
+
                 if let Some(input) = &root.input {
+                    eprintln!(
+                        "DEBUG: Root has input, calling convert_rel_to_plan_tree_with_context"
+                    );
+                    pgrx::info!(
+                        "DEBUG: Root has input, calling convert_rel_to_plan_tree_with_context"
+                    );
+
                     convert_rel_to_plan_tree_with_context(input, _function_map)
                 } else {
                     Err("Root relation missing input".into())
@@ -80,9 +93,72 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::rel::RelType;
 
-    match &rel.rel_type {
+    eprintln!("DEBUG: convert_rel_to_plan_tree_with_context called");
+    pgrx::info!("DEBUG: convert_rel_to_plan_tree_with_context called");
+
+    // Debug what relation type we're about to process
+    let relation_type_name = match &rel.rel_type {
+        Some(rel_type) => get_relation_type_name(rel_type),
+        None => "None",
+    };
+    eprintln!(
+        "DEBUG: About to process relation type: {}",
+        relation_type_name
+    );
+    pgrx::info!(
+        "DEBUG: About to process relation type: {}",
+        relation_type_name
+    );
+
+    // The common field with emit/output_mapping is on the specific relation types
+    eprintln!("DEBUG: Checking for common/emit fields on specific relation types");
+    pgrx::info!("DEBUG: Checking for common/emit fields on specific relation types");
+
+    let result = match &rel.rel_type {
         Some(RelType::Project(project)) => {
             // Handle projection - create a Result node
+            eprintln!("DEBUG: ✅ Project relation - starts processing");
+            pgrx::info!("DEBUG: ✅ Project relation - starts processing");
+
+            // Check for common field with emit/output_mapping on ProjectRel
+            if let Some(common) = &project.common {
+                eprintln!("DEBUG: Project relation has common field");
+                pgrx::info!("DEBUG: Project relation has common field");
+
+                // Check the emit_kind field structure
+                if let Some(emit_kind) = &common.emit_kind {
+                    match emit_kind {
+                        substrait::proto::rel_common::EmitKind::Emit(emit) => {
+                            eprintln!(
+                                "DEBUG: Project common has emit with {} output mappings",
+                                emit.output_mapping.len()
+                            );
+                            pgrx::info!(
+                                "DEBUG: Project common has emit with {} output mappings",
+                                emit.output_mapping.len()
+                            );
+
+                            for (i, mapping) in emit.output_mapping.iter().enumerate() {
+                                eprintln!("DEBUG: Project output mapping {}: {}", i, mapping);
+                                pgrx::info!("DEBUG: Project output mapping {}: {}", i, mapping);
+                            }
+                        }
+                        substrait::proto::rel_common::EmitKind::Direct(_) => {
+                            eprintln!("DEBUG: Project common has direct emit (no output mapping)");
+                            pgrx::info!(
+                                "DEBUG: Project common has direct emit (no output mapping)"
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!("DEBUG: Project common field has no emit_kind");
+                    pgrx::info!("DEBUG: Project common field has no emit_kind");
+                }
+            } else {
+                eprintln!("DEBUG: Project relation has no common field");
+                pgrx::info!("DEBUG: Project relation has no common field");
+            }
+
             if let Some(input) = &project.input {
                 // Project with input - create Result node with input as left tree
                 let input_plan = convert_rel_to_plan_tree_with_context(input, function_map)?;
@@ -127,20 +203,116 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         }
         Some(RelType::Read(read)) => {
             // Handle table reads
+            eprintln!("DEBUG: ✅ Read relation - starts processing");
+            pgrx::info!("DEBUG: ✅ Read relation - starts processing");
+
+            // Check for common field with emit/output_mapping on ReadRel
+            if let Some(common) = &read.common {
+                eprintln!("DEBUG: Read relation has common field");
+                pgrx::info!("DEBUG: Read relation has common field");
+
+                // Check the emit_kind field structure
+                if let Some(emit_kind) = &common.emit_kind {
+                    match emit_kind {
+                        substrait::proto::rel_common::EmitKind::Emit(emit) => {
+                            eprintln!(
+                                "DEBUG: Read common has emit with {} output mappings",
+                                emit.output_mapping.len()
+                            );
+                            pgrx::info!(
+                                "DEBUG: Read common has emit with {} output mappings",
+                                emit.output_mapping.len()
+                            );
+
+                            for (i, mapping) in emit.output_mapping.iter().enumerate() {
+                                eprintln!("DEBUG: Read output mapping {}: {}", i, mapping);
+                                pgrx::info!("DEBUG: Read output mapping {}: {}", i, mapping);
+                            }
+                        }
+                        substrait::proto::rel_common::EmitKind::Direct(_) => {
+                            eprintln!("DEBUG: Read common has direct emit (no output mapping)");
+                            pgrx::info!("DEBUG: Read common has direct emit (no output mapping)");
+                        }
+                    }
+                } else {
+                    eprintln!("DEBUG: Read common field has no emit_kind");
+                    pgrx::info!("DEBUG: Read common field has no emit_kind");
+                }
+            } else {
+                eprintln!("DEBUG: Read relation has no common field");
+                pgrx::info!("DEBUG: Read relation has no common field");
+            }
+
             if let Some(read_type) = &read.read_type {
-                match read_type {
+                eprintln!("DEBUG: Read relation has read_type");
+                pgrx::info!("DEBUG: Read relation has read_type");
+
+                let read_result = match read_type {
                     substrait::proto::read_rel::ReadType::VirtualTable(_vt) => {
+                        eprintln!("DEBUG: Processing VirtualTable read type");
+                        pgrx::info!("DEBUG: Processing VirtualTable read type");
                         // Virtual table - create a Values scan node
                         create_values_scan_node()
                     }
                     substrait::proto::read_rel::ReadType::NamedTable(nt) => {
+                        eprintln!("DEBUG: Processing NamedTable read type");
+                        pgrx::info!("DEBUG: Processing NamedTable read type");
                         // Named table - create a SeqScan node
                         let table_name = nt.names.join(".");
-                        create_seqscan_node(&table_name)
+                        eprintln!(
+                            "DEBUG: About to create SeqScan node for table: {}",
+                            table_name
+                        );
+                        pgrx::info!(
+                            "DEBUG: About to create SeqScan node for table: {}",
+                            table_name
+                        );
+
+                        let result = create_seqscan_node(&table_name);
+
+                        eprintln!(
+                            "DEBUG: SeqScan node creation completed for table: {}",
+                            table_name
+                        );
+                        pgrx::info!(
+                            "DEBUG: SeqScan node creation completed for table: {}",
+                            table_name
+                        );
+
+                        eprintln!("DEBUG: About to return from NamedTable processing");
+                        pgrx::info!("DEBUG: About to return from NamedTable processing");
+
+                        result
                     }
-                    _ => Err("Unsupported read type".into()),
+                    _ => {
+                        eprintln!("DEBUG: Unsupported read type encountered");
+                        pgrx::info!("DEBUG: Unsupported read type encountered");
+                        Err("Unsupported read type".into())
+                    }
+                };
+
+                eprintln!("DEBUG: Read relation processing completed, about to return result");
+                pgrx::info!("DEBUG: Read relation processing completed, about to return result");
+
+                // Check if the read_result is Ok before returning
+                match &read_result {
+                    Ok(plan_ptr) => {
+                        eprintln!("DEBUG: Read result is Ok, plan pointer: {:p}", plan_ptr);
+                        pgrx::info!("DEBUG: Read result is Ok, plan pointer: {:p}", plan_ptr);
+                    }
+                    Err(e) => {
+                        eprintln!("DEBUG: Read result is Err: {}", e);
+                        pgrx::info!("DEBUG: Read result is Err: {}", e);
+                    }
                 }
+
+                eprintln!("DEBUG: About to return read_result from Read relation");
+                pgrx::info!("DEBUG: About to return read_result from Read relation");
+
+                read_result
             } else {
+                eprintln!("DEBUG: Read relation missing read type");
+                pgrx::info!("DEBUG: Read relation missing read type");
                 Err("Read relation missing read type".into())
             }
         }
@@ -172,9 +344,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     OffsetMode::Offset(constant_offset) => {
                         // Support deprecated constant offset by converting to expression
                         eprintln!("WARNING: Using deprecated constant offset field. Consider migrating to offset_expr.");
-                        Some(unsafe {
-                            super::expressions::create_int8_const(*constant_offset as i64)?
-                        })
+                        Some(unsafe { super::expressions::create_int8_const(*constant_offset)? })
                     }
                 }
             } else {
@@ -190,9 +360,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     CountMode::Count(constant_count) => {
                         // Support deprecated constant count by converting to expression
                         eprintln!("WARNING: Using deprecated constant count field. Consider migrating to count_expr.");
-                        Some(unsafe {
-                            super::expressions::create_int8_const(*constant_count as i64)?
-                        })
+                        Some(unsafe { super::expressions::create_int8_const(*constant_count)? })
                     }
                 }
             } else {
@@ -253,5 +421,22 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             .into())
         }
         None => Err("Relation missing rel_type".into()),
+    };
+
+    eprintln!("DEBUG: About to return from convert_rel_to_plan_tree_with_context");
+    pgrx::info!("DEBUG: About to return from convert_rel_to_plan_tree_with_context");
+
+    // Debug the result before returning
+    match &result {
+        Ok(plan_ptr) => {
+            eprintln!("DEBUG: Function result is Ok, plan pointer: {:p}", plan_ptr);
+            pgrx::info!("DEBUG: Function result is Ok, plan pointer: {:p}", plan_ptr);
+        }
+        Err(e) => {
+            eprintln!("DEBUG: Function result is Err: {}", e);
+            pgrx::info!("DEBUG: Function result is Err: {}", e);
+        }
     }
+
+    result
 }

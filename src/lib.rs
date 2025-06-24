@@ -90,7 +90,16 @@ pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
     match serde_json::from_str::<Plan>(&json_str) {
         Ok(plan) => {
             pgrx::info!("Successfully parsed JSON to Plan");
-            execute_substrait_as_srf(fcinfo, plan)
+
+            // Build function extension map BEFORE entering PostgreSQL memory context
+            // This avoids the segmentation fault when accessing protobuf data
+            let function_map = plan_translator::build_function_extension_map(plan.clone());
+            pgrx::info!(
+                "Built function map with {} functions before PostgreSQL context",
+                function_map.len()
+            );
+
+            execute_substrait_as_srf_with_function_map(fcinfo, plan, function_map)
         }
         Err(e) => {
             pgrx::info!("Failed to parse JSON: {}", e);
@@ -203,6 +212,34 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
     pgrx::info!("Starting execute_substrait_as_srf");
     // Use separate translation and execution
     match translate_substrait_plan(&plan) {
+        Ok((postgres_plan, column_names)) => {
+            match execute_postgres_plan(postgres_plan, column_names) {
+                Ok(result_data) => {
+                    pgrx::info!(
+                        "Successfully got result_data with {} columns",
+                        result_data.columns.len()
+                    );
+                    execute_results_as_srf(fcinfo, result_data)
+                }
+                Err(e) => {
+                    pgrx::error!("Failed to execute PostgreSQL plan: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            pgrx::error!("Failed to translate Substrait plan: {}", e);
+        }
+    }
+}
+
+unsafe fn execute_substrait_as_srf_with_function_map(
+    fcinfo: pg_sys::FunctionCallInfo,
+    plan: Plan,
+    function_map: std::collections::HashMap<u32, String>,
+) -> pg_sys::Datum {
+    pgrx::info!("Starting execute_substrait_as_srf_with_function_map");
+    // Use translation with pre-built function map to avoid memory context issues
+    match plan_translator::translate_substrait_plan_with_function_map(&plan, function_map) {
         Ok((postgres_plan, column_names)) => {
             match execute_postgres_plan(postgres_plan, column_names) {
                 Ok(result_data) => {
@@ -582,7 +619,7 @@ fn get_type_name(type_oid: pg_sys::Oid) -> &'static str {
 mod tests {
     use crate::executor::execute_postgres_plan;
     use crate::generate_as_clause;
-    use crate::plan_translator::translate_substrait_plan;
+    use crate::plan_translator;
     use pgrx::prelude::*;
 
     #[pg_test]
@@ -802,7 +839,7 @@ mod tests {
 
         // Encode Plan to protobuf bytes
         let mut protobuf_bytes = Vec::new();
-        if let Err(_) = plan.encode(&mut protobuf_bytes) {
+        if plan.encode(&mut protobuf_bytes).is_err() {
             // If encoding fails, that's a test setup issue, not a function issue
             assert!(true, "Protobuf encoding failed - this is a test limitation");
             return;
@@ -960,8 +997,23 @@ mod tests {
                 setup_tpch_database_if_needed();
 
                 // Step 2: Execute plan to get schema information
-                pgrx::info!("{} - About to call translate_substrait_plan", $file_name);
-                let as_clause = match translate_substrait_plan(&plan) {
+                pgrx::info!(
+                    "{} - About to call translate_substrait_plan with memory-safe approach",
+                    $file_name
+                );
+
+                // Build function extension map BEFORE entering PostgreSQL memory context to avoid segfault
+                let function_map = plan_translator::build_function_extension_map(plan.clone());
+                pgrx::info!(
+                    "{} - Built function map with {} functions before PostgreSQL context",
+                    $file_name,
+                    function_map.len()
+                );
+
+                let as_clause = match plan_translator::translate_substrait_plan_with_function_map(
+                    &plan,
+                    function_map,
+                ) {
                     Ok((postgres_plan, column_names)) => {
                         match unsafe { execute_postgres_plan(postgres_plan, column_names) } {
                             Ok(result_data) => {
@@ -1184,6 +1236,111 @@ mod tests {
     );
 
     #[pg_test]
+    fn test_simple_table_scan_missing_table() {
+        // Test that we properly handle missing tables instead of crashing
+        let simple_scan_json = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [
+                {
+                    "root": {
+                        "input": {
+                            "read": {
+                                "baseSchema": {
+                                    "names": ["id", "name"],
+                                    "struct": {
+                                        "types": [
+                                            {"i32": {"nullability": "NULLABILITY_NULLABLE"}},
+                                            {"string": {"nullability": "NULLABILITY_NULLABLE"}}
+                                        ]
+                                    }
+                                },
+                                "namedTable": {
+                                    "names": ["nonexistent_table"]
+                                }
+                            }
+                        },
+                        "names": ["id", "name"]
+                    }
+                }
+            ]
+        }"#;
+
+        // This should fail gracefully with a proper error, not crash
+        let escaped_json = simple_scan_json.replace("'", "''");
+        let query = format!(
+            "SELECT * FROM from_substrait_json('{}') AS t(id int, name text)",
+            escaped_json
+        );
+        let result = Spi::get_one::<String>(&query);
+
+        // We expect this to fail, but it should be a controlled failure, not a crash
+        match result {
+            Ok(_) => panic!("Expected failure for missing table, but got success"),
+            Err(e) => {
+                // Should get a proper error about missing table
+                let error_msg = format!("{:?}", e);
+                assert!(
+                    error_msg.contains("not found") || error_msg.contains("does not exist"),
+                    "Expected error about missing table, got: {}",
+                    error_msg
+                );
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_simple_table_scan_existing_table() {
+        // First create a simple test table
+        Spi::run("CREATE TABLE IF NOT EXISTS test_simple_table (id int, name text)").unwrap();
+        Spi::run("INSERT INTO test_simple_table VALUES (1, 'test'), (2, 'data')").unwrap();
+
+        let simple_scan_json = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [
+                {
+                    "root": {
+                        "input": {
+                            "read": {
+                                "baseSchema": {
+                                    "names": ["id", "name"],
+                                    "struct": {
+                                        "types": [
+                                            {"i32": {"nullability": "NULLABILITY_NULLABLE"}},
+                                            {"string": {"nullability": "NULLABILITY_NULLABLE"}}
+                                        ]
+                                    }
+                                },
+                                "namedTable": {
+                                    "names": ["test_simple_table"]
+                                }
+                            }
+                        },
+                        "names": ["id", "name"]
+                    }
+                }
+            ]
+        }"#;
+
+        // This should work and return data
+        let escaped_json = simple_scan_json.replace("'", "''");
+        let query = format!("SELECT string_agg(id::text, ',') FROM from_substrait_json('{}') AS t(id int, name text)", escaped_json);
+        let result = Spi::get_one::<String>(&query);
+
+        match result {
+            Ok(Some(data)) => {
+                // Should get some result with our test data
+                assert!(
+                    data.contains("1") || data.contains("2"),
+                    "Expected test data, got: {}",
+                    data
+                );
+            }
+            Ok(None) => panic!("Expected data from table scan, got NULL"),
+            Err(e) => panic!("Expected successful table scan, got error: {:?}", e),
+        }
+    }
+
+    #[pg_test]
     fn test_valid_as_clause_works() {
         // Test that a valid AS clause works
         let json_plan = r#"{
@@ -1267,7 +1424,7 @@ mod tests {
             .arg(&database) // Pass the actual test database name
             .env("DATABASE_URL", &db_url)
             .env("PGHOST", &host)
-            .env("PGPORT", &port.to_string())
+            .env("PGPORT", port.to_string())
             .env("PGDATABASE", &database)
             .env("PGUSER", &user)
             .output()

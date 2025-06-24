@@ -136,7 +136,7 @@ pub unsafe fn convert_selection_to_postgres(
                 if let Some(struct_field) = &direct_ref.reference_type {
                     match struct_field {
                         substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
-                            create_var_node(field.field as i32 + 1) // 1-based indexing
+                            create_var_node(field.field + 1) // 1-based indexing
                         }
                         _ => Err("Unsupported reference type in selection".into()),
                     }
@@ -333,7 +333,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
     match function_name {
         "lte:date_date" => {
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                let left_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -431,7 +431,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "equal:any_any" => {
             // Handle equality comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                let left_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -484,7 +484,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "multiply:fp64_fp64" => {
             // Handle floating point multiplication
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                let left_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -543,7 +543,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "subtract:fp64_fp64" => {
             // Handle floating point subtraction
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                let left_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -602,7 +602,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "add:fp64_fp64" => {
             // Handle floating point addition
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                let left_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -659,7 +659,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "like:str_str" => {
             // Handle string LIKE pattern matching function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.get(0) {
+                let left_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
