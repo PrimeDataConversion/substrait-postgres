@@ -1,6 +1,5 @@
 use anyhow::Result;
 use pgrx::pg_sys;
-use std::collections::HashMap;
 use substrait::proto::Plan;
 
 use super::relations::{

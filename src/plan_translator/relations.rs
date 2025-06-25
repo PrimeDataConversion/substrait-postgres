@@ -1,13 +1,13 @@
-use anyhow::Result;
-use pgrx::pg_sys;
-use std::collections::HashMap;
-use substrait::proto::{Plan, PlanRel, Rel};
-
 use super::constants::get_relation_type_name;
 use super::expressions::{
     convert_expression_to_postgres_with_context, convert_expressions_to_target_list_with_context,
 };
 use super::plan_nodes::*;
+use crate::plan_translator::aggregate::create_aggregate_node;
+use anyhow::Result;
+use pgrx::pg_sys;
+use std::collections::HashMap;
+use substrait::proto::{Plan, PlanRel, Rel};
 
 /// Build a map of function references to their names from the plan's extensions
 /// This function directly accesses protobuf data without PostgreSQL memory context issues
@@ -191,14 +191,14 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 
                 Ok(result_node as *mut pg_sys::Plan)
             } else {
-                // Project with no input (literal projections) - create Values scan node
+                // Project with no input (literal projections) - create Result node
                 let target_list = convert_expressions_to_target_list_with_context(
                     &project.expressions,
                     function_map,
                 )?;
 
-                // Create a ValuesScan plan node for literal projections
-                create_values_scan_with_target_list(target_list)
+                // Create a Result plan node for literal projections (matches PostgreSQL behavior)
+                create_result_node_with_target_list(target_list)
             }
         }
         Some(RelType::Read(read)) => {

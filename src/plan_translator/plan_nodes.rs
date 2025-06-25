@@ -1,6 +1,5 @@
 use anyhow::Result;
 use pgrx::pg_sys;
-use std::collections::HashMap;
 
 use super::expressions::create_cstring;
 
@@ -25,6 +24,32 @@ pub unsafe fn create_values_scan_node(
     (*result_node).plan.plan_node_id = 0;
     (*result_node).plan.qual = std::ptr::null_mut();
     (*result_node).plan.targetlist = std::ptr::null_mut();
+
+    Ok(result_node as *mut pg_sys::Plan)
+}
+
+/// Create a Result node with target list for literal projections
+/// This matches PostgreSQL's behavior for simple constant expressions
+pub unsafe fn create_result_node_with_target_list(
+    target_list: *mut pg_sys::List,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
+    (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
+    (*result_node).plan.lefttree = std::ptr::null_mut();
+    (*result_node).plan.righttree = std::ptr::null_mut();
+    (*result_node).plan.initPlan = std::ptr::null_mut();
+    (*result_node).plan.extParam = std::ptr::null_mut();
+    (*result_node).plan.allParam = std::ptr::null_mut();
+    (*result_node).plan.startup_cost = 0.0;
+    (*result_node).plan.total_cost = 1.0;
+    (*result_node).plan.plan_rows = 1.0;
+    (*result_node).plan.plan_width = 32;
+    (*result_node).plan.parallel_aware = false;
+    (*result_node).plan.parallel_safe = true;
+    (*result_node).plan.async_capable = false;
+    (*result_node).plan.plan_node_id = 0;
+    (*result_node).plan.qual = std::ptr::null_mut();
+    (*result_node).plan.targetlist = target_list;
 
     Ok(result_node as *mut pg_sys::Plan)
 }
@@ -917,218 +942,6 @@ unsafe fn create_combined_target_list(
     }
 
     Ok(combined_list)
-}
-
-/// Create a PostgreSQL Agg plan node for aggregate operations with GROUP BY
-pub unsafe fn create_aggregate_node(
-    input_plan: *mut pg_sys::Plan,
-    aggregate: &substrait::proto::AggregateRel,
-    function_map: &HashMap<u32, String>,
-) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // Create an Agg plan node
-    let agg_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Agg>()) as *mut pg_sys::Agg;
-    (*agg_node).plan.type_ = pg_sys::NodeTag::T_Agg;
-    (*agg_node).plan.lefttree = input_plan;
-    (*agg_node).plan.righttree = std::ptr::null_mut();
-    (*agg_node).plan.initPlan = std::ptr::null_mut();
-    (*agg_node).plan.extParam = std::ptr::null_mut();
-    (*agg_node).plan.allParam = std::ptr::null_mut();
-    (*agg_node).plan.startup_cost = 0.0;
-    (*agg_node).plan.total_cost = 1000.0;
-    (*agg_node).plan.plan_rows = 100.0;
-    (*agg_node).plan.plan_width = 32;
-    (*agg_node).plan.parallel_aware = false;
-    (*agg_node).plan.parallel_safe = true;
-    (*agg_node).plan.async_capable = false;
-    (*agg_node).plan.plan_node_id = 0;
-    (*agg_node).plan.qual = std::ptr::null_mut();
-
-    // Determine aggregation strategy (for now, use plain aggregation)
-    (*agg_node).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
-
-    // CRITICAL: Initialize ALL Agg-specific fields that palloc0 might not handle correctly
-    (*agg_node).aggsplit = pg_sys::AggSplit::AGGSPLIT_SIMPLE;
-    (*agg_node).numGroups = 100; // Estimate
-    (*agg_node).transitionSpace = 0; // For pass-by-ref transition data
-    (*agg_node).aggParams = std::ptr::null_mut(); // No parameters
-    (*agg_node).groupingSets = std::ptr::null_mut(); // Simple aggregation
-    (*agg_node).chain = std::ptr::null_mut(); // No chained operations
-
-    // Process GROUP BY columns
-    let mut num_group_cols = 0;
-    let mut group_col_indices: Vec<pg_sys::AttrNumber> = Vec::new();
-
-    if !aggregate.groupings.is_empty() {
-        let grouping = &aggregate.groupings[0]; // Take the first grouping set
-        #[allow(deprecated)]
-        for group_expr in &grouping.grouping_expressions {
-            if let Some(substrait::proto::expression::RexType::Selection(selection)) =
-                &group_expr.rex_type
-            {
-                if let Some(
-                    substrait::proto::expression::field_reference::ReferenceType::DirectReference(
-                        direct_ref,
-                    ),
-                ) = &selection.reference_type
-                {
-                    if let Some(
-                        substrait::proto::expression::reference_segment::ReferenceType::StructField(
-                            field,
-                        ),
-                    ) = &direct_ref.reference_type
-                    {
-                        group_col_indices.push((field.field + 1) as pg_sys::AttrNumber); // 1-based indexing
-                        num_group_cols += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    (*agg_node).numCols = num_group_cols;
-    if num_group_cols > 0 {
-        // Allocate memory for group column indices
-        let group_cols_ptr =
-            pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::AttrNumber>())
-                as *mut pg_sys::AttrNumber;
-        for (i, &col_idx) in group_col_indices.iter().enumerate() {
-            *group_cols_ptr.add(i) = col_idx;
-        }
-        (*agg_node).grpColIdx = group_cols_ptr;
-
-        // CRITICAL: Also allocate grpOperators and grpCollations arrays to match numCols
-        let group_ops_ptr =
-            pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::Oid>())
-                as *mut pg_sys::Oid;
-        let group_colls_ptr =
-            pg_sys::palloc(num_group_cols as usize * std::mem::size_of::<pg_sys::Oid>())
-                as *mut pg_sys::Oid;
-
-        for i in 0..num_group_cols {
-            *group_ops_ptr.offset(i as isize) = pg_sys::Oid::from(351); // btint4cmp function OID for integer comparison
-            *group_colls_ptr.offset(i as isize) = pg_sys::InvalidOid; // No collation
-        }
-
-        (*agg_node).grpOperators = group_ops_ptr;
-        (*agg_node).grpCollations = group_colls_ptr;
-    } else {
-        (*agg_node).grpColIdx = std::ptr::null_mut();
-        (*agg_node).grpOperators = std::ptr::null_mut();
-        (*agg_node).grpCollations = std::ptr::null_mut();
-    }
-
-    // Build target list including GROUP BY columns and aggregate functions
-    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
-    let mut resno = 1;
-
-    // Add GROUP BY columns to target list
-    for &group_col in &group_col_indices {
-        let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
-        (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
-        (*var_node).varno = 1; // Input relation number
-        (*var_node).varattno = group_col;
-        (*var_node).vartype = pg_sys::UNKNOWNOID; // Will be resolved during planning
-        (*var_node).vartypmod = -1;
-        (*var_node).varcollid = pg_sys::InvalidOid;
-        (*var_node).varlevelsup = 0;
-
-        let target_entry =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
-        (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-        (*target_entry).expr = var_node as *mut pg_sys::Expr;
-        (*target_entry).resno = resno;
-        (*target_entry).resname = create_cstring(&format!("group_col_{}", resno));
-        (*target_entry).resjunk = false;
-
-        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
-        resno += 1;
-    }
-
-    // Add aggregate functions to target list
-    for measure in &aggregate.measures {
-        if let Some(agg_func) = &measure.measure {
-            // Create an Aggref node for the aggregate function
-            let aggref_node =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::Aggref>()) as *mut pg_sys::Aggref;
-            (*aggref_node).xpr.type_ = pg_sys::NodeTag::T_Aggref;
-
-            // Map function reference to PostgreSQL aggregate function OID using function_map
-            let function_name = function_map
-                .get(&agg_func.function_reference)
-                .map(|s| s.as_str())
-                .unwrap_or("unknown");
-
-            let agg_func_oid = match function_name {
-                "sum:fp64" => pg_sys::Oid::from(2108), // SUM function for float8
-                "avg:fp64" => pg_sys::Oid::from(2100), // AVG function for float8
-                "count:" => pg_sys::Oid::from(2803),   // COUNT(*) function
-                _ => {
-                    eprintln!(
-                        "DEBUG: Unknown aggregate function: {} (ref={})",
-                        function_name, agg_func.function_reference
-                    );
-                    pg_sys::Oid::from(2803) // Default to COUNT(*)
-                }
-            };
-
-            (*aggref_node).aggfnoid = agg_func_oid;
-            (*aggref_node).aggtype = pg_sys::UNKNOWNOID; // Will be resolved
-            (*aggref_node).aggcollid = pg_sys::InvalidOid;
-            (*aggref_node).inputcollid = pg_sys::InvalidOid;
-            (*aggref_node).aggdirectargs = std::ptr::null_mut();
-            (*aggref_node).aggdistinct = std::ptr::null_mut();
-            (*aggref_node).aggfilter = std::ptr::null_mut();
-            (*aggref_node).aggstar = agg_func.arguments.is_empty(); // COUNT(*) if no arguments
-            (*aggref_node).aggvariadic = false;
-            (*aggref_node).aggkind = 'n' as i8; // Normal aggregate
-            (*aggref_node).agglevelsup = 0;
-            (*aggref_node).aggsplit = pg_sys::AggSplit::AGGSPLIT_SIMPLE;
-
-            // Process aggregate function arguments
-            let mut agg_args: *mut pg_sys::List = std::ptr::null_mut();
-            for arg in &agg_func.arguments {
-                if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
-                    &arg.arg_type
-                {
-                    if let Some(substrait::proto::expression::RexType::Selection(selection)) =
-                        &expr.rex_type
-                    {
-                        if let Some(substrait::proto::expression::field_reference::ReferenceType::DirectReference(direct_ref)) = &selection.reference_type {
-                            if let Some(substrait::proto::expression::reference_segment::ReferenceType::StructField(field)) = &direct_ref.reference_type {
-                                let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
-                                (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
-                                (*var_node).varno = 1;
-                                (*var_node).varattno = (field.field + 1) as pg_sys::AttrNumber;
-                                (*var_node).vartype = pg_sys::UNKNOWNOID;
-                                (*var_node).vartypmod = -1;
-                                (*var_node).varcollid = pg_sys::InvalidOid;
-                                (*var_node).varlevelsup = 0;
-
-                                agg_args = pg_sys::lappend(agg_args, var_node as *mut std::ffi::c_void);
-                            }
-                        }
-                    }
-                }
-            }
-            (*aggref_node).args = agg_args;
-
-            // Create target entry for the aggregate function
-            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
-            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-            (*target_entry).expr = aggref_node as *mut pg_sys::Expr;
-            (*target_entry).resno = resno;
-            (*target_entry).resname = create_cstring(&format!("agg_func_{}", resno));
-            (*target_entry).resjunk = false;
-
-            target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
-            resno += 1;
-        }
-    }
-
-    (*agg_node).plan.targetlist = target_list;
-
-    Ok(agg_node as *mut pg_sys::Plan)
 }
 
 /// Create a range table entry from a table OID

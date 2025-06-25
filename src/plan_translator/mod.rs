@@ -1,4 +1,5 @@
 // Module declarations for the plan translator components
+mod aggregate;
 pub mod constants;
 pub mod expressions;
 pub mod plan_nodes;

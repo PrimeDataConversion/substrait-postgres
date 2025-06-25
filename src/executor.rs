@@ -81,7 +81,7 @@ pub unsafe fn execute_plan_directly(
     }
 
     // Execute the plan and collect tuples into tuplestore with error handling
-    let mut tuple_count = 0;
+    let mut tuple_count = 0u64;
     loop {
         // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
         let slot = pg_sys::ExecProcNode(plan_state);
@@ -153,7 +153,7 @@ pub unsafe fn execute_postgres_plan(
     let mut nulls = Vec::new();
 
     // Set up tuplestore for reading
-    let slot = pg_sys::MakeTupleTableSlot(tupdesc, &pg_sys::TTSOpsHeapTuple);
+    let slot = pg_sys::MakeTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
     pg_sys::tuplestore_rescan(tuplestore);
 
     while pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
@@ -235,6 +235,107 @@ unsafe fn collect_seqscan_nodes_for_range_table(
     }
 
     Ok(())
+}
+
+/// Execute PostgreSQL plan as SRF directly without unpacking/repacking
+/// This function directly interfaces with PostgreSQL's SRF mechanism
+pub unsafe fn execute_postgres_plan_as_srf(
+    fcinfo: pg_sys::FunctionCallInfo,
+    plan_tree: *mut pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *mut pg_sys::List,
+) -> pg_sys::Datum {
+    eprintln!("DEBUG: execute_postgres_plan_as_srf ENTRY");
+    let func_ctx = pg_sys::init_MultiFuncCall(fcinfo);
+    eprintln!("DEBUG: init_MultiFuncCall completed");
+
+    if (*func_ctx).call_cntr == 0 {
+        // First call - set up the SRF
+        let memory_ctx = (*func_ctx).multi_call_memory_ctx;
+        let old_ctx = pg_sys::MemoryContextSwitchTo(memory_ctx);
+
+        // Get the expected tuple descriptor from the AS clause
+        let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
+        let expected_tupdesc = if !result_info.is_null() && !(*result_info).expectedDesc.is_null() {
+            let tupdesc = (*result_info).expectedDesc;
+
+            // Debug the AS clause descriptor
+            eprintln!(
+                "DEBUG: AS clause descriptor has {} attributes",
+                (*tupdesc).natts
+            );
+            for i in 0..(*tupdesc).natts {
+                let attr = (*tupdesc).attrs.as_ptr().add(i as usize);
+                eprintln!(
+                    "DEBUG: AS attr {}: typid={}, typmod={}, name={:?}",
+                    i,
+                    (*attr).atttypid.to_u32(),
+                    (*attr).atttypmod,
+                    std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy()
+                );
+            }
+
+            tupdesc
+        } else {
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            pgrx::error!("SETOF RECORD function requires AS clause to specify return columns");
+        };
+
+        // Execute the plan and get tuplestore
+        let (_, tuplestore) = execute_plan_directly(&*plan_tree, column_names, range_table)
+            .unwrap_or_else(|e| {
+                pg_sys::MemoryContextSwitchTo(old_ctx);
+                pgrx::error!("Plan execution failed: {}", e);
+            });
+
+        // Use the expected tuple descriptor from the AS clause
+        let blessed_tupdesc = pg_sys::BlessTupleDesc(expected_tupdesc);
+        (*func_ctx).tuple_desc = blessed_tupdesc;
+
+        // Store tuplestore in function context
+        (*func_ctx).user_fctx = tuplestore as *mut std::ffi::c_void;
+
+        // Create tuple slot for reading from tuplestore - use minimal tuple ops since tuplestore uses minimal tuples
+        let slot = pg_sys::MakeTupleTableSlot(blessed_tupdesc, &pg_sys::TTSOpsMinimalTuple);
+
+        // Store slot pointer in attinmeta field (reusing this field)
+        (*func_ctx).attinmeta = slot as *mut pg_sys::AttInMetadata;
+
+        // Reset tuplestore for reading
+        pg_sys::tuplestore_rescan(tuplestore);
+
+        pg_sys::MemoryContextSwitchTo(old_ctx);
+    }
+
+    // Get tuplestore and slot from context
+    let tuplestore = (*func_ctx).user_fctx as *mut pg_sys::Tuplestorestate;
+    let slot = (*func_ctx).attinmeta as *mut pg_sys::TupleTableSlot;
+
+    // Try to get next tuple from tuplestore
+    if pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
+        // Convert slot to minimal tuple and then to datum
+        let mut should_free = false;
+        let minimal_tuple = pg_sys::ExecFetchSlotMinimalTuple(slot, &mut should_free);
+        let result = pg_sys::Datum::from(minimal_tuple as usize);
+        (*func_ctx).call_cntr += 1;
+        result
+    } else {
+        // No more tuples - cleanup and finish
+        if !tuplestore.is_null() {
+            pg_sys::tuplestore_end(tuplestore);
+        }
+        if !slot.is_null() {
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+        }
+
+        // Signal end of SRF
+        let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
+        if !result_info.is_null() {
+            (*result_info).isDone = pg_sys::ExprDoneCond::ExprEndResult;
+        }
+        pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
+        pg_sys::Datum::null()
+    }
 }
 
 /// Create a range table entry from a table OID
