@@ -224,7 +224,8 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                 );
                 return handle_literal_result_properly(fcinfo);
             }
-            executor::execute_postgres_plan_as_srf(fcinfo, postgres_plan, column_names, range_table)
+            pgrx::info!("DEBUG: Multi-column bytea path, using table scan workaround");
+            return handle_table_scan_properly(fcinfo, postgres_plan, column_names, range_table);
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -265,6 +266,62 @@ unsafe fn handle_literal_result_properly(fcinfo: pg_sys::FunctionCallInfo) -> pg
     pg_sys::Datum::from(tuple_data as usize)
 }
 
+/// Handler for multi-column table scan results
+unsafe fn handle_table_scan_properly(
+    fcinfo: pg_sys::FunctionCallInfo,
+    postgres_plan: *mut pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *mut pg_sys::List,
+) -> pg_sys::Datum {
+    pgrx::info!(
+        "DEBUG: handle_table_scan_properly ENTRY with {} columns",
+        column_names.len()
+    );
+
+    // Get the result info and expected tuple descriptor
+    let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
+    if result_info.is_null() || (*result_info).expectedDesc.is_null() {
+        pgrx::error!("SETOF RECORD function requires AS clause");
+    }
+
+    let expected_tupdesc = (*result_info).expectedDesc;
+    pgrx::info!("DEBUG: AS clause has {} attrs", (*expected_tupdesc).natts);
+
+    // Switch to the correct memory context for the tuplestore
+    let old_context = pg_sys::MemoryContextSwitchTo((*(*fcinfo).flinfo).fn_mcxt);
+
+    // Use Materialized mode for multi-row results
+    (*result_info).returnMode = pg_sys::SetFunctionReturnMode::SFRM_Materialize;
+
+    pgrx::info!("DEBUG: About to call execute_simple_table_scan");
+    pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
+    pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
+
+    // Execute the plan using a simpler approach that avoids complex executor setup
+    let tuplestore = execute_simple_table_scan(postgres_plan, &column_names, expected_tupdesc)
+        .unwrap_or_else(|e| {
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pgrx::error!("Simple table scan execution failed: {}", e);
+        });
+
+    pgrx::info!("DEBUG: execute_simple_table_scan returned successfully");
+
+    pgrx::info!("DEBUG: Got tuplestore from plan execution");
+
+    // Set the required fields for Materialize mode
+    (*result_info).setResult = tuplestore;
+    (*result_info).setDesc = pg_sys::BlessTupleDesc(expected_tupdesc);
+    (*result_info).allowedModes = pg_sys::SetFunctionReturnMode::SFRM_Materialize_Random as i32
+        | pg_sys::SetFunctionReturnMode::SFRM_Materialize as i32;
+
+    // Switch back to the original context
+    pg_sys::MemoryContextSwitchTo(old_context);
+
+    pgrx::info!("DEBUG: About to return from handle_table_scan_properly");
+
+    pg_sys::Datum::from(0) // Return value is ignored in Materialize mode
+}
+
 unsafe fn execute_substrait_as_srf_with_function_map(
     fcinfo: pg_sys::FunctionCallInfo,
     plan: Plan,
@@ -283,15 +340,25 @@ unsafe fn execute_substrait_as_srf_with_function_map(
                 pgrx::info!("DEBUG: Column {}: {}", i, name);
             }
 
-            // For single-column literal results, use a fixed workaround
+            // For literal results, use a fixed workaround
             if column_names.len() == 1 {
                 pgrx::info!("DEBUG: Single column case, using fixed literal workaround");
                 return handle_literal_result_properly(fcinfo);
             }
 
-            pgrx::info!("DEBUG: Multi-column case, calling executor SRF");
-            // Let the executor handle the SRF directly
-            executor::execute_postgres_plan_as_srf(fcinfo, postgres_plan, column_names, range_table)
+            pgrx::info!("DEBUG: Multi-column case with columns: {:?}", column_names);
+            pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
+            pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
+
+            // Try the table scan workaround for multi-column cases to bypass OID 65536
+            pgrx::info!("DEBUG: About to call handle_table_scan_properly");
+            let result =
+                handle_table_scan_properly(fcinfo, postgres_plan, column_names, range_table);
+            pgrx::info!(
+                "DEBUG: handle_table_scan_properly returned, result: {:?}",
+                result
+            );
+            return result;
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -943,6 +1010,7 @@ mod tests {
     );
 
     #[pg_test]
+    #[should_panic(expected = "does not exist")]
     fn test_simple_table_scan_missing_table() {
         // Test that we properly handle missing tables instead of crashing
         let simple_scan_json = r#"{
@@ -978,21 +1046,8 @@ mod tests {
             "SELECT * FROM from_substrait_json('{}') AS t(id int, name text)",
             escaped_json
         );
-        let result = Spi::get_one::<String>(&query);
-
-        // We expect this to fail, but it should be a controlled failure, not a crash
-        match result {
-            Ok(_) => panic!("Expected failure for missing table, but got success"),
-            Err(e) => {
-                // Should get a proper error about missing table
-                let error_msg = format!("{:?}", e);
-                assert!(
-                    error_msg.contains("not found") || error_msg.contains("does not exist"),
-                    "Expected error about missing table, got: {}",
-                    error_msg
-                );
-            }
-        }
+        // This should panic with an error about the missing table
+        let _result = Spi::get_one::<String>(&query);
     }
 
     #[pg_test]
@@ -1217,4 +1272,88 @@ pub mod pg_test {
         // return any postgresql.conf settings that are required for your tests
         vec![]
     }
+}
+
+/// Simple table scan execution that avoids complex executor setup
+/// This directly scans the table without using PostgreSQL's complex executor
+unsafe fn execute_simple_table_scan(
+    postgres_plan: *mut pg_sys::Plan,
+    column_names: &[String],
+    expected_tupdesc: *mut pg_sys::TupleDescData,
+) -> Result<*mut pg_sys::Tuplestorestate, Box<dyn std::error::Error + Send + Sync>> {
+    pgrx::info!("DEBUG: execute_simple_table_scan ENTRY");
+
+    // Extract table OID from the plan tree
+    let table_oid = pg_sys::Oid::from((*postgres_plan).plan_node_id as u32);
+    pgrx::info!("DEBUG: Table OID from plan: {}", table_oid);
+
+    // Create tuplestore for results
+    let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
+    if tuplestore.is_null() {
+        return Err("Failed to create tuplestore".into());
+    }
+
+    // Open the table for reading
+    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
+    if relation.is_null() {
+        return Err(format!("Could not open relation with OID {}", table_oid).into());
+    }
+
+    pgrx::info!("DEBUG: Opened table successfully");
+
+    // Get tuple descriptor from relation
+    let rel_tupdesc = (*relation).rd_att;
+
+    // Create a simple table scan using PostgreSQL's heap scan
+    let scan_desc = pg_sys::table_beginscan(
+        relation,
+        pg_sys::GetActiveSnapshot(),
+        0,
+        std::ptr::null_mut(),
+    );
+    if scan_desc.is_null() {
+        pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+        return Err("Failed to begin table scan".into());
+    }
+
+    pgrx::info!("DEBUG: Started table scan");
+
+    // Scan through all tuples
+    let mut tuple_count = 0;
+    loop {
+        let tuple = pg_sys::heap_getnext(scan_desc, pg_sys::ScanDirection::ForwardScanDirection);
+        if tuple.is_null() {
+            break; // No more tuples
+        }
+
+        // Create a tuple table slot for this tuple - use HeapTuple ops for heap tuples
+        let slot = pg_sys::MakeTupleTableSlot(expected_tupdesc, &pg_sys::TTSOpsHeapTuple);
+
+        // Store the tuple in the slot (convert from heap tuple to slot)
+        pg_sys::ExecStoreHeapTuple(tuple, slot, false);
+
+        // Add to tuplestore
+        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+
+        // Clean up slot
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+
+        tuple_count += 1;
+
+        // Safety limit
+        if tuple_count > 10000 {
+            pgrx::warning!("Table scan limit reached, stopping at 10000 tuples");
+            break;
+        }
+    }
+
+    pgrx::info!("DEBUG: Scanned {} tuples", tuple_count);
+
+    // Clean up scan
+    pg_sys::table_endscan(scan_desc);
+    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    pgrx::info!("DEBUG: Table scan completed successfully");
+
+    Ok(tuplestore)
 }

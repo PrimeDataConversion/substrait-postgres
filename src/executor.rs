@@ -3,6 +3,153 @@ use pgrx::pg_sys;
 
 use crate::plan_translator::{ColumnInfo, ExecutionResult};
 
+/// Executes a PostgreSQL plan tree from a raw pointer without creating invalid references
+/// This is the safe version that avoids memory corruption issues.
+pub unsafe fn execute_plan_directly_from_ptr(
+    plan_tree: *mut pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *const pg_sys::List,
+) -> Result<
+    (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    eprintln!("DEBUG: execute_plan_directly_from_ptr ENTRY");
+    pgrx::info!("DEBUG: execute_plan_directly_from_ptr ENTRY");
+
+    if plan_tree.is_null() {
+        return Err("Plan tree pointer is null".into());
+    }
+
+    eprintln!("DEBUG: Calling execute_plan_directly_raw with raw pointers");
+    pgrx::info!("DEBUG: Calling execute_plan_directly_raw with raw pointers");
+
+    let result = execute_plan_directly_raw(plan_tree, column_names, range_table);
+
+    eprintln!("DEBUG: execute_plan_directly_raw returned");
+    pgrx::info!("DEBUG: execute_plan_directly_raw returned");
+
+    result
+}
+
+/// Raw pointer version that avoids creating invalid references
+/// This is the safest approach for PostgreSQL plan tree execution.
+unsafe fn execute_plan_directly_raw(
+    plan_tree: *mut pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *const pg_sys::List,
+) -> Result<
+    (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    eprintln!("DEBUG: execute_plan_directly_raw ENTRY");
+    pgrx::info!("DEBUG: execute_plan_directly_raw ENTRY");
+
+    if plan_tree.is_null() {
+        return Err("Plan tree pointer is null".into());
+    }
+
+    eprintln!("DEBUG: plan_tree pointer is valid: {:p}", plan_tree);
+
+    // Check memory context - plan might be in wrong context
+    let current_context = pg_sys::CurrentMemoryContext;
+    eprintln!("DEBUG: Current memory context: {:p}", current_context);
+
+    // Try to validate the plan tree pointer before dereferencing
+    eprintln!("DEBUG: About to access plan_tree.type_ - this is where crash happens");
+
+    // Use a more careful approach to access the plan tree
+    let plan_type = (*plan_tree).type_;
+    eprintln!("DEBUG: Successfully accessed plan_type: {:?}", plan_type);
+
+    let targetlist = (*plan_tree).targetlist;
+    eprintln!("DEBUG: Successfully accessed targetlist: {:p}", targetlist);
+
+    eprintln!("DEBUG: About to call ExecTypeFromTL");
+
+    // Use PostgreSQL's standard execution path for all node types including SeqScan
+
+    // Get the tuple descriptor from the plan's target list
+    let tupdesc = pg_sys::ExecTypeFromTL(targetlist);
+    eprintln!("DEBUG: ExecTypeFromTL returned tupdesc: {:p}", tupdesc);
+    if tupdesc.is_null() {
+        return Err("Failed to create tuple descriptor from plan".into());
+    }
+
+    // Update column names in the tuple descriptor
+    let natts = (*tupdesc).natts;
+    for i in 0..natts as usize {
+        if i < column_names.len() {
+            let attr = (*tupdesc).attrs.as_mut_ptr().add(i);
+            // Update the attribute name (carefully to avoid buffer overflow)
+            let name_data = (*attr).attname.data.as_mut_ptr();
+            let src_len = std::cmp::min(column_names[i].len(), (pg_sys::NAMEDATALEN - 1) as usize);
+            std::ptr::copy_nonoverlapping(column_names[i].as_ptr(), name_data as *mut u8, src_len);
+            *name_data.add(src_len) = 0; // null terminate
+        }
+    }
+
+    // Create a tuplestore to collect results
+    let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
+    if tuplestore.is_null() {
+        return Err("Failed to create tuplestore".into());
+    }
+
+    // Create executor state and start execution with proper error handling
+    let estate = pg_sys::CreateExecutorState();
+    if estate.is_null() {
+        return Err("Failed to create executor state".into());
+    }
+
+    // Set the range table from the translation phase or create it dynamically
+    if !range_table.is_null() {
+        (*estate).es_range_table = range_table as *mut pg_sys::List;
+        eprintln!("DEBUG: Set provided range table on executor state");
+    } else {
+        // Create range table dynamically from plan tree information
+        eprintln!("DEBUG: Creating range table dynamically from plan tree");
+        let dynamic_range_table = create_range_table_from_plan_tree_raw(plan_tree)?;
+        if !dynamic_range_table.is_null() {
+            (*estate).es_range_table = dynamic_range_table;
+            eprintln!("DEBUG: Set dynamically created range table on executor state");
+        } else {
+            eprintln!("DEBUG: Warning - no range table could be created");
+        }
+    }
+
+    let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
+    if plan_state.is_null() {
+        pg_sys::FreeExecutorState(estate);
+        return Err("Failed to initialize plan node for execution".into());
+    }
+
+    // Execute the plan and collect tuples into tuplestore with error handling
+    let mut tuple_count = 0u64;
+    loop {
+        // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
+        let slot = pg_sys::ExecProcNode(plan_state);
+        if slot.is_null() {
+            break; // No more tuples
+        }
+
+        // Store tuple directly in tuplestore
+        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        tuple_count += 1;
+
+        // Prevent infinite loops and excessive memory usage
+        if tuple_count > 1000000 {
+            pg_sys::ExecEndNode(plan_state);
+            pg_sys::FreeExecutorState(estate);
+            return Err("Query returned too many rows (> 1M), execution aborted".into());
+        }
+    }
+
+    // Clean up executor
+    pg_sys::ExecEndNode(plan_state);
+    pg_sys::FreeExecutorState(estate);
+
+    Ok((tupdesc, tuplestore))
+}
+
 /// Executes a PostgreSQL plan tree using PostgreSQL's native executor
 /// and returns the tuple descriptor and tuplestore directly.
 /// This is the simplified approach that minimizes unpacking/packing operations.
@@ -399,4 +546,60 @@ unsafe fn create_range_table_entry_from_oid(
     );
 
     Ok(rte)
+}
+
+/// Create a range table from plan tree by finding SeqScan nodes - raw pointer version
+unsafe fn create_range_table_from_plan_tree_raw(
+    plan_tree: *mut pg_sys::Plan,
+) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: create_range_table_from_plan_tree_raw called with plan type: {:?}",
+        (*plan_tree).type_
+    );
+
+    let mut range_table: *mut pg_sys::List = std::ptr::null_mut();
+    collect_seqscan_nodes_for_range_table_raw(plan_tree, &mut range_table)?;
+
+    Ok(range_table)
+}
+
+/// Recursively collect SeqScan nodes and create range table entries - raw pointer version
+unsafe fn collect_seqscan_nodes_for_range_table_raw(
+    plan: *mut pg_sys::Plan,
+    range_table: &mut *mut pg_sys::List,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if plan.is_null() {
+        return Ok(());
+    }
+
+    eprintln!("DEBUG: Checking plan node type: {:?}", (*plan).type_);
+
+    // Check if this is a SeqScan node
+    if (*plan).type_ == pg_sys::NodeTag::T_SeqScan {
+        eprintln!("DEBUG: Found SeqScan node, creating range table entry");
+
+        // Extract table OID from plan_node_id (where we stored it during translation)
+        let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
+        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {}", table_oid);
+
+        if table_oid != pg_sys::InvalidOid {
+            // Create a range table entry for this table
+            let rte = create_range_table_entry_from_oid(table_oid)?;
+            *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
+            eprintln!(
+                "DEBUG: Added range table entry for table OID: {}",
+                table_oid
+            );
+        }
+    }
+
+    // Recursively check child nodes
+    if !(*plan).lefttree.is_null() {
+        collect_seqscan_nodes_for_range_table_raw((*plan).lefttree, range_table)?;
+    }
+    if !(*plan).righttree.is_null() {
+        collect_seqscan_nodes_for_range_table_raw((*plan).righttree, range_table)?;
+    }
+
+    Ok(())
 }

@@ -957,27 +957,31 @@ pub unsafe fn create_range_table_entry_from_oid(
 unsafe fn get_table_name_from_oid(
     table_oid: pg_sys::Oid,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Get the relation tuple
-    let rel_tuple = pg_sys::SearchSysCache1(
-        pg_sys::SysCacheIdentifier::RELOID as i32,
-        pg_sys::Datum::from(table_oid),
+    // Use relation_open approach - much safer than SearchSysCache1
+    eprintln!(
+        "DEBUG: get_table_name_from_oid opening relation for OID: {}",
+        table_oid
     );
 
-    if rel_tuple.is_null() {
-        return Err(format!("Table with OID {} not found", table_oid).into());
+    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
+    if relation.is_null() {
+        eprintln!("DEBUG: relation_open returned null for OID: {}", table_oid);
+        return Err(format!("Could not open relation with OID {}", table_oid).into());
     }
 
-    // Extract the relation name
-    let form_rel = pg_sys::GETSTRUCT(rel_tuple) as *mut pg_sys::Form_pg_class;
-    let name_data = &(*(*form_rel)).relname;
+    eprintln!("DEBUG: relation_open succeeded, extracting name");
 
-    // Convert NameData to string
-    let table_name = std::ffi::CStr::from_ptr(name_data.data.as_ptr())
+    // Extract table name from relation
+    let table_name = std::ffi::CStr::from_ptr((*(*relation).rd_rel).relname.data.as_ptr())
         .to_string_lossy()
         .to_string();
 
-    // Release the syscache tuple
-    pg_sys::ReleaseSysCache(rel_tuple);
+    eprintln!("DEBUG: Got table name: {}", table_name);
+
+    // Close the relation
+    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    eprintln!("DEBUG: relation_close completed");
 
     Ok(table_name)
 }

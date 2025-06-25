@@ -149,8 +149,22 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: About to create return value");
         pgrx::info!("DEBUG: About to create return value");
 
-        // Build range table by collecting RTEs from the plan tree
-        let range_table = collect_range_table_from_plan_tree(plan_tree);
+        // Build range table by collecting RTEs from the plan tree with error handling
+        eprintln!("DEBUG: About to call collect_range_table_from_plan_tree");
+        pgrx::info!("DEBUG: About to call collect_range_table_from_plan_tree");
+
+        let range_table = match collect_range_table_from_plan_tree(plan_tree) {
+            Ok(rt) => {
+                eprintln!("DEBUG: collect_range_table_from_plan_tree succeeded");
+                pgrx::info!("DEBUG: collect_range_table_from_plan_tree succeeded");
+                rt
+            }
+            Err(e) => {
+                eprintln!("DEBUG: collect_range_table_from_plan_tree failed: {}", e);
+                pgrx::info!("DEBUG: collect_range_table_from_plan_tree failed: {}", e);
+                return Err(format!("Range table collection failed: {}", e).into());
+            }
+        };
 
         eprintln!("DEBUG: Built range table during translation");
         pgrx::info!("DEBUG: Built range table during translation");
@@ -166,14 +180,16 @@ pub fn translate_substrait_plan_with_function_map(
 
 /// Collect range table entries from a plan tree
 /// This function traverses the plan tree and builds a range table with proper scanrelid assignments
-unsafe fn collect_range_table_from_plan_tree(plan_tree: *mut pg_sys::Plan) -> *mut pg_sys::List {
+unsafe fn collect_range_table_from_plan_tree(
+    plan_tree: *mut pg_sys::Plan,
+) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
     let mut range_table = std::ptr::null_mut::<pg_sys::List>();
     let mut current_scanrelid = 1u32;
 
-    // Traverse the plan tree and collect all SeqScan nodes
-    collect_seqscan_nodes_recursive(plan_tree, &mut range_table, &mut current_scanrelid);
+    // Traverse the plan tree and collect all SeqScan nodes with error handling
+    collect_seqscan_nodes_recursive(plan_tree, &mut range_table, &mut current_scanrelid)?;
 
-    range_table
+    Ok(range_table)
 }
 
 /// Recursively traverse plan tree to collect SeqScan nodes and build range table
@@ -181,9 +197,9 @@ unsafe fn collect_seqscan_nodes_recursive(
     plan: *mut pg_sys::Plan,
     range_table: &mut *mut pg_sys::List,
     current_scanrelid: &mut u32,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if plan.is_null() {
-        return;
+        return Ok(());
     }
 
     match (*plan).type_ {
@@ -191,43 +207,57 @@ unsafe fn collect_seqscan_nodes_recursive(
             // Get table OID from plan_node_id (stored during SeqScan creation)
             let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
 
-            // Create range table entry for this table
-            if let Ok(rte) = super::plan_nodes::create_range_table_entry_from_oid(table_oid) {
-                *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
+            eprintln!("DEBUG: Processing SeqScan with table OID: {}", table_oid);
+            pgrx::info!("DEBUG: Processing SeqScan with table OID: {}", table_oid);
 
-                // Update the SeqScan node to use the correct scanrelid
-                let seqscan = plan as *mut pg_sys::SeqScan;
+            // Create range table entry for this table with proper error handling
+            let rte =
+                super::plan_nodes::create_range_table_entry_from_oid(table_oid).map_err(|e| {
+                    eprintln!(
+                        "DEBUG: Failed to create RTE for table OID {}: {}",
+                        table_oid, e
+                    );
+                    format!(
+                        "Failed to create range table entry for table OID {}: {}",
+                        table_oid, e
+                    )
+                })?;
+            *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
 
-                #[cfg(any(feature = "pg13", feature = "pg14"))]
-                {
-                    (*seqscan).scanrelid = *current_scanrelid;
-                }
-                #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-                {
-                    (*seqscan).scan.scanrelid = *current_scanrelid;
-                }
+            // Update the SeqScan node to use the correct scanrelid
+            let seqscan = plan as *mut pg_sys::SeqScan;
 
-                eprintln!(
-                    "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",
-                    *current_scanrelid, table_oid
-                );
-                pgrx::info!(
-                    "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",
-                    *current_scanrelid,
-                    table_oid
-                );
-
-                *current_scanrelid += 1;
+            #[cfg(any(feature = "pg13", feature = "pg14"))]
+            {
+                (*seqscan).scanrelid = *current_scanrelid;
             }
+            #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+            {
+                (*seqscan).scan.scanrelid = *current_scanrelid;
+            }
+
+            eprintln!(
+                "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",
+                *current_scanrelid, table_oid
+            );
+            pgrx::info!(
+                "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",
+                *current_scanrelid,
+                table_oid
+            );
+
+            *current_scanrelid += 1;
         }
         _ => {
             // For other node types, recurse into child nodes
             if !(*plan).lefttree.is_null() {
-                collect_seqscan_nodes_recursive((*plan).lefttree, range_table, current_scanrelid);
+                collect_seqscan_nodes_recursive((*plan).lefttree, range_table, current_scanrelid)?;
             }
             if !(*plan).righttree.is_null() {
-                collect_seqscan_nodes_recursive((*plan).righttree, range_table, current_scanrelid);
+                collect_seqscan_nodes_recursive((*plan).righttree, range_table, current_scanrelid)?;
             }
         }
     }
+
+    Ok(())
 }
