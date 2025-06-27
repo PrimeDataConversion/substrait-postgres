@@ -488,13 +488,21 @@ unsafe fn handle_table_scan_properly(
     pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
     pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
 
-    // Execute the plan using a simpler approach that avoids complex executor setup
-    let tuplestore =
-        execute_simple_table_scan(postgres_plan, &column_names, expected_tupdesc, range_table)
-            .unwrap_or_else(|e| {
-                pg_sys::MemoryContextSwitchTo(old_context);
-                pgrx::error!("Simple table scan execution failed: {}", e);
-            });
+    // Execute the full PostgreSQL plan to get actual computed results
+    let execution_result = match execute_postgres_plan(postgres_plan, column_names, range_table) {
+        Ok(result) => result,
+        Err(e) => {
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pgrx::error!("Plan execution failed: {}", e);
+        }
+    };
+
+    // Convert the execution result to a tuplestore
+    let tuplestore = convert_execution_result_to_tuplestore(&execution_result, expected_tupdesc)
+        .unwrap_or_else(|e| {
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pgrx::error!("Failed to convert execution result to tuplestore: {}", e);
+        });
 
     pgrx::info!("DEBUG: execute_simple_table_scan returned successfully");
 
@@ -1625,6 +1633,58 @@ unsafe fn execute_simple_table_scan(
 
     pgrx::info!("DEBUG: Table scan completed successfully");
 
+    Ok(tuplestore)
+}
+
+/// Convert ExecutionResult to a PostgreSQL tuplestore
+unsafe fn convert_execution_result_to_tuplestore(
+    execution_result: &crate::plan_translator::ExecutionResult,
+    expected_tupdesc: *mut pg_sys::TupleDescData,
+) -> Result<*mut pg_sys::Tuplestorestate, Box<dyn std::error::Error + Send + Sync>> {
+    pgrx::info!("DEBUG: Converting ExecutionResult to tuplestore");
+
+    // Create tuplestore for results
+    let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
+    if tuplestore.is_null() {
+        return Err("Failed to create tuplestore".into());
+    }
+
+    pgrx::info!(
+        "DEBUG: Created tuplestore, processing {} rows",
+        execution_result.rows.len()
+    );
+
+    // Process each row in the execution result
+    for (row_idx, row_data) in execution_result.rows.iter().enumerate() {
+        let row_nulls = &execution_result.nulls[row_idx];
+
+        // Create arrays for this row's data
+        let values = pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>() * row_data.len())
+            as *mut pg_sys::Datum;
+        let nulls = pg_sys::palloc(std::mem::size_of::<bool>() * row_data.len()) as *mut bool;
+
+        // Copy the data and null flags
+        for (col_idx, &datum) in row_data.iter().enumerate() {
+            *values.add(col_idx) = datum;
+            *nulls.add(col_idx) = row_nulls[col_idx];
+        }
+
+        // Create a tuple and add it to the tuplestore
+        let tuple = pg_sys::heap_form_tuple(expected_tupdesc, values, nulls);
+        let slot = pg_sys::MakeTupleTableSlot(expected_tupdesc, &pg_sys::TTSOpsHeapTuple);
+        pg_sys::ExecStoreHeapTuple(tuple, slot, false);
+        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+
+        // Clean up for this row
+        pg_sys::pfree(values as *mut std::ffi::c_void);
+        pg_sys::pfree(nulls as *mut std::ffi::c_void);
+    }
+
+    pgrx::info!(
+        "DEBUG: Successfully converted {} rows to tuplestore",
+        execution_result.rows.len()
+    );
     Ok(tuplestore)
 }
 
