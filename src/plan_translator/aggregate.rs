@@ -247,8 +247,12 @@ fn resolve_agg_oid(
         .unwrap_or("");
     match name {
         "sum:fp64" => 2108,
+        "sum:i32" => 2102, // sum(integer) -> numeric
+        "sum:dec" => 2104, // sum(numeric) -> numeric
         "avg:fp64" => 2100,
         "count:" => 2803,
+        "count:any" => 2147, // count(any) -> bigint
+        "min:fp64" => 2136,  // min(double precision) -> double precision
         _ => 2803,
     }
     .into()
@@ -278,7 +282,7 @@ unsafe fn get_column_type_from_input_plan(index: i32) -> (pg_sys::Oid, i32, pg_s
 unsafe fn resolve_agg_return_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
     // Common aggregate function return types - match on the OID value
     match func_oid.into() {
-        2100 => pg_sys::INT8OID,    // count() -> bigint
+        2100 => pg_sys::FLOAT8OID,  // avg(double precision) -> double precision
         2101 => pg_sys::INT8OID,    // count(any) -> bigint
         2102 => pg_sys::NUMERICOID, // sum(integer) -> numeric
         2103 => pg_sys::NUMERICOID, // sum(bigint) -> numeric
@@ -286,6 +290,10 @@ unsafe fn resolve_agg_return_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
         2105 => pg_sys::FLOAT8OID,  // avg(integer) -> double precision
         2106 => pg_sys::FLOAT8OID,  // avg(bigint) -> double precision
         2107 => pg_sys::NUMERICOID, // avg(numeric) -> numeric
+        2108 => pg_sys::FLOAT8OID,  // sum(double precision) -> double precision
+        2136 => pg_sys::FLOAT8OID,  // min(double precision) -> double precision
+        2147 => pg_sys::INT8OID,    // count(any) -> bigint
+        2803 => pg_sys::INT8OID,    // count() -> bigint
         _ => {
             // For unknown functions, try to look up the return type from pg_proc
             // If lookup fails, default to numeric which is safe for most aggregates

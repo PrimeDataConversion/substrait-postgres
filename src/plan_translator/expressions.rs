@@ -729,6 +729,1077 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 .into())
             }
         }
+        "or:bool" => {
+            // Handle variadic logical OR function using PostgreSQL's BoolExpr
+            if func.arguments.len() >= 2 {
+                // Convert all arguments to PostgreSQL expressions
+                let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
+                for arg in &func.arguments {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                let pg_expr = convert_expression_to_postgres_with_context(
+                                    expr,
+                                    function_map,
+                                )?;
+                                pg_args =
+                                    pg_sys::lappend(pg_args, pg_expr as *mut std::ffi::c_void);
+                            }
+                            _ => return Err("Unsupported argument type in or:bool function".into()),
+                        }
+                    } else {
+                        return Err("Missing argument type in or:bool function".into());
+                    }
+                }
+
+                // Create a BoolExpr node for variadic OR
+                let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
+                    as *mut pg_sys::BoolExpr;
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::OR_EXPR;
+                (*bool_expr).args = pg_args;
+
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(format!(
+                    "or:bool function expects at least 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "lt:any_any" => {
+            // Handle less-than comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lt:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lt:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in lt:any_any function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lt:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lt:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in lt:any_any function".into());
+                };
+
+                // Create a binary operation expression for less-than
+                // Use generic less-than operator
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(97), // INT4LT_OP, fallback for generic types
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "lt:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "gte:date_date" => {
+            // Handle greater-than-or-equal comparison for dates
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gte:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gte:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in gte:date_date function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gte:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gte:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in gte:date_date function".into());
+                };
+
+                // Create a binary operation expression for date greater-than-equal
+                // PostgreSQL date >= operator OID is 1096 (DATE_GE_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1096),
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "gte:date_date function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "lt:date_date" => {
+            // Handle less-than comparison for dates
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lt:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lt:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in lt:date_date function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lt:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lt:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in lt:date_date function".into());
+                };
+
+                // Create a binary operation expression for date less-than
+                // PostgreSQL date < operator OID is 1094 (DATE_LT_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1094),
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "lt:date_date function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "not_equal:any_any" => {
+            // Handle not-equal comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in not_equal:any_any function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in not_equal:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in not_equal:any_any function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in not_equal:any_any function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in not_equal:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in not_equal:any_any function".into());
+                };
+
+                // Create a binary operation expression for not-equal
+                // Use generic not-equal operator
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(518), // INT4NE_OP, fallback for generic types
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "not_equal:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "like:vchar_vchar" => {
+            // Handle string LIKE pattern matching function for varchar types
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in like:vchar_vchar function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in like:vchar_vchar function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in like:vchar_vchar function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in like:vchar_vchar function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in like:vchar_vchar function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in like:vchar_vchar function".into());
+                };
+
+                // Create a binary operation expression for LIKE
+                // PostgreSQL LIKE operator OID is 15 (TEXTLIKE_OP)
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(15), pg_sys::BOOLOID)
+            } else {
+                Err(format!(
+                    "like:vchar_vchar function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "multiply:dec_dec" => {
+            // Handle decimal multiplication
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in multiply:dec_dec function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in multiply:dec_dec function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in multiply:dec_dec function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in multiply:dec_dec function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in multiply:dec_dec function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in multiply:dec_dec function".into());
+                };
+
+                // Create a binary operation expression for decimal multiplication
+                // PostgreSQL numeric * operator OID is 1758 (NUMERIC_MUL_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1758),
+                    pg_sys::NUMERICOID,
+                )
+            } else {
+                Err(format!(
+                    "multiply:dec_dec function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "subtract:dec_dec" => {
+            // Handle decimal subtraction
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in subtract:dec_dec function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in subtract:dec_dec function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in subtract:dec_dec function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in subtract:dec_dec function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in subtract:dec_dec function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in subtract:dec_dec function".into());
+                };
+
+                // Create a binary operation expression for decimal subtraction
+                // PostgreSQL numeric - operator OID is 1759 (NUMERIC_SUB_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1759),
+                    pg_sys::NUMERICOID,
+                )
+            } else {
+                Err(format!(
+                    "subtract:dec_dec function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "divide:dec_dec" => {
+            // Handle decimal division
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in divide:dec_dec function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in divide:dec_dec function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in divide:dec_dec function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in divide:dec_dec function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in divide:dec_dec function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in divide:dec_dec function".into());
+                };
+
+                // Create a binary operation expression for decimal division
+                // PostgreSQL numeric / operator OID is 1760 (NUMERIC_DIV_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1760),
+                    pg_sys::NUMERICOID,
+                )
+            } else {
+                Err(format!(
+                    "divide:dec_dec function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "gt:any_any" => {
+            // Handle greater-than comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gt:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gt:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in gt:any_any function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gt:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gt:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in gt:any_any function".into());
+                };
+
+                // Create a binary operation expression for greater-than
+                // Use generic greater-than operator
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(521), // INT4GT_OP, fallback for generic types
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "gt:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "add:date_year" => {
+            // Handle date + year interval function
+            // This typically comes from expressions like date '1994-08-01' + interval '1' month
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in add:date_year function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in add:date_year function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in add:date_year function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in add:date_year function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in add:date_year function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in add:date_year function".into());
+                };
+
+                // Create a binary operation expression for date + interval
+                // PostgreSQL date + interval operator OID is 1076 (DATE_PL_INTERVAL)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1076),
+                    pg_sys::DATEOID,
+                )
+            } else {
+                Err(format!(
+                    "add:date_year function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "gte:any_any" => {
+            // Handle greater-than-or-equal comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gte:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gte:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in gte:any_any function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gte:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gte:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in gte:any_any function".into());
+                };
+
+                // Create a binary operation expression for greater-than-or-equal
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(525), // INT4GE_OP as generic fallback
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "gte:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "lte:any_any" => {
+            // Handle less-than-or-equal comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lte:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lte:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in lte:any_any function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in lte:any_any function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in lte:any_any function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in lte:any_any function".into());
+                };
+
+                // Create a binary operation expression for less-than-or-equal
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(523), // INT4LE_OP as generic fallback
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "lte:any_any function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "add:i32_i32" => {
+            // Handle integer addition
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in add:i32_i32 function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in add:i32_i32 function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in add:i32_i32 function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in add:i32_i32 function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in add:i32_i32 function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in add:i32_i32 function".into());
+                };
+
+                // Create a binary operation expression for integer addition
+                // PostgreSQL int4 + operator OID is 551 (INT4PL_OP)
+                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(551), pg_sys::INT4OID)
+            } else {
+                Err(format!(
+                    "add:i32_i32 function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "substring:str_i32_i32" => {
+            // Handle string substring function
+            if func.arguments.len() == 3 {
+                let string_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in substring:str_i32_i32 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err(
+                            "Missing argument type in substring:str_i32_i32 function".into()
+                        );
+                    }
+                } else {
+                    return Err("Missing string argument in substring:str_i32_i32 function".into());
+                };
+
+                let start_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in substring:str_i32_i32 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err(
+                            "Missing argument type in substring:str_i32_i32 function".into()
+                        );
+                    }
+                } else {
+                    return Err("Missing start argument in substring:str_i32_i32 function".into());
+                };
+
+                let length_arg = if let Some(arg) = func.arguments.get(2) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in substring:str_i32_i32 function"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err(
+                            "Missing argument type in substring:str_i32_i32 function".into()
+                        );
+                    }
+                } else {
+                    return Err("Missing length argument in substring:str_i32_i32 function".into());
+                };
+
+                // Create a function call expression for substring
+                // PostgreSQL substring function OID is 883 (text_substr)
+                create_function_call_expr(
+                    pg_sys::Oid::from(883),
+                    vec![string_arg, start_arg, length_arg],
+                    pg_sys::TEXTOID,
+                )
+            } else {
+                Err(format!(
+                    "substring:str_i32_i32 function expects 3 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "not:bool" => {
+            // Handle logical NOT function
+            if func.arguments.len() == 1 {
+                let arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err("Unsupported argument type in not:bool function".into())
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in not:bool function".into());
+                    }
+                } else {
+                    return Err("Missing argument in not:bool function".into());
+                };
+
+                // Create a BoolExpr node for NOT
+                let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
+                    as *mut pg_sys::BoolExpr;
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
+
+                // Create args list with single argument
+                let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
+                pg_args = pg_sys::lappend(pg_args, arg as *mut std::ffi::c_void);
+                (*bool_expr).args = pg_args;
+
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(format!(
+                    "not:bool function expects 1 argument, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "gt:date_date" => {
+            // Handle date greater-than comparison function
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gt:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gt:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in gt:date_date function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in gt:date_date function".into()
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in gt:date_date function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in gt:date_date function".into());
+                };
+
+                // Create a binary operation expression for date greater-than
+                // PostgreSQL date > operator OID is 1093 (DATE_GT_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(1093),
+                    pg_sys::BOOLOID,
+                )
+            } else {
+                Err(format!(
+                    "gt:date_date function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "divide:fp64_fp64" => {
+            // Handle floating point division
+            if func.arguments.len() == 2 {
+                let left_arg = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in divide:fp64_fp64 function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in divide:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing left argument in divide:fp64_fp64 function".into());
+                };
+
+                let right_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
+                            }
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in divide:fp64_fp64 function".into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in divide:fp64_fp64 function".into());
+                    }
+                } else {
+                    return Err("Missing right argument in divide:fp64_fp64 function".into());
+                };
+
+                // Create a binary operation expression for division
+                // PostgreSQL float8 / operator OID is 595 (FLOAT8DIV_OP)
+                create_binary_op_expr(
+                    left_arg,
+                    right_arg,
+                    pg_sys::Oid::from(595),
+                    pg_sys::FLOAT8OID,
+                )
+            } else {
+                Err(format!(
+                    "divide:fp64_fp64 function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
+        "extract:req_date" => {
+            // Handle date extraction function (EXTRACT(YEAR FROM date))
+            if func.arguments.len() == 2 {
+                // First argument is the enum specifying what to extract (YEAR, MONTH, etc.)
+                let extract_field = if let Some(arg) = func.arguments.first() {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Enum(enum_val) => {
+                                enum_val.as_str()
+                            }
+                            _ => {
+                                return Err(
+                                    "First argument of extract:req_date function must be enum"
+                                        .into(),
+                                )
+                            }
+                        }
+                    } else {
+                        return Err("Missing argument type in extract:req_date function".into());
+                    }
+                } else {
+                    return Err(
+                        "Missing extract field argument in extract:req_date function".into(),
+                    );
+                };
+
+                // Second argument is the date expression
+                let date_arg =
+                    if let Some(arg) = func.arguments.get(1) {
+                        if let Some(value) = &arg.arg_type {
+                            match value {
+                                substrait::proto::function_argument::ArgType::Value(expr) => {
+                                    convert_expression_to_postgres_with_context(expr, function_map)?
+                                }
+                                _ => return Err(
+                                    "Second argument of extract:req_date function must be value"
+                                        .into(),
+                                ),
+                            }
+                        } else {
+                            return Err("Missing argument type in extract:req_date function".into());
+                        }
+                    } else {
+                        return Err("Missing date argument in extract:req_date function".into());
+                    };
+
+                // Create a function call expression for EXTRACT(field FROM date)
+                // PostgreSQL date_part function OID is 1385 (date_part_text_date)
+                let field_literal = create_text_const(&extract_field.to_lowercase())?;
+                create_function_call_expr(
+                    pg_sys::Oid::from(1385),
+                    vec![field_literal, date_arg],
+                    pg_sys::FLOAT8OID,
+                )
+            } else {
+                Err(format!(
+                    "extract:req_date function expects 2 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
         _ => Err(format!(
             "Unsupported scalar function: {} (function_reference={}, args_count={})",
             function_name, function_reference, argument_count
@@ -840,6 +1911,34 @@ unsafe fn create_placeholder_query_for_subquery() -> *mut pg_sys::Query {
     (*query).isReturn = false;
 
     query
+}
+
+/// Create a PostgreSQL function call expression
+pub unsafe fn create_function_call_expr(
+    func_oid: pg_sys::Oid,
+    args: Vec<*mut pg_sys::Expr>,
+    result_type: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a FuncExpr node
+    let func_expr =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::FuncExpr>()) as *mut pg_sys::FuncExpr;
+    (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
+    (*func_expr).funcid = func_oid;
+    (*func_expr).funcresulttype = result_type;
+    (*func_expr).funcretset = false;
+    (*func_expr).funcvariadic = false;
+    (*func_expr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
+    (*func_expr).funccollid = pg_sys::InvalidOid;
+    (*func_expr).inputcollid = pg_sys::InvalidOid;
+
+    // Create args list
+    let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
+    for arg in args {
+        pg_args = pg_sys::lappend(pg_args, arg as *mut std::ffi::c_void);
+    }
+    (*func_expr).args = pg_args;
+
+    Ok(func_expr as *mut pg_sys::Expr)
 }
 
 /// Helper function to create C strings for PostgreSQL
