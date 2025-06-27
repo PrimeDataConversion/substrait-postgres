@@ -327,36 +327,22 @@ pub unsafe fn execute_postgres_plan(
         (*plan_tree).type_
     );
 
-    // ALTERNATIVE APPROACH: Instead of using our problematic execution wrapper,
-    // return a simple mock result to get TPC-H Q1 working
-    eprintln!("DEBUG: BYPASSING EXECUTION - returning mock result to avoid segfault");
+    // Execute the plan using PostgreSQL's native executor
+    eprintln!("DEBUG: Executing plan using PostgreSQL's native executor");
 
-    // Create a simple tuple descriptor
-    let tupdesc = pg_sys::CreateTemplateTupleDesc(column_names.len() as i32);
-    if tupdesc.is_null() {
-        return Err("Failed to create tuple descriptor".into());
-    }
+    let (tupdesc, tuplestore) =
+        execute_plan_directly_from_ptr(plan_tree, column_names, range_table).map_err(|e| {
+            eprintln!("DEBUG: Plan execution failed: {}", e);
+            e
+        })?;
 
-    // Set up column names and types
-    for (i, name) in column_names.iter().enumerate() {
-        let name_cstr = std::ffi::CString::new(name.as_str()).unwrap();
-        pg_sys::TupleDescInitEntry(
-            tupdesc,
-            (i + 1) as pg_sys::AttrNumber,
-            name_cstr.as_ptr(),
-            pg_sys::INT8OID, // Use BIGINT as default type
-            -1,              // No specific type modifier
-            0,               // No specific dimension
-        );
-    }
-
-    let blessed_tupdesc = pg_sys::BlessTupleDesc(tupdesc);
+    eprintln!("DEBUG: Plan executed successfully, converting results");
 
     // Convert tuple descriptor to ColumnInfo
     let mut columns = Vec::new();
-    let natts = (*blessed_tupdesc).natts;
+    let natts = (*tupdesc).natts;
     for i in 0..natts {
-        let attr = (*blessed_tupdesc).attrs.as_ptr().offset(i as isize);
+        let attr = (*tupdesc).attrs.as_ptr().offset(i as isize);
         let name_cstr = std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr());
         let name = name_cstr.to_string_lossy().to_string();
 
@@ -368,14 +354,39 @@ pub unsafe fn execute_postgres_plan(
         });
     }
 
-    eprintln!("DEBUG: Created {} columns for mock result", columns.len());
+    // Extract rows from tuplestore
+    let mut rows = Vec::new();
+    let mut nulls = Vec::new();
 
-    // Return empty result set - this will allow translation to complete
-    // and show that our plan creation works, even though execution is bypassed
-    let rows = Vec::new();
-    let nulls = Vec::new();
+    // Reset tuplestore to beginning
+    pg_sys::tuplestore_rescan(tuplestore);
 
-    eprintln!("DEBUG: Returning mock ExecutionResult to bypass segfault");
+    // Create slot for reading tuples
+    let slot = pg_sys::MakeTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
+
+    // Read all tuples from tuplestore
+    while pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
+        let mut row_data = Vec::new();
+        let mut row_nulls = Vec::new();
+
+        // Extract values from slot
+        for i in 0..natts {
+            let mut is_null = false;
+            let attr_num = (i + 1) as i32;
+            let datum = pg_sys::slot_getattr(slot, attr_num, &mut is_null);
+            row_data.push(datum);
+            row_nulls.push(is_null);
+        }
+
+        rows.push(row_data);
+        nulls.push(row_nulls);
+    }
+
+    // Clean up
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+    pg_sys::tuplestore_end(tuplestore);
+
+    eprintln!("DEBUG: Extracted {} rows from execution", rows.len());
 
     Ok(ExecutionResult {
         columns,
