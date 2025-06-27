@@ -386,7 +386,12 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                     "DEBUG: Handling single-column case in bytea path: {}",
                     column_names[0]
                 );
-                return handle_literal_result_properly(fcinfo);
+                return handle_literal_result_properly(
+                    fcinfo,
+                    postgres_plan,
+                    column_names,
+                    range_table,
+                );
             }
             pgrx::info!("DEBUG: Multi-column bytea path, using table scan workaround");
             return handle_table_scan_properly(fcinfo, postgres_plan, column_names, range_table);
@@ -398,7 +403,12 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
 }
 
 /// Fixed handler for literal results that preserves type information
-unsafe fn handle_literal_result_properly(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
+unsafe fn handle_literal_result_properly(
+    fcinfo: pg_sys::FunctionCallInfo,
+    postgres_plan: *mut pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *mut pg_sys::List,
+) -> pg_sys::Datum {
     pgrx::info!("DEBUG: handle_literal_result_properly ENTRY");
 
     // Get the result info and expected tuple descriptor
@@ -410,20 +420,37 @@ unsafe fn handle_literal_result_properly(fcinfo: pg_sys::FunctionCallInfo) -> pg
     let expected_tupdesc = (*result_info).expectedDesc;
     pgrx::info!("DEBUG: AS clause has {} attrs", (*expected_tupdesc).natts);
 
+    // Execute the plan to get the actual result
+    let execution_result = match execute_postgres_plan(postgres_plan, column_names, range_table) {
+        Ok(result) => result,
+        Err(e) => {
+            pgrx::error!("Failed to execute plan for literal result: {}", e);
+        }
+    };
+
     // For single result functions, we can return the value directly using ValuePerCall mode
     (*result_info).returnMode = pg_sys::SetFunctionReturnMode::SFRM_ValuePerCall;
     (*result_info).isDone = pg_sys::ExprDoneCond::ExprSingleResult;
 
-    // Create the result tuple directly
+    // Extract the actual computed value from the execution result
     let values = pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
-    *values = pg_sys::Datum::from(42i32); // Return the literal value 42 from the test
-
     let nulls = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
-    *nulls = false;
+
+    if execution_result.rows.is_empty() || execution_result.rows[0].is_empty() {
+        // No results - return NULL
+        *nulls = true;
+        *values = pg_sys::Datum::from(0);
+    } else {
+        // Use the actual computed value from the first row, first column
+        *values = execution_result.rows[0][0];
+        *nulls = execution_result.nulls[0][0];
+    }
+
+    pgrx::info!("DEBUG: Using actual computed value from plan execution");
 
     // Use the expected tuple descriptor directly without blessing
     let tuple = pg_sys::heap_form_tuple(expected_tupdesc, values, nulls);
-    pgrx::info!("DEBUG: Created tuple directly from AS clause descriptor");
+    pgrx::info!("DEBUG: Created tuple with actual computed value");
 
     // Return as HeapTupleHeader datum (not HeapTuple pointer)
     let tuple_data = (*tuple).t_data;
@@ -462,11 +489,12 @@ unsafe fn handle_table_scan_properly(
     pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
 
     // Execute the plan using a simpler approach that avoids complex executor setup
-    let tuplestore = execute_simple_table_scan(postgres_plan, &column_names, expected_tupdesc)
-        .unwrap_or_else(|e| {
-            pg_sys::MemoryContextSwitchTo(old_context);
-            pgrx::error!("Simple table scan execution failed: {}", e);
-        });
+    let tuplestore =
+        execute_simple_table_scan(postgres_plan, &column_names, expected_tupdesc, range_table)
+            .unwrap_or_else(|e| {
+                pg_sys::MemoryContextSwitchTo(old_context);
+                pgrx::error!("Simple table scan execution failed: {}", e);
+            });
 
     pgrx::info!("DEBUG: execute_simple_table_scan returned successfully");
 
@@ -507,7 +535,12 @@ unsafe fn execute_substrait_as_srf_with_function_map(
             // For literal results, use a fixed workaround
             if column_names.len() == 1 {
                 pgrx::info!("DEBUG: Single column case, using fixed literal workaround");
-                return handle_literal_result_properly(fcinfo);
+                return handle_literal_result_properly(
+                    fcinfo,
+                    postgres_plan,
+                    column_names,
+                    range_table,
+                );
             }
 
             pgrx::info!("DEBUG: Multi-column case with columns: {:?}", column_names);
@@ -978,10 +1011,7 @@ mod tests {
                 match $expected_value {
                     GoldenExpectation::IntExact(expected) => {
                         // For int expectations, get the first column of the first row and convert to i64
-                        match Spi::get_one::<i64>(&format!(
-                            "SELECT ({})::bigint LIMIT 1",
-                            execution_query
-                        )) {
+                        match Spi::get_one::<i64>(&format!("{} LIMIT 1", execution_query)) {
                             Ok(Some(actual)) => {
                                 assert_eq!(
                                     actual, expected,
@@ -1000,10 +1030,7 @@ mod tests {
                     }
                     GoldenExpectation::FloatTolerance(expected, tolerance) => {
                         // For float expectations, get the first column of the first row and convert to f64
-                        match Spi::get_one::<f64>(&format!(
-                            "SELECT ({})::double precision LIMIT 1",
-                            execution_query
-                        )) {
+                        match Spi::get_one::<f64>(&format!("{} LIMIT 1", execution_query)) {
                             Ok(Some(actual)) => {
                                 let difference = (actual - expected).abs();
                                 assert!(
@@ -1027,10 +1054,7 @@ mod tests {
                     }
                     GoldenExpectation::StringExact(expected) => {
                         // For string expectations, get the first column of the first row as text
-                        match Spi::get_one::<String>(&format!(
-                            "SELECT ({})::text LIMIT 1",
-                            execution_query
-                        )) {
+                        match Spi::get_one::<String>(&format!("{} LIMIT 1", execution_query)) {
                             Ok(Some(actual)) => {
                                 assert_eq!(
                                     actual, expected,
@@ -1525,11 +1549,12 @@ unsafe fn execute_simple_table_scan(
     postgres_plan: *mut pg_sys::Plan,
     _column_names: &[String],
     expected_tupdesc: *mut pg_sys::TupleDescData,
+    range_table: *mut pg_sys::List,
 ) -> Result<*mut pg_sys::Tuplestorestate, Box<dyn std::error::Error + Send + Sync>> {
     pgrx::info!("DEBUG: execute_simple_table_scan ENTRY");
 
-    // Extract table OID from the plan tree
-    let table_oid = pg_sys::Oid::from((*postgres_plan).plan_node_id as u32);
+    // Extract table OID from the plan tree - need to find SeqScan nodes and get their scanrelid
+    let table_oid = extract_table_oid_from_plan_tree(postgres_plan, range_table)?;
     pgrx::info!("DEBUG: Table OID from plan: {}", table_oid);
 
     // Create tuplestore for results
@@ -1601,4 +1626,82 @@ unsafe fn execute_simple_table_scan(
     pgrx::info!("DEBUG: Table scan completed successfully");
 
     Ok(tuplestore)
+}
+
+/// Extract table OID from PostgreSQL plan tree by finding SeqScan nodes
+unsafe fn extract_table_oid_from_plan_tree(
+    plan: *mut pg_sys::Plan,
+    range_table: *mut pg_sys::List,
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    if plan.is_null() {
+        return Err("Plan is null".into());
+    }
+
+    pgrx::info!(
+        "DEBUG: extract_table_oid_from_plan_tree - plan type: {:?}",
+        (*plan).type_
+    );
+
+    // Recursively traverse the plan tree to find SeqScan nodes
+    match (*plan).type_ {
+        pg_sys::NodeTag::T_SeqScan => {
+            let seqscan = plan as *mut pg_sys::SeqScan;
+            let scanrelid = (*seqscan).scan.scanrelid;
+            pgrx::info!("DEBUG: Found SeqScan with scanrelid: {}", scanrelid);
+
+            if scanrelid == 0 {
+                return Err("SeqScan scanrelid is 0".into());
+            }
+
+            // scanrelid is an index into the range table, we need to get the actual table OID
+            if range_table.is_null() {
+                return Err("Range table is null".into());
+            }
+
+            // scanrelid is 1-based, PostgreSQL lists are 0-based
+            let rt_index = (scanrelid - 1) as i32;
+            let rt_entry = pg_sys::list_nth(range_table, rt_index);
+
+            if rt_entry.is_null() {
+                return Err(format!("Range table entry {} not found", scanrelid).into());
+            }
+
+            let rte = rt_entry as *mut pg_sys::RangeTblEntry;
+            if rte.is_null() {
+                return Err("Range table entry is null".into());
+            }
+
+            // Get the table OID from the RangeTblEntry
+            let table_oid = (*rte).relid;
+            pgrx::info!(
+                "DEBUG: Resolved scanrelid {} to table OID {}",
+                scanrelid,
+                table_oid
+            );
+
+            Ok(table_oid)
+        }
+        _ => {
+            // Check left and right subtrees
+            if !(*plan).lefttree.is_null() {
+                match extract_table_oid_from_plan_tree((*plan).lefttree, range_table) {
+                    Ok(oid) => return Ok(oid),
+                    Err(_) => {} // Continue searching
+                }
+            }
+
+            if !(*plan).righttree.is_null() {
+                match extract_table_oid_from_plan_tree((*plan).righttree, range_table) {
+                    Ok(oid) => return Ok(oid),
+                    Err(_) => {} // Continue searching
+                }
+            }
+
+            Err(format!(
+                "No SeqScan found in plan tree starting from node type {:?}",
+                (*plan).type_
+            )
+            .into())
+        }
+    }
 }
