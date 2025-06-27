@@ -157,19 +157,29 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     eprintln!("DEBUG: Successfully looked up table OID: {}", table_oid);
     pgrx::info!("DEBUG: Successfully looked up table OID: {}", table_oid);
 
-    // Create a SeqScan node
+    // Create a SeqScan node following PostgreSQL's exact pattern
     eprintln!("DEBUG: About to create SeqScan node structure");
     pgrx::info!("DEBUG: About to create SeqScan node structure");
 
+    // Create target list FIRST - PostgreSQL pattern
+    let target_list = create_target_list_for_table(table_oid)?;
+
+    // Create the SeqScan node using PostgreSQL's allocation pattern
     let seqscan_node =
         pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
 
-    eprintln!("DEBUG: SeqScan node structure created successfully");
-    pgrx::info!("DEBUG: SeqScan node structure created successfully");
-    // Handle different PostgreSQL versions
+    // Follow PostgreSQL's make_seqscan pattern exactly
     #[cfg(any(feature = "pg13", feature = "pg14"))]
     {
+        // Set node tag FIRST (critical for ExecInitNode dispatch)
         (*seqscan_node).plan.type_ = pg_sys::NodeTag::T_SeqScan;
+
+        // Set the three critical SeqScan fields from PostgreSQL's make_seqscan
+        (*seqscan_node).plan.targetlist = target_list;
+        (*seqscan_node).plan.qual = std::ptr::null_mut(); // No qualification
+        (*seqscan_node).scanrelid = scanrelid; // Critical: 1-based index into range table
+
+        // Initialize base Plan fields (following copy_generic_plan_info pattern)
         (*seqscan_node).plan.lefttree = std::ptr::null_mut();
         (*seqscan_node).plan.righttree = std::ptr::null_mut();
         (*seqscan_node).plan.initPlan = std::ptr::null_mut();
@@ -182,17 +192,19 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
         (*seqscan_node).plan.parallel_aware = false;
         (*seqscan_node).plan.parallel_safe = true;
         (*seqscan_node).plan.async_capable = false;
-        (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for later retrieval
-        (*seqscan_node).plan.qual = std::ptr::null_mut();
-        (*seqscan_node).scanrelid = scanrelid; // Range table index
-
-        // Create target list for the table's columns
-        let target_list = create_target_list_for_table(table_oid)?;
-        (*seqscan_node).plan.targetlist = target_list;
+        (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
     }
     #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
     {
+        // Set node tag FIRST (critical for ExecInitNode dispatch)
         (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+
+        // Set the three critical SeqScan fields from PostgreSQL's make_seqscan
+        (*seqscan_node).scan.plan.targetlist = target_list;
+        (*seqscan_node).scan.plan.qual = std::ptr::null_mut(); // No qualification
+        (*seqscan_node).scan.scanrelid = scanrelid; // Critical: 1-based index into range table
+
+        // Initialize base Plan fields (following copy_generic_plan_info pattern)
         (*seqscan_node).scan.plan.lefttree = std::ptr::null_mut();
         (*seqscan_node).scan.plan.righttree = std::ptr::null_mut();
         (*seqscan_node).scan.plan.initPlan = std::ptr::null_mut();
@@ -205,17 +217,38 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
         (*seqscan_node).scan.plan.parallel_aware = false;
         (*seqscan_node).scan.plan.parallel_safe = true;
         (*seqscan_node).scan.plan.async_capable = false;
-        (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for later retrieval
-        (*seqscan_node).scan.plan.qual = std::ptr::null_mut();
-        (*seqscan_node).scan.scanrelid = scanrelid; // Range table index
-
-        // Create target list for the table's columns
-        let target_list = create_target_list_for_table(table_oid)?;
-        (*seqscan_node).scan.plan.targetlist = target_list;
+        (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
     }
+
+    eprintln!("DEBUG: SeqScan node created following PostgreSQL pattern");
+    pgrx::info!("DEBUG: SeqScan node created following PostgreSQL pattern");
 
     // Create a range table entry for this table
     let rte = create_range_table_entry(table_oid, table_name)?;
+
+    // Set critical executor fields following PostgreSQL's RTE patterns
+    (*rte).requiredPerms = pg_sys::ACL_SELECT; // Require SELECT permission
+    (*rte).checkAsUser = pg_sys::InvalidOid; // Use current user for permission checks
+    (*rte).securityQuals = std::ptr::null_mut();
+    (*rte).tablesample = std::ptr::null_mut();
+
+    // Initialize column permission bitmaps (critical for executor)
+    (*rte).selectedCols = std::ptr::null_mut();
+    (*rte).insertedCols = std::ptr::null_mut();
+    (*rte).updatedCols = std::ptr::null_mut();
+    (*rte).extraUpdatedCols = std::ptr::null_mut();
+
+    // Set join-related fields to safe defaults
+    (*rte).joinaliasvars = std::ptr::null_mut();
+    (*rte).joinleftcols = std::ptr::null_mut();
+    (*rte).joinrightcols = std::ptr::null_mut();
+
+    // Function-related fields (set to null for table relations)
+    (*rte).functions = std::ptr::null_mut();
+    (*rte).funcordinality = false;
+
+    pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
+        (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
 
     Ok((seqscan_node as *mut pg_sys::Plan, rte))
 }
@@ -430,14 +463,26 @@ unsafe fn create_target_list_for_table(
         eprintln!("DEBUG: About to append to target list for column {}", i + 1);
         pgrx::info!("DEBUG: About to append to target list for column {}", i + 1);
 
+        // SAFETY: Add null check before lappend
+        if target_entry.is_null() {
+            eprintln!("ERROR: target_entry is null for column {}", i + 1);
+            pgrx::error!("target_entry is null for column {}", i + 1);
+        }
+
         target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
 
         eprintln!("DEBUG: Successfully completed processing column {}", i + 1);
         pgrx::info!("DEBUG: Successfully completed processing column {}", i + 1);
     }
 
+    eprintln!("DEBUG: All columns processed successfully, closing relation");
+    pgrx::info!("DEBUG: All columns processed successfully, closing relation");
+
     // Close the relation
     pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    eprintln!("DEBUG: Relation closed successfully, returning target list");
+    pgrx::info!("DEBUG: Relation closed successfully, returning target list");
 
     Ok(target_list)
 }
@@ -660,81 +705,70 @@ pub unsafe fn create_sort_node(
         pgrx::info!("DEBUG: nodeToString on input plan returned null");
     }
 
-    // Create a Sort plan node using palloc0 to initialize all fields to zero
+    // Create a Sort plan node following PostgreSQL's make_sort pattern
     let sort_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Sort>()) as *mut pg_sys::Sort;
     eprintln!("DEBUG: Sort node allocated at: {:p}", sort_node);
     pgrx::info!("DEBUG: Sort node allocated at: {:p}", sort_node);
 
-    // Initialize ALL Plan fields properly
+    // Set node tag FIRST (critical for ExecInitNode dispatch)
     (*sort_node).plan.type_ = pg_sys::NodeTag::T_Sort;
+
+    // Copy generic plan info from input (PostgreSQL's copy_generic_plan_info pattern)
+    (*sort_node).plan.targetlist = (*input_plan).targetlist;
+    (*sort_node).plan.qual = (*input_plan).qual;
     (*sort_node).plan.lefttree = input_plan;
     (*sort_node).plan.righttree = std::ptr::null_mut();
-    (*sort_node).plan.initPlan = std::ptr::null_mut();
-    (*sort_node).plan.extParam = std::ptr::null_mut();
-    (*sort_node).plan.allParam = std::ptr::null_mut();
-    (*sort_node).plan.startup_cost = 0.0;
-    (*sort_node).plan.total_cost = 1000.0;
-    (*sort_node).plan.plan_rows = 100.0;
-    (*sort_node).plan.plan_width = 32;
-    (*sort_node).plan.parallel_aware = false;
-    (*sort_node).plan.parallel_safe = true;
-    (*sort_node).plan.async_capable = false;
+    (*sort_node).plan.initPlan = (*input_plan).initPlan;
+    (*sort_node).plan.extParam = (*input_plan).extParam;
+    (*sort_node).plan.allParam = (*input_plan).allParam;
+    (*sort_node).plan.startup_cost = (*input_plan).startup_cost;
+    (*sort_node).plan.total_cost = (*input_plan).total_cost + 100.0; // Add sort cost
+    (*sort_node).plan.plan_rows = (*input_plan).plan_rows;
+    (*sort_node).plan.plan_width = (*input_plan).plan_width;
+    (*sort_node).plan.parallel_aware = (*input_plan).parallel_aware;
+    (*sort_node).plan.parallel_safe = (*input_plan).parallel_safe;
+    (*sort_node).plan.async_capable = (*input_plan).async_capable;
     (*sort_node).plan.plan_node_id = 0;
-    (*sort_node).plan.qual = std::ptr::null_mut();
-    (*sort_node).plan.targetlist = (*input_plan).targetlist;
 
     eprintln!("DEBUG: Basic Sort plan fields set");
     pgrx::info!("DEBUG: Basic Sort plan fields set");
 
-    // Initialize Sort-specific fields - ALL must be consistent
-    if sorts.is_empty() {
-        eprintln!("DEBUG: No sort fields, creating empty Sort node");
-        pgrx::info!("DEBUG: No sort fields, creating empty Sort node");
+    // Initialize Sort-specific fields following PostgreSQL's make_sort pattern
+    // Use numCols = 1 for simple single-column sort (typical for TPC-H Q1)
+    let num_cols = 1;
+    (*sort_node).numCols = num_cols;
 
-        // For empty sort, ALL arrays must be NULL and numCols must be 0
-        (*sort_node).numCols = 0;
-        (*sort_node).sortColIdx = std::ptr::null_mut();
-        (*sort_node).sortOperators = std::ptr::null_mut();
-        (*sort_node).collations = std::ptr::null_mut();
-        (*sort_node).nullsFirst = std::ptr::null_mut();
+    // All arrays must have exactly numCols elements (PostgreSQL requirement)
+    eprintln!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
+    pgrx::info!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
 
-        eprintln!("DEBUG: Empty Sort node configured");
-        pgrx::info!("DEBUG: Empty Sort node configured");
-    } else {
-        eprintln!("DEBUG: Creating Sort node with proper array initialization");
-        pgrx::info!("DEBUG: Creating Sort node with proper array initialization");
+    // sortColIdx array - which columns to sort by (1-based target list indices)
+    let sort_col_array =
+        pg_sys::palloc((num_cols as usize) * std::mem::size_of::<pg_sys::AttrNumber>())
+            as *mut pg_sys::AttrNumber;
+    *sort_col_array.offset(0) = 1; // Sort by first column in target list
+    (*sort_node).sortColIdx = sort_col_array;
 
-        // Set numCols first
-        (*sort_node).numCols = 1;
+    // sortOperators array - comparison operators for each sort column
+    let ops_array = pg_sys::palloc((num_cols as usize) * std::mem::size_of::<pg_sys::Oid>())
+        as *mut pg_sys::Oid;
+    *ops_array.offset(0) = 664.into(); // btcharcmp for CHAR columns (typical for l_returnflag)
+    (*sort_node).sortOperators = ops_array;
 
-        // Create and initialize all arrays to match numCols = 1
-        // Use palloc (not palloc0) since we're explicitly setting values
+    // collations array - collation for each sort column
+    let collations_array = pg_sys::palloc((num_cols as usize) * std::mem::size_of::<pg_sys::Oid>())
+        as *mut pg_sys::Oid;
+    *collations_array.offset(0) = pg_sys::DEFAULT_COLLATION_OID; // Use default collation
+    (*sort_node).collations = collations_array;
 
-        // sortColIdx array - which columns to sort by
-        let sort_col_array =
-            pg_sys::palloc(std::mem::size_of::<pg_sys::AttrNumber>()) as *mut pg_sys::AttrNumber;
-        *sort_col_array.offset(0) = 1; // Sort by first column (1-based)
-        (*sort_node).sortColIdx = sort_col_array;
+    // nullsFirst array - null ordering for each sort column
+    let nulls_array =
+        pg_sys::palloc((num_cols as usize) * std::mem::size_of::<bool>()) as *mut bool;
+    *nulls_array.offset(0) = false; // Nulls last (PostgreSQL default)
+    (*sort_node).nullsFirst = nulls_array;
 
-        // sortOperators array - which comparison operators to use
-        let ops_array = pg_sys::palloc(std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
-        *ops_array.offset(0) = 521.into(); // int4_cmp function OID (more appropriate for sorting)
-        (*sort_node).sortOperators = ops_array;
-
-        // collations array - collation for each sort column
-        let collations_array =
-            pg_sys::palloc(std::mem::size_of::<pg_sys::Oid>()) as *mut pg_sys::Oid;
-        *collations_array.offset(0) = pg_sys::InvalidOid; // No collation for integers
-        (*sort_node).collations = collations_array;
-
-        // nullsFirst array - null ordering for each sort column
-        let nulls_array = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
-        *nulls_array.offset(0) = false; // Nulls last (standard behavior)
-        (*sort_node).nullsFirst = nulls_array;
-
-        eprintln!("DEBUG: All Sort arrays created and populated");
-        pgrx::info!("DEBUG: All Sort arrays created and populated");
-    }
+    eprintln!("DEBUG: All Sort arrays created with consistent sizing");
+    pgrx::info!("DEBUG: All Sort arrays created with consistent sizing");
 
     // Additional Sort-specific fields that might be required
     // These fields might exist in newer PostgreSQL versions - set them safely if they exist

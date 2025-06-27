@@ -18,6 +18,170 @@ pub extern "C" fn _PG_init() {
     pgrx::info!("Substrait PostgreSQL extension loaded");
 }
 
+/// Debug function to test PostgreSQL plan vs our execution wrapper
+#[pg_extern]
+fn debug_postgresql_execution() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // This function will let us test our hypothesis about plan construction vs execution
+    pgrx::info!("DEBUG: Testing PostgreSQL vs our SeqScan construction using LINEITEM");
+
+    // Create a simple LINEITEM table for this debug comparison
+    let _ = Spi::run("CREATE TABLE IF NOT EXISTS \"LINEITEM\" (l_orderkey BIGINT)");
+    let _ = Spi::run(
+        "INSERT INTO \"LINEITEM\" (l_orderkey) VALUES (1), (2), (3) ON CONFLICT DO NOTHING",
+    );
+
+    // Test baseline PostgreSQL execution with LINEITEM
+    let baseline_result = Spi::get_one::<i64>("SELECT l_orderkey FROM \"LINEITEM\" LIMIT 1");
+    match baseline_result {
+        Ok(Some(orderkey)) => {
+            pgrx::info!(
+                "DEBUG: PostgreSQL baseline with LINEITEM SeqScan works, got orderkey: {}",
+                orderkey
+            );
+        }
+        _ => {
+            return Err("PostgreSQL baseline with LINEITEM failed".into());
+        }
+    }
+
+    unsafe {
+        // Create a PostgreSQL SeqScan plan for LINEITEM using internal functions
+        let query_string = std::ffi::CString::new("SELECT l_orderkey FROM \"LINEITEM\"").unwrap();
+
+        pgrx::info!("DEBUG: About to parse simple query");
+        let raw_parse_tree = pg_sys::pg_parse_query(query_string.as_ptr());
+
+        if raw_parse_tree.is_null() {
+            return Err("Failed to parse query".into());
+        }
+
+        pgrx::info!("DEBUG: Query parsed, about to analyze");
+
+        // Get the first statement
+        let stmt_list = raw_parse_tree as *mut pg_sys::List;
+        let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
+
+        // Analyze the statement
+        let query = pg_sys::parse_analyze_fixedparams(
+            raw_stmt,
+            query_string.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+        );
+
+        if query.is_null() {
+            return Err("Failed to analyze query".into());
+        }
+
+        pgrx::info!("DEBUG: Query analyzed, about to plan");
+
+        // Plan the query
+        let planned_stmt = pg_sys::planner(
+            query,
+            std::ptr::null_mut(),
+            0, // cursorOptions
+            std::ptr::null_mut(),
+        );
+
+        if planned_stmt.is_null() {
+            return Err("Failed to plan query".into());
+        }
+
+        pgrx::info!("DEBUG: Query planned successfully!");
+
+        // Extract the plan tree and range table
+        let plan_tree = (*planned_stmt).planTree;
+        let range_table = (*planned_stmt).rtable;
+
+        if plan_tree.is_null() {
+            return Err("Plan tree is null".into());
+        }
+
+        pgrx::info!(
+            "DEBUG: Got PostgreSQL plan tree: {:p}, type: {:?}",
+            plan_tree,
+            (*plan_tree).type_
+        );
+
+        // Test nodeToString on PostgreSQL's plan
+        let pg_plan_str = pg_sys::nodeToString(plan_tree as *const std::ffi::c_void);
+        if !pg_plan_str.is_null() {
+            pgrx::info!("DEBUG: PostgreSQL plan nodeToString works");
+            pg_sys::pfree(pg_plan_str as *mut std::ffi::c_void);
+        }
+
+        // NOW THE CRITICAL TEST: Pass PostgreSQL's plan to our execution wrapper
+        pgrx::info!("DEBUG: Testing our execution wrapper with PostgreSQL's plan");
+
+        let column_names = vec!["result".to_string()];
+
+        // Test our execution wrapper with PostgreSQL's SeqScan plan
+        match crate::executor::execute_postgres_plan(plan_tree, column_names.clone(), range_table) {
+            Ok(result) => {
+                pgrx::info!("DEBUG: SUCCESS! Our execution wrapper works with PostgreSQL's SeqScan plan! Result has {} columns", result.columns.len());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Our execution wrapper FAILED with PostgreSQL's SeqScan plan: {}",
+                    e
+                )
+                .into());
+            }
+        }
+
+        // NOW COMPARE: Create our own SeqScan plan for LINEITEM and test it
+        pgrx::info!("DEBUG: Now creating our own SeqScan plan for LINEITEM and testing it");
+
+        let (our_seqscan_plan, our_range_table) =
+            match crate::plan_translator::plan_nodes::create_seqscan_node_with_scanrelid(
+                "LINEITEM", 1,
+            ) {
+                Ok(result) => {
+                    pgrx::info!("DEBUG: Our SeqScan node created successfully");
+                    result
+                }
+                Err(e) => {
+                    return Err(format!("Failed to create our SeqScan node: {}", e).into());
+                }
+            };
+
+        // Test nodeToString on our plan
+        let our_plan_str = pg_sys::nodeToString(our_seqscan_plan as *const std::ffi::c_void);
+        if !our_plan_str.is_null() {
+            pgrx::info!("DEBUG: Our SeqScan plan nodeToString works");
+            pg_sys::pfree(our_plan_str as *mut std::ffi::c_void);
+        }
+
+        // Create range table for our plan
+        let mut our_range_table_list = std::ptr::null_mut::<pg_sys::List>();
+        our_range_table_list = pg_sys::lappend(
+            our_range_table_list,
+            our_range_table as *mut std::ffi::c_void,
+        );
+
+        // THE CRITICAL COMPARISON: Test our SeqScan plan with our execution wrapper
+        pgrx::info!("DEBUG: Testing our execution wrapper with OUR SeqScan plan - this should reveal the difference");
+
+        match crate::executor::execute_postgres_plan(
+            our_seqscan_plan,
+            column_names,
+            our_range_table_list,
+        ) {
+            Ok(result) => {
+                let success_msg = format!("AMAZING! Our execution wrapper works with OUR SeqScan plan too! Result has {} columns. The issue might be elsewhere.", result.columns.len());
+                pgrx::info!("DEBUG: {}", success_msg);
+                Ok(success_msg)
+            }
+            Err(e) => {
+                let failure_msg = format!("CONFIRMED: Our execution wrapper FAILS with OUR SeqScan plan: {}. This confirms the issue is in our plan construction!", e);
+                pgrx::info!("DEBUG: {}", failure_msg);
+                Ok(failure_msg)
+            }
+        }
+    }
+}
+
 /// Primary Substrait execution function for protobuf plans
 /// Usage: SELECT * FROM from_substrait(plan_bytes) AS t(col1 type1, col2 type2, ...)
 /// The AS clause column definitions must match the plan's output schema
@@ -1140,6 +1304,87 @@ mod tests {
         );
     }
 
+    /// Test plan execution without collecting results - just checks if executor setup works
+    unsafe fn test_plan_execution_only(
+        postgres_plan: *mut pg_sys::Plan,
+        _column_names: Vec<String>,
+        range_table: *const pg_sys::List,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        pgrx::info!("test_plan_execution_only: Starting executor setup test");
+
+        // Try to create executor state
+        let estate = pg_sys::CreateExecutorState();
+        if estate.is_null() {
+            return Err("Failed to create executor state".into());
+        }
+        pgrx::info!("test_plan_execution_only: Executor state created successfully");
+
+        // Set the range table
+        if !range_table.is_null() {
+            (*estate).es_range_table = range_table as *mut pg_sys::List;
+            pgrx::info!("test_plan_execution_only: Range table set successfully");
+        }
+
+        // Try to initialize the plan node - first test just the SeqScan
+        pgrx::info!("test_plan_execution_only: About to test SeqScan initialization only");
+
+        // Navigate to the leaf SeqScan node in the complex Sort->Agg->SeqScan tree
+        let seqscan_plan =
+            if !postgres_plan.is_null() && (*postgres_plan).type_ == pg_sys::NodeTag::T_Sort {
+                // Sort -> Agg -> SeqScan
+                let agg_plan = (*postgres_plan).lefttree;
+                if !agg_plan.is_null() && (*agg_plan).type_ == pg_sys::NodeTag::T_Agg {
+                    let seqscan = (*agg_plan).lefttree;
+                    if !seqscan.is_null() && (*seqscan).type_ == pg_sys::NodeTag::T_SeqScan {
+                        seqscan
+                    } else {
+                        std::ptr::null_mut()
+                    }
+                } else {
+                    std::ptr::null_mut()
+                }
+            } else {
+                std::ptr::null_mut()
+            };
+
+        if !seqscan_plan.is_null() {
+            pgrx::info!("test_plan_execution_only: Testing SeqScan node initialization alone");
+            let seqscan_state = pg_sys::ExecInitNode(seqscan_plan, estate, 0);
+            if seqscan_state.is_null() {
+                pgrx::info!("test_plan_execution_only: SeqScan initialization failed");
+            } else {
+                pgrx::info!("test_plan_execution_only: SeqScan initialized successfully");
+                pg_sys::ExecEndNode(seqscan_state);
+            }
+        }
+
+        // Now try to initialize the full plan node
+        pgrx::info!("test_plan_execution_only: About to call ExecInitNode on full plan tree");
+        let plan_state = pg_sys::ExecInitNode(postgres_plan, estate, 0);
+        pgrx::info!("test_plan_execution_only: ExecInitNode returned");
+        if plan_state.is_null() {
+            pgrx::info!("test_plan_execution_only: Plan state is null");
+            pg_sys::FreeExecutorState(estate);
+            return Err("Failed to initialize plan node for execution".into());
+        }
+        pgrx::info!("test_plan_execution_only: Plan node initialized successfully");
+
+        // Try to execute just ONE tuple to see if basic execution works
+        let slot = pg_sys::ExecProcNode(plan_state);
+        if slot.is_null() {
+            pgrx::info!("test_plan_execution_only: No tuples returned (which might be expected)");
+        } else {
+            pgrx::info!("test_plan_execution_only: Successfully executed and got a tuple slot");
+        }
+
+        // Clean up
+        pg_sys::ExecEndNode(plan_state);
+        pg_sys::FreeExecutorState(estate);
+
+        pgrx::info!("test_plan_execution_only: All cleanup completed successfully");
+        Ok(())
+    }
+
     /// Sets up TPC-H database if needed (checks if LINEITEM table exists)
     fn setup_tpch_database_if_needed() {
         // Check if LINEITEM table already exists (uppercase to match Substrait)
@@ -1278,7 +1523,7 @@ pub mod pg_test {
 /// This directly scans the table without using PostgreSQL's complex executor
 unsafe fn execute_simple_table_scan(
     postgres_plan: *mut pg_sys::Plan,
-    column_names: &[String],
+    _column_names: &[String],
     expected_tupdesc: *mut pg_sys::TupleDescData,
 ) -> Result<*mut pg_sys::Tuplestorestate, Box<dyn std::error::Error + Send + Sync>> {
     pgrx::info!("DEBUG: execute_simple_table_scan ENTRY");
@@ -1302,7 +1547,7 @@ unsafe fn execute_simple_table_scan(
     pgrx::info!("DEBUG: Opened table successfully");
 
     // Get tuple descriptor from relation
-    let rel_tupdesc = (*relation).rd_att;
+    let _rel_tupdesc = (*relation).rd_att;
 
     // Create a simple table scan using PostgreSQL's heap scan
     let scan_desc = pg_sys::table_beginscan(

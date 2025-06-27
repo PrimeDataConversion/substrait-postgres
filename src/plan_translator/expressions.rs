@@ -84,6 +84,7 @@ pub unsafe fn create_text_const(
 }
 
 /// Create a PostgreSQL Var node for column references
+/// NOTE: This creates a Var with UNKNOWNOID - use create_var_node_with_type for proper typing
 pub unsafe fn create_var_node(
     attr_number: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
@@ -94,6 +95,25 @@ pub unsafe fn create_var_node(
     (*var_node).vartype = pg_sys::UNKNOWNOID; // Will be resolved during planning
     (*var_node).vartypmod = -1;
     (*var_node).varcollid = pg_sys::InvalidOid;
+    (*var_node).varlevelsup = 0;
+
+    Ok(var_node as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL Var node with proper type information
+pub unsafe fn create_var_node_with_type(
+    attr_number: i32,
+    vartype: pg_sys::Oid,
+    vartypmod: i32,
+    varcollid: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+    (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
+    (*var_node).varno = 1; // Single table reference for now
+    (*var_node).varattno = attr_number as pg_sys::AttrNumber;
+    (*var_node).vartype = vartype; // Use actual column type
+    (*var_node).vartypmod = vartypmod;
+    (*var_node).varcollid = varcollid;
     (*var_node).varlevelsup = 0;
 
     Ok(var_node as *mut pg_sys::Expr)
