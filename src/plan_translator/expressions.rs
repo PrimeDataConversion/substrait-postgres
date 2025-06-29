@@ -4,8 +4,14 @@ use std::collections::HashMap;
 use substrait::proto::Expression;
 
 use super::constants::get_expression_type_name;
+use super::relations::convert_rel_to_plan_tree_with_context;
 
 use substrait::proto::{r#type::Kind, Type};
+
+/// Create a CString from a Rust string
+pub fn create_cstring(s: &str) -> *mut std::os::raw::c_char {
+    std::ffi::CString::new(s).unwrap().into_raw()
+}
 
 /// Get the PostgreSQL type OID for a given Substrait type
 fn get_pg_type_oid(
@@ -20,7 +26,7 @@ fn get_pg_type_oid(
             Kind::Fp64(_) => Ok(pg_sys::FLOAT8OID),
             Kind::String(_) | Kind::Varchar(_) | Kind::FixedChar(_) => Ok(pg_sys::TEXTOID),
             Kind::Date(_) => Ok(pg_sys::DATEOID),
-            Kind::Decimal(d) => {
+            Kind::Decimal(_d) => {
                 // For now, map all decimals to NUMERIC
                 // TODO: Handle precision and scale
                 Ok(pg_sys::NUMERICOID)
@@ -324,7 +330,6 @@ pub unsafe fn create_var_node_with_type(
 }
 
 /// Create a PostgreSQL type cast expression
-/// Create a PostgreSQL type cast expression
 pub unsafe fn create_cast_expr(
     arg: *mut pg_sys::Expr,
     target_type_oid: pg_sys::Oid,
@@ -392,6 +397,31 @@ pub unsafe fn create_binary_op_expr(
     }
 
     Ok(op_expr as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL function call expression
+pub unsafe fn create_function_call_expr(
+    function_oid: pg_sys::Oid,
+    result_type: pg_sys::Oid,
+    arguments: &[*mut pg_sys::Expr],
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let func_expr =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::FuncExpr>()) as *mut pg_sys::FuncExpr;
+    (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
+    (*func_expr).funcid = function_oid;
+    (*func_expr).funcresulttype = result_type;
+    (*func_expr).funcretset = false;
+    (*func_expr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
+    (*func_expr).funccollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*func_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
+
+    let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+    for arg in arguments {
+        args_list = pg_sys::lappend(args_list, *arg as *mut std::ffi::c_void);
+    }
+    (*func_expr).args = args_list;
+
+    Ok(func_expr as *mut pg_sys::Expr)
 }
 
 /// Convert selection expression to PostgreSQL
@@ -476,7 +506,7 @@ pub unsafe fn convert_expression_to_postgres_with_context(
         }
         Some(RexType::Subquery(subquery)) => {
             // Handle subquery expressions
-            create_subquery_expr(subquery, function_map)
+            create_subquery_expr(subquery, function_map).map(|node| node as *mut pg_sys::Expr)
         }
         Some(rex_type) => {
             let type_name = get_expression_type_name(rex_type);
@@ -488,6 +518,121 @@ pub unsafe fn convert_expression_to_postgres_with_context(
         }
         None => Err("Expression missing rex_type".into()),
     }
+}
+
+/// Create a PostgreSQL subquery expression from Substrait subquery
+pub unsafe fn create_subquery_expr(
+    subquery: &substrait::proto::expression::Subquery,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::SubqueryType;
+
+    match &subquery.subquery_type {
+        Some(SubqueryType::Scalar(scalar_subquery)) => {
+            // The scalar_subquery should contain the inner relation
+            create_scalar_subquery_expr(scalar_subquery, function_map)
+        }
+        Some(SubqueryType::InPredicate(_)) => {
+            Err("IN predicate subqueries not yet supported".into())
+        }
+        Some(SubqueryType::SetPredicate(set_predicate)) => {
+            // Handle EXISTS/UNIQUE subqueries
+            create_set_predicate_expr(set_predicate, function_map)
+        }
+        Some(SubqueryType::SetComparison(_)) => {
+            Err("Set comparison subqueries not yet supported".into())
+        }
+        None => Err("Subquery missing subquery_type".into()),
+    }
+}
+
+/// Create a PostgreSQL scalar subquery expression
+unsafe fn create_scalar_subquery_expr(
+    scalar_subquery: &substrait::proto::expression::subquery::Scalar,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    // scalar_subquery contains the input relation of the scalar subquery
+    if scalar_subquery.input.is_none() {
+        return Err("Scalar subquery missing input relation".into());
+    }
+
+    if let Some(rel) = &scalar_subquery.input {
+        let sublink =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+        (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
+        (*sublink).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK;
+        (*sublink).subLinkId = 0;
+        (*sublink).testexpr = std::ptr::null_mut();
+        (*sublink).operName = std::ptr::null_mut();
+
+        let plan_tree = convert_rel_to_plan_tree_with_context(rel, function_map)?;
+        let query_node =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+        (*query_node).type_ = pg_sys::NodeTag::T_Query;
+        (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
+        (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
+        (*query_node).canSetTag = true;
+        (*query_node).rtable = std::ptr::null_mut();
+        (*query_node).jointree =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
+        (*(*query_node).jointree).fromlist = std::ptr::null_mut();
+        (*(*query_node).jointree).quals = std::ptr::null_mut();
+        (*query_node).targetList = (*plan_tree).targetlist;
+
+        (*sublink).subselect = query_node as *mut pg_sys::Node;
+
+        Ok(sublink as *mut pg_sys::Node)
+    } else {
+        Err("Scalar subquery missing input relation".into())
+    }
+}
+
+/// Create a PostgreSQL EXISTS/UNIQUE subquery expression from Substrait SetPredicate
+unsafe fn create_set_predicate_expr(
+    set_predicate: &substrait::proto::expression::subquery::SetPredicate,
+    _function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::set_predicate::PredicateOp;
+
+    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+    (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
+    (*sublink).subLinkId = 0;
+    (*sublink).testexpr = std::ptr::null_mut();
+    (*sublink).operName = std::ptr::null_mut();
+
+    // Determine the sublink type based on the predicate operation
+    match PredicateOp::try_from(set_predicate.predicate_op) {
+        Ok(PredicateOp::Exists) => {
+            (*sublink).subLinkType = pg_sys::SubLinkType::EXISTS_SUBLINK;
+        }
+        Ok(PredicateOp::Unique) => {
+            (*sublink).subLinkType = pg_sys::SubLinkType::ROWCOMPARE_SUBLINK;
+        }
+        _ => return Err("Unsupported set predicate operation".into()),
+    }
+
+    // Get the subquery relation
+    let _tuples_relation = set_predicate
+        .tuples
+        .as_ref()
+        .ok_or_else(|| "SetPredicate missing tuples relation")?;
+
+    // Create a placeholder Query node for the subselect
+    let query = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+    (*query).type_ = pg_sys::NodeTag::T_Query;
+    (*query).commandType = pg_sys::CmdType::CMD_SELECT;
+    (*query).querySource = pg_sys::QuerySource::QSRC_PARSER;
+    (*query).canSetTag = true;
+    (*query).rtable = std::ptr::null_mut();
+    (*query).jointree =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
+    (*(*query).jointree).fromlist = std::ptr::null_mut();
+    (*(*query).jointree).quals = std::ptr::null_mut();
+    (*query).targetList = std::ptr::null_mut();
+
+    (*sublink).subselect = query as *mut pg_sys::Node;
+
+    Ok(sublink as *mut pg_sys::Node)
 }
 
 /// Convert expressions to target list with function context
@@ -1828,8 +1973,8 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 // PostgreSQL substring function OID is 883 (text_substr)
                 create_function_call_expr(
                     pg_sys::Oid::from(883),
-                    vec![string_arg, start_arg, length_arg],
                     pg_sys::TEXTOID,
+                    &[string_arg, start_arg, length_arg],
                 )
             } else {
                 Err(format!(
@@ -1977,7 +2122,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     return Err("Missing right argument in divide:fp64_fp64 function".into());
                 };
 
-                // Create a binary operation expression for division
+                // Create a binary operation expression for decimal division
                 // PostgreSQL float8 / operator OID is 595 (FLOAT8DIV_OP)
                 create_binary_op_expr(
                     left_arg,
@@ -1994,19 +2139,17 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "extract:req_date" => {
-            // Handle date extraction function (EXTRACT(YEAR FROM date))
+            // Handle extract function (e.g., extract year from date)
             if func.arguments.len() == 2 {
-                // First argument is the enum specifying what to extract (YEAR, MONTH, etc.)
-                let extract_field = if let Some(arg) = func.arguments.first() {
+                let part_arg = if let Some(arg) = func.arguments.first() {
                     if let Some(value) = &arg.arg_type {
                         match value {
-                            substrait::proto::function_argument::ArgType::Enum(enum_val) => {
-                                enum_val.as_str()
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
                             }
                             _ => {
                                 return Err(
-                                    "First argument of extract:req_date function must be enum"
-                                        .into(),
+                                    "Unsupported argument type in extract:req_date function".into(),
                                 )
                             }
                         }
@@ -2014,38 +2157,34 @@ pub unsafe fn create_scalar_function_expr_with_context(
                         return Err("Missing argument type in extract:req_date function".into());
                     }
                 } else {
-                    return Err(
-                        "Missing extract field argument in extract:req_date function".into(),
-                    );
+                    return Err("Missing part argument in extract:req_date function".into());
                 };
 
-                // Second argument is the date expression
-                let date_arg =
-                    if let Some(arg) = func.arguments.get(1) {
-                        if let Some(value) = &arg.arg_type {
-                            match value {
-                                substrait::proto::function_argument::ArgType::Value(expr) => {
-                                    convert_expression_to_postgres_with_context(expr, function_map)?
-                                }
-                                _ => return Err(
-                                    "Second argument of extract:req_date function must be value"
-                                        .into(),
-                                ),
+                let source_arg = if let Some(arg) = func.arguments.get(1) {
+                    if let Some(value) = &arg.arg_type {
+                        match value {
+                            substrait::proto::function_argument::ArgType::Value(expr) => {
+                                convert_expression_to_postgres_with_context(expr, function_map)?
                             }
-                        } else {
-                            return Err("Missing argument type in extract:req_date function".into());
+                            _ => {
+                                return Err(
+                                    "Unsupported argument type in extract:req_date function".into(),
+                                )
+                            }
                         }
                     } else {
-                        return Err("Missing date argument in extract:req_date function".into());
-                    };
+                        return Err("Missing argument type in extract:req_date function".into());
+                    }
+                } else {
+                    return Err("Missing source argument in extract:req_date function".into());
+                };
 
-                // Create a function call expression for EXTRACT(field FROM date)
-                // PostgreSQL date_part function OID is 1385 (date_part_text_date)
-                let field_literal = create_text_const(&extract_field.to_lowercase())?;
+                // Create a function call expression for extract
+                // PostgreSQL extract function OID is 884 (date_part)
                 create_function_call_expr(
-                    pg_sys::Oid::from(1385),
-                    vec![field_literal, date_arg],
-                    pg_sys::FLOAT8OID,
+                    pg_sys::Oid::from(884),
+                    pg_sys::FLOAT8OID, // extract returns float8
+                    &[part_arg, source_arg],
                 )
             } else {
                 Err(format!(
@@ -2056,199 +2195,9 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         _ => Err(format!(
-            "Unsupported scalar function: {} (function_reference={}, args_count={})",
-            function_name, function_reference, argument_count
+            "Unsupported scalar function: {} with {} arguments",
+            function_name, argument_count
         )
         .into()),
     }
-}
-
-/// Create a PostgreSQL subquery expression from Substrait subquery
-pub unsafe fn create_subquery_expr(
-    subquery: &substrait::proto::expression::Subquery,
-    function_map: &HashMap<u32, String>,
-) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    use substrait::proto::expression::subquery::SubqueryType;
-
-    match &subquery.subquery_type {
-        Some(SubqueryType::Scalar(scalar_subquery)) => {
-            // Handle scalar subqueries (returns single value)
-            // The scalar_subquery should contain the inner relation
-            create_scalar_subquery_expr(scalar_subquery, function_map)
-        }
-        Some(SubqueryType::InPredicate(_)) => {
-            Err("IN predicate subqueries are not yet implemented".into())
-        }
-        Some(SubqueryType::SetPredicate(set_predicate)) => {
-            // Handle EXISTS/UNIQUE predicates
-            create_set_predicate_expr(set_predicate, function_map)
-        }
-        Some(SubqueryType::SetComparison(_)) => {
-            Err("Set comparison subqueries are not yet implemented".into())
-        }
-        None => Err("Subquery missing subquery_type".into()),
-    }
-}
-
-/// Create a PostgreSQL scalar subquery expression
-unsafe fn create_scalar_subquery_expr(
-    scalar_subquery: &substrait::proto::expression::subquery::Scalar,
-    _function_map: &HashMap<u32, String>,
-) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // scalar_subquery contains the input relation of the scalar subquery
-    if scalar_subquery.input.is_none() {
-        return Err("Scalar subquery missing input relation".into());
-    }
-
-    // For now, we'll implement a simplified version that converts the subquery
-    // to a basic SubLink node. A full implementation would need to:
-    // 1. Convert the Substrait relation to a PostgreSQL Query/PlannedStmt
-    // 2. Handle correlation properly with PARAM_EXEC parameters
-    // 3. Set up proper subplan execution context
-
-    // Create a basic SubLink node for scalar subqueries
-    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
-    (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
-    (*sublink).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK; // Scalar subquery
-    (*sublink).subLinkId = 0; // Will be assigned during planning
-    (*sublink).testexpr = std::ptr::null_mut(); // No test expression for scalar subqueries
-    (*sublink).operName = std::ptr::null_mut(); // No operator for scalar subqueries
-
-    // For now, create a placeholder subselect
-    // In a real implementation, this would convert the Substrait relation to a Query
-    let placeholder_query = create_placeholder_query_for_subquery();
-    (*sublink).subselect = placeholder_query as *mut pg_sys::Node;
-
-    // Set location to unknown
-    (*sublink).location = -1;
-
-    Ok(sublink as *mut pg_sys::Expr)
-}
-
-/// Create a PostgreSQL EXISTS/UNIQUE subquery expression from Substrait SetPredicate
-unsafe fn create_set_predicate_expr(
-    set_predicate: &substrait::proto::expression::subquery::SetPredicate,
-    function_map: &HashMap<u32, String>,
-) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    use substrait::proto::expression::subquery::set_predicate::PredicateOp;
-
-    // Get the predicate operation type
-    let predicate_op = PredicateOp::try_from(set_predicate.predicate_op)
-        .map_err(|_| format!("Invalid predicate_op: {}", set_predicate.predicate_op))?;
-
-    // Determine the SubLink type based on the predicate operation
-    let sublink_type = match predicate_op {
-        PredicateOp::Exists => pg_sys::SubLinkType::EXISTS_SUBLINK,
-        PredicateOp::Unique => {
-            return Err("UNIQUE predicate subqueries are not yet implemented".into());
-        }
-        PredicateOp::Unspecified => {
-            return Err("Unspecified predicate operation not supported".into());
-        }
-    };
-
-    // Get the subquery relation
-    let tuples_relation = set_predicate
-        .tuples
-        .as_ref()
-        .ok_or("SetPredicate missing tuples relation")?;
-
-    // Convert the Substrait relation to a PostgreSQL Query node
-    // For now, create a placeholder query - this would need proper relation conversion
-    let query = create_placeholder_query_for_subquery();
-
-    // Create the SubLink node
-    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
-    (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
-    (*sublink).subLinkType = sublink_type;
-    (*sublink).subLinkId = 0; // Will be assigned during planning
-    (*sublink).testexpr = std::ptr::null_mut(); // No test expression for EXISTS/UNIQUE
-    (*sublink).operName = std::ptr::null_mut(); // No operator for EXISTS/UNIQUE
-    (*sublink).subselect = query as *mut pg_sys::Node;
-    (*sublink).location = -1; // Unknown location
-
-    eprintln!("DEBUG: Created {:?} SubLink for SetPredicate", predicate_op);
-
-    Ok(sublink as *mut pg_sys::Expr)
-}
-
-/// Create a placeholder query for subquery conversion
-/// This is a simplified implementation - in practice, we'd need to convert
-/// the full Substrait relation to a PostgreSQL Query node
-unsafe fn create_placeholder_query_for_subquery() -> *mut pg_sys::Query {
-    // Create a minimal Query node that represents the subquery
-    let query = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
-    (*query).type_ = pg_sys::NodeTag::T_Query;
-    (*query).commandType = pg_sys::CmdType::CMD_SELECT;
-    (*query).querySource = pg_sys::QuerySource::QSRC_ORIGINAL;
-    (*query).canSetTag = true;
-
-    // Initialize empty lists
-    (*query).rtable = std::ptr::null_mut();
-    (*query).jointree = std::ptr::null_mut();
-    (*query).targetList = std::ptr::null_mut();
-    (*query).returningList = std::ptr::null_mut();
-    (*query).groupClause = std::ptr::null_mut();
-    (*query).groupingSets = std::ptr::null_mut();
-    (*query).havingQual = std::ptr::null_mut();
-    (*query).windowClause = std::ptr::null_mut();
-    (*query).distinctClause = std::ptr::null_mut();
-    (*query).sortClause = std::ptr::null_mut();
-    (*query).limitOffset = std::ptr::null_mut();
-    (*query).limitCount = std::ptr::null_mut();
-    (*query).rowMarks = std::ptr::null_mut();
-    (*query).setOperations = std::ptr::null_mut();
-    (*query).constraintDeps = std::ptr::null_mut();
-    (*query).withCheckOptions = std::ptr::null_mut();
-
-    // Set up basic properties
-    (*query).hasAggs = false;
-    (*query).hasWindowFuncs = false;
-    (*query).hasTargetSRFs = false;
-    (*query).hasSubLinks = false;
-    (*query).hasDistinctOn = false;
-    (*query).hasRecursive = false;
-    (*query).hasModifyingCTE = false;
-    (*query).hasForUpdate = false;
-    (*query).hasRowSecurity = false;
-    (*query).isReturn = false;
-
-    query
-}
-
-/// Create a PostgreSQL function call expression
-pub unsafe fn create_function_call_expr(
-    func_oid: pg_sys::Oid,
-    args: Vec<*mut pg_sys::Expr>,
-    result_type: pg_sys::Oid,
-) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // Create a FuncExpr node
-    let func_expr =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::FuncExpr>()) as *mut pg_sys::FuncExpr;
-    (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
-    (*func_expr).funcid = func_oid;
-    (*func_expr).funcresulttype = result_type;
-    (*func_expr).funcretset = false;
-    (*func_expr).funcvariadic = false;
-    (*func_expr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
-    (*func_expr).funccollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*func_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
-
-    // Create args list
-    let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
-    for arg in args {
-        pg_args = pg_sys::lappend(pg_args, arg as *mut std::ffi::c_void);
-    }
-    (*func_expr).args = pg_args;
-
-    Ok(func_expr as *mut pg_sys::Expr)
-}
-
-/// Helper function to create C strings for PostgreSQL
-pub unsafe fn create_cstring(s: &str) -> *mut i8 {
-    let cstr = std::ffi::CString::new(s).unwrap();
-    let len = cstr.as_bytes_with_nul().len();
-    let ptr = pg_sys::palloc(len) as *mut i8;
-    std::ptr::copy_nonoverlapping(cstr.as_ptr(), ptr, len);
-    ptr
 }

@@ -1,3 +1,4 @@
+use crate::plan_translator::expressions::create_cstring;
 use pgrx::pg_sys::AttrNumber;
 use pgrx::{pg_sys, PgBox, PgList};
 use std::collections::HashMap;
@@ -260,10 +261,6 @@ fn resolve_agg_oid(
 
 unsafe fn palloc_array<T>(len: i32) -> *mut T {
     pg_sys::palloc((len as usize * std::mem::size_of::<T>()) as usize) as *mut T
-}
-
-fn create_cstring(s: &str) -> *mut std::os::raw::c_char {
-    std::ffi::CString::new(s).unwrap().into_raw()
 }
 
 /// Get column type information from input plan's target list
