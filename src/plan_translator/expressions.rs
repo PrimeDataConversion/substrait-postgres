@@ -6,6 +6,8 @@ use substrait::proto::Expression;
 use super::constants::get_expression_type_name;
 use super::relations::convert_rel_to_plan_tree_with_context;
 
+use pgrx::{AnyNumeric, IntoDatum};
+use std::str::FromStr;
 use substrait::proto::{r#type::Kind, Type};
 
 /// Create a CString from a Rust string
@@ -219,6 +221,62 @@ pub unsafe fn create_text_const(
     (*const_node).constisnull = false;
     (*const_node).constbyval = false;
 
+    eprintln!(
+        "DEBUG: create_text_const - const_node type: {:?}, consttype: {}",
+        (*const_node).xpr.type_,
+        (*const_node).consttype.to_u32()
+    );
+
+    Ok(const_node as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL numeric constant node
+pub unsafe fn create_numeric_const(
+    value_bytes: &[u8],
+    precision: i32,
+    scale: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let type_oid = pg_sys::NUMERICOID;
+
+    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+        return Err(format!("Invalid NUMERICOID: {}", type_oid).into());
+    }
+
+    // Convert the two's complement byte array to a BigInt
+    // The bytes are typically in big-endian order.
+    let big_int = num_bigint::BigInt::from_signed_bytes_be(value_bytes);
+
+    // Format the BigInt into a string, applying the scale
+    let mut numeric_string = big_int.to_string();
+
+    // Apply scaling
+    if scale > 0 {
+        let len = numeric_string.len() as i32;
+        if len <= scale {
+            // Pad with leading zeros if necessary, e.g., 123, scale 5 -> 0.00123
+            numeric_string =
+                "0.".to_string() + &"0".repeat((scale - len) as usize) + &numeric_string;
+        } else {
+            // Insert decimal point
+            numeric_string.insert((len - scale) as usize, '.');
+        }
+    } else if scale < 0 {
+        // If scale is negative, append zeros
+        numeric_string.push_str(&"0".repeat((-scale) as usize));
+    }
+
+    let numeric_value: AnyNumeric = AnyNumeric::from_str(&numeric_string)
+        .map_err(|e| format!("Failed to parse numeric value from string: {}", e))?;
+    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
+    (*const_node).consttype = type_oid;
+    (*const_node).consttypmod = -1; // Let PostgreSQL determine typmod from value
+    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*const_node).constlen = -1; // Variable length
+    (*const_node).constvalue = numeric_value.into_datum().unwrap();
+    (*const_node).constisnull = false;
+    (*const_node).constbyval = false; // Numeric is not pass-by-value
+
     Ok(const_node as *mut pg_sys::Expr)
 }
 
@@ -374,6 +432,14 @@ pub unsafe fn create_binary_op_expr(
     (*op_expr).opcollid = pg_sys::DEFAULT_COLLATION_OID;
     (*op_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
 
+    eprintln!(
+        "DEBUG: create_binary_op_expr - op_expr type: {:?}, opno: {}, opfuncid: {}, opresulttype: {}",
+        (*op_expr).xpr.type_,
+        (*op_expr).opno.to_u32(),
+        (*op_expr).opfuncid.to_u32(),
+        (*op_expr).opresulttype.to_u32()
+    );
+
     // Debug: Check for corruption right after creation
     if (*op_expr).xpr.type_ as u32 == 124 {
         eprintln!(
@@ -414,6 +480,13 @@ pub unsafe fn create_function_call_expr(
     (*func_expr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
     (*func_expr).funccollid = pg_sys::DEFAULT_COLLATION_OID;
     (*func_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
+
+    eprintln!(
+        "DEBUG: create_function_call_expr - func_expr type: {:?}, funcid: {}, funcresulttype: {}",
+        (*func_expr).xpr.type_,
+        (*func_expr).funcid.to_u32(),
+        (*func_expr).funcresulttype.to_u32()
+    );
 
     let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
     for arg in arguments {
@@ -458,10 +531,16 @@ pub unsafe fn convert_expression_to_postgres_with_context(
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::RexType;
 
+    eprintln!(
+        "DEBUG: convert_expression_to_postgres_with_context called with expr: {:?}",
+        expr
+    );
+
     match &expr.rex_type {
         Some(RexType::Literal(literal)) => {
             // Handle literal values
             if let Some(literal_type) = &literal.literal_type {
+                eprintln!("DEBUG: Literal type: {:?}", literal_type);
                 match literal_type {
                     substrait::proto::expression::literal::LiteralType::I32(val) => {
                         create_int4_const(*val)
@@ -477,6 +556,9 @@ pub unsafe fn convert_expression_to_postgres_with_context(
                     }
                     substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
                         create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Decimal(d) => {
+                        create_numeric_const(&d.value, d.precision, d.scale)
                     }
                     _ => Err("Unsupported literal type in filter condition".into()),
                 }
