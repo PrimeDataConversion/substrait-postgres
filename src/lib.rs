@@ -620,6 +620,86 @@ mod tests {
     use crate::plan_translator;
     use pgrx::prelude::*;
 
+    // Helper function to convert a numeric datum to a string for comparison
+    fn numeric_datum_to_string(datum: pg_sys::Datum) -> String {
+        let any_numeric = unsafe { AnyNumeric::from_datum(datum, false).unwrap() };
+        any_numeric.to_string()
+    }
+
+    #[pg_test]
+    fn test_create_numeric_const_positive_integer() {
+        let value_bytes = 12345i32.to_be_bytes();
+        let (precision, scale) = (10, 0);
+        let result = unsafe {
+            plan_translator::expressions::create_numeric_const(&value_bytes, precision, scale)
+                .unwrap()
+        };
+        let const_node = unsafe { &*(result as *mut pg_sys::Const) };
+        assert_eq!(numeric_datum_to_string(const_node.constvalue), "12345");
+    }
+
+    #[pg_test]
+    fn test_create_numeric_const_negative_integer() {
+        let value_bytes = (-54321i32).to_be_bytes();
+        let (precision, scale) = (10, 0);
+        let result = unsafe {
+            plan_translator::expressions::create_numeric_const(&value_bytes, precision, scale)
+                .unwrap()
+        };
+        let const_node = unsafe { &*(result as *mut pg_sys::Const) };
+        assert_eq!(numeric_datum_to_string(const_node.constvalue), "-54321");
+    }
+
+    #[pg_test]
+    fn test_create_numeric_const_positive_decimal() {
+        let value_bytes = 12345i32.to_be_bytes();
+        let (precision, scale) = (10, 2);
+        let result = unsafe {
+            plan_translator::expressions::create_numeric_const(&value_bytes, precision, scale)
+                .unwrap()
+        };
+        let const_node = unsafe { &*(result as *mut pg_sys::Const) };
+        assert_eq!(numeric_datum_to_string(const_node.constvalue), "123.45");
+    }
+
+    #[pg_test]
+    fn test_create_numeric_const_negative_decimal() {
+        let value_bytes = (-54321i32).to_be_bytes();
+        let (precision, scale) = (10, 3);
+        let result = unsafe {
+            plan_translator::expressions::create_numeric_const(&value_bytes, precision, scale)
+                .unwrap()
+        };
+        let const_node = unsafe { &*(result as *mut pg_sys::Const) };
+        assert_eq!(numeric_datum_to_string(const_node.constvalue), "-54.321");
+    }
+
+    #[pg_test]
+    fn test_create_numeric_const_zero() {
+        let value_bytes = 0i32.to_be_bytes();
+        let (precision, scale) = (1, 0);
+        let result = unsafe {
+            plan_translator::expressions::create_numeric_const(&value_bytes, precision, scale)
+                .unwrap()
+        };
+        let const_node = unsafe { &*(result as *mut pg_sys::Const) };
+        assert_eq!(numeric_datum_to_string(const_node.constvalue), "0");
+    }
+
+    #[pg_test]
+    fn test_create_numeric_const_decimal_less_than_one() {
+        let value_bytes = 123i32.to_be_bytes();
+        let (precision, scale) = (10, 5);
+        let result = unsafe {
+            plan_translator::expressions::create_numeric_const(&value_bytes, precision, scale)
+                .unwrap()
+        };
+        let const_node = unsafe { &*(result as *mut pg_sys::Const) };
+        assert_eq!(numeric_datum_to_string(const_node.constvalue), "0.00123");
+    }
+
+    use pgrx::prelude::*;
+
     /// Generate an AS clause string from ExecutionResult schema
     fn generate_as_clause(results: &crate::plan_translator::ExecutionResult) -> String {
         results

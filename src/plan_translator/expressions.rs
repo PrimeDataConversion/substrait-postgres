@@ -1,4 +1,5 @@
 use anyhow::Result;
+use pgrx::pg_schema;
 use pgrx::pg_sys;
 use std::collections::HashMap;
 use substrait::proto::Expression;
@@ -75,11 +76,6 @@ unsafe fn get_operator_function_oid(
     pg_sys::ReleaseSysCache(tuple);
 
     if function_oid == pg_sys::InvalidOid || function_oid.to_u32() == 0 {
-        eprintln!(
-            "DEBUG: Operator OID {} has invalid function OID: {}",
-            operator_oid.to_u32(),
-            function_oid.to_u32()
-        );
         return Err(format!("Operator OID {} has no associated function", operator_oid).into());
     }
 
@@ -122,10 +118,6 @@ pub unsafe fn create_int4_const(
     let type_oid = pg_sys::INT4OID;
 
     // Debug: Always print what INT4OID actually is
-    eprintln!("DEBUG: pg_sys::INT4OID = {}", type_oid.to_u32());
-    eprintln!("DEBUG: pg_sys::TEXTOID = {}", pg_sys::TEXTOID.to_u32());
-    eprintln!("DEBUG: pg_sys::BOOLOID = {}", pg_sys::BOOLOID.to_u32());
-    eprintln!("DEBUG: pg_sys::FLOAT8OID = {}", pg_sys::FLOAT8OID.to_u32());
 
     // Validate that the OID is reasonable (should not be 0 or InvalidOid)
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
@@ -142,7 +134,6 @@ pub unsafe fn create_int4_const(
 
     // Debug: Check what T_Const actually evaluates to
     let t_const_value = pg_sys::NodeTag::T_Const as u32;
-    eprintln!("DEBUG: pg_sys::NodeTag::T_Const value = {}", t_const_value);
 
     if t_const_value == 124 {
         eprintln!("ERROR: T_Const NodeTag itself is 124! This is wrong - T_Const should not be pg_type OID");
@@ -221,12 +212,6 @@ pub unsafe fn create_text_const(
     (*const_node).constisnull = false;
     (*const_node).constbyval = false;
 
-    eprintln!(
-        "DEBUG: create_text_const - const_node type: {:?}, consttype: {}",
-        (*const_node).xpr.type_,
-        (*const_node).consttype.to_u32()
-    );
-
     Ok(const_node as *mut pg_sys::Expr)
 }
 
@@ -236,6 +221,7 @@ pub unsafe fn create_numeric_const(
     precision: i32,
     scale: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // TODO: Start using precision here too.
     let type_oid = pg_sys::NUMERICOID;
 
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
@@ -2029,7 +2015,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     return Err("Missing start argument in substring:str_i32_i32 function".into());
                 };
 
-                let length_arg = if let Some(arg) = func.arguments.get(2) {
+                let count_arg = if let Some(arg) = func.arguments.get(2) {
                     if let Some(value) = &arg.arg_type {
                         match value {
                             substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -2048,15 +2034,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
                         );
                     }
                 } else {
-                    return Err("Missing length argument in substring:str_i32_i32 function".into());
+                    return Err("Missing count argument in substring:str_i32_i32 function".into());
                 };
 
                 // Create a function call expression for substring
-                // PostgreSQL substring function OID is 883 (text_substr)
+                // PostgreSQL substring function OID is 29 (SUBSTRING_TEXT_OP)
                 create_function_call_expr(
-                    pg_sys::Oid::from(883),
+                    pg_sys::Oid::from(29),
                     pg_sys::TEXTOID,
-                    &[string_arg, start_arg, length_arg],
+                    &[string_arg, start_arg, count_arg],
                 )
             } else {
                 Err(format!(
