@@ -1,4 +1,4 @@
-# Claude Development Notes
+# Gemini Development Notes
 
 ## Key Architecture Decisions
 
@@ -10,9 +10,8 @@
 ### Things to do
 1. Run tests before declaring partial victory.
 2. Run precommit before declaring victory over a task.
-3. Don't end lines with whitespace.
-4. Always include a linefeed at the end of a file.
-5. End sentence comments with a period.
+3. Always include a linefeed at the end of a file.
+4. End sentence comments with a period.
 
 ## Common Mistakes to Avoid
 1. **DO NOT** create wrapper functions with fixed return types

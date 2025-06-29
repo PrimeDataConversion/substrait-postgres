@@ -5,6 +5,107 @@ use substrait::proto::Expression;
 
 use super::constants::get_expression_type_name;
 
+use substrait::proto::{r#type::Kind, Type};
+
+/// Get the PostgreSQL type OID for a given Substrait type
+fn get_pg_type_oid(
+    substrait_type: &Type,
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(kind) = &substrait_type.kind {
+        match kind {
+            Kind::Bool(_) => Ok(pg_sys::BOOLOID),
+            Kind::I8(_) | Kind::I16(_) | Kind::I32(_) => Ok(pg_sys::INT4OID),
+            Kind::I64(_) => Ok(pg_sys::INT8OID),
+            Kind::Fp32(_) => Ok(pg_sys::FLOAT4OID),
+            Kind::Fp64(_) => Ok(pg_sys::FLOAT8OID),
+            Kind::String(_) | Kind::Varchar(_) | Kind::FixedChar(_) => Ok(pg_sys::TEXTOID),
+            Kind::Date(_) => Ok(pg_sys::DATEOID),
+            Kind::Decimal(d) => {
+                // For now, map all decimals to NUMERIC
+                // TODO: Handle precision and scale
+                Ok(pg_sys::NUMERICOID)
+            }
+            _ => Err("Unsupported Substrait type for casting".into()),
+        }
+    } else {
+        Err("Substrait type missing kind".into())
+    }
+}
+
+/// Look up the function OID for a given operator OID
+unsafe fn get_operator_function_oid(
+    operator_oid: pg_sys::Oid,
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: Looking up function OID for operator OID: {}",
+        operator_oid.to_u32()
+    );
+
+    // Use PostgreSQL's system catalog to get the function OID for this operator
+    let tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::OPEROID as i32,
+        pg_sys::Datum::from(operator_oid.to_u32()),
+    );
+
+    if tuple.is_null() {
+        eprintln!(
+            "DEBUG: Operator OID {} not found in system catalog",
+            operator_oid.to_u32()
+        );
+        return Err(format!("Operator OID {} not found in system catalog", operator_oid).into());
+    }
+
+    let operator_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_operator;
+    let function_oid = (*operator_form).oprcode;
+
+    eprintln!(
+        "DEBUG: Operator OID {} maps to function OID: {}",
+        operator_oid.to_u32(),
+        function_oid.to_u32()
+    );
+
+    pg_sys::ReleaseSysCache(tuple);
+
+    if function_oid == pg_sys::InvalidOid || function_oid.to_u32() == 0 {
+        eprintln!(
+            "DEBUG: Operator OID {} has invalid function OID: {}",
+            operator_oid.to_u32(),
+            function_oid.to_u32()
+        );
+        return Err(format!("Operator OID {} has no associated function", operator_oid).into());
+    }
+
+    Ok(function_oid)
+}
+
+// PostgreSQL's date epoch is 2000-01-01, while Substrait's is 1970-01-01.
+// The difference is 10957 days.
+const PG_DATE_EPOCH_OFFSET: i32 = 10957;
+
+/// Create a PostgreSQL date constant node
+pub unsafe fn create_date_const(
+    value: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let type_oid = pg_sys::DATEOID;
+
+    // Validate that the OID is reasonable
+    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+        return Err(format!("Invalid DATEOID: {}", type_oid).into());
+    }
+
+    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
+    (*const_node).consttype = type_oid;
+    (*const_node).consttypmod = -1;
+    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*const_node).constlen = 4;
+    (*const_node).constvalue = pg_sys::Datum::from(value - PG_DATE_EPOCH_OFFSET);
+    (*const_node).constisnull = false;
+    (*const_node).constbyval = true;
+
+    Ok(const_node as *mut pg_sys::Expr)
+}
+
 /// Create a PostgreSQL int4 constant node
 pub unsafe fn create_int4_const(
     value: i32,
@@ -12,16 +113,48 @@ pub unsafe fn create_int4_const(
     // Use the PostgreSQL built-in constant, but validate it first
     let type_oid = pg_sys::INT4OID;
 
+    // Debug: Always print what INT4OID actually is
+    eprintln!("DEBUG: pg_sys::INT4OID = {}", type_oid.to_u32());
+    eprintln!("DEBUG: pg_sys::TEXTOID = {}", pg_sys::TEXTOID.to_u32());
+    eprintln!("DEBUG: pg_sys::BOOLOID = {}", pg_sys::BOOLOID.to_u32());
+    eprintln!("DEBUG: pg_sys::FLOAT8OID = {}", pg_sys::FLOAT8OID.to_u32());
+
     // Validate that the OID is reasonable (should not be 0 or InvalidOid)
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
         return Err(format!("Invalid INT4OID: {}", type_oid).into());
     }
 
+    // Check if type_oid is suspiciously 124 (pg_type OID)
+    if type_oid.to_u32() == 124 {
+        eprintln!("ERROR: INT4OID is returning pg_type OID 124 instead of actual int4 type!");
+        return Err("INT4OID corrupted to pg_type OID (124)".into());
+    }
+
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+
+    // Debug: Check what T_Const actually evaluates to
+    let t_const_value = pg_sys::NodeTag::T_Const as u32;
+    eprintln!("DEBUG: pg_sys::NodeTag::T_Const value = {}", t_const_value);
+
+    if t_const_value == 124 {
+        eprintln!("ERROR: T_Const NodeTag itself is 124! This is wrong - T_Const should not be pg_type OID");
+        return Err("T_Const NodeTag has wrong value 124".into());
+    }
+
     (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
     (*const_node).consttype = type_oid;
+
+    // Debug: Check for NodeTag corruption right after setting it
+    if (*const_node).xpr.type_ as u32 == 124 {
+        eprintln!(
+            "ERROR: Int4Const node type corrupted to 124 after setting! consttype = {}",
+            type_oid.to_u32()
+        );
+        return Err("Int4Const node type corrupted to pg_type OID (124)".into());
+    }
+
     (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::InvalidOid;
+    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
     (*const_node).constlen = 4;
     (*const_node).constvalue = pg_sys::Datum::from(value);
     (*const_node).constisnull = false;
@@ -46,7 +179,7 @@ pub unsafe fn create_int8_const(
     (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
     (*const_node).consttype = type_oid;
     (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::InvalidOid;
+    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
     (*const_node).constlen = 8;
     (*const_node).constvalue = pg_sys::Datum::from(value);
     (*const_node).constisnull = false;
@@ -83,6 +216,47 @@ pub unsafe fn create_text_const(
     Ok(const_node as *mut pg_sys::Expr)
 }
 
+/// Resolve actual column type information from table OID and attribute number
+unsafe fn resolve_column_type_info(
+    table_oid: pg_sys::Oid,
+    attnum: pg_sys::AttrNumber,
+) -> Result<(pg_sys::Oid, i32, pg_sys::Oid), Box<dyn std::error::Error + Send + Sync>> {
+    // Open the relation to get schema information
+    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
+    if relation.is_null() {
+        return Err(format!("Could not open relation with OID {}", table_oid).into());
+    }
+
+    let tuple_desc = (*relation).rd_att;
+
+    // Validate attribute number
+    if attnum <= 0 || (attnum as i32) > (*tuple_desc).natts {
+        pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+        return Err(format!(
+            "Invalid attribute number {} for relation {}",
+            attnum, table_oid
+        )
+        .into());
+    }
+
+    // Get the attribute (1-based indexing, so subtract 1)
+    let attr = (*tuple_desc).attrs.as_ptr().offset((attnum - 1) as isize);
+
+    if (*attr).attisdropped {
+        pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+        return Err(format!("Attribute {} is dropped", attnum).into());
+    }
+
+    // Extract the actual type information
+    let vartype = (*attr).atttypid;
+    let vartypmod = (*attr).atttypmod;
+    let varcollid = (*attr).attcollation;
+
+    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    Ok((vartype, vartypmod, varcollid))
+}
+
 /// Create a PostgreSQL Var node for column references
 /// NOTE: This creates a Var with UNKNOWNOID - use create_var_node_with_type for proper typing
 pub unsafe fn create_var_node(
@@ -92,9 +266,39 @@ pub unsafe fn create_var_node(
     (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
     (*var_node).varno = 1; // Single table reference for now
     (*var_node).varattno = attr_number as pg_sys::AttrNumber;
-    (*var_node).vartype = pg_sys::UNKNOWNOID; // Will be resolved during planning
+    (*var_node).vartype = pg_sys::TEXTOID; // Use TEXT as default, will be resolved during planning
     (*var_node).vartypmod = -1;
-    (*var_node).varcollid = pg_sys::InvalidOid;
+    (*var_node).varcollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*var_node).varlevelsup = 0;
+
+    // Debug: Check for corruption right after creation
+    if (*var_node).xpr.type_ as u32 == 124 {
+        eprintln!(
+            "ERROR: Var node corruption detected at creation! type_ = 124, vartype = {}",
+            (*var_node).vartype.to_u32()
+        );
+        return Err("Var node type corrupted to pg_type OID (124)".into());
+    }
+
+    Ok(var_node as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL Var node with proper type resolution from table schema
+pub unsafe fn create_var_node_with_table_schema(
+    attr_number: i32,
+    table_oid: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+    (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
+    (*var_node).varno = 1;
+    (*var_node).varattno = attr_number as pg_sys::AttrNumber;
+
+    // Resolve actual column type instead of hardcoding
+    let (vartype, vartypmod, varcollid) =
+        resolve_column_type_info(table_oid, attr_number as pg_sys::AttrNumber)?;
+    (*var_node).vartype = vartype;
+    (*var_node).vartypmod = vartypmod;
+    (*var_node).varcollid = varcollid;
     (*var_node).varlevelsup = 0;
 
     Ok(var_node as *mut pg_sys::Expr)
@@ -119,6 +323,35 @@ pub unsafe fn create_var_node_with_type(
     Ok(var_node as *mut pg_sys::Expr)
 }
 
+/// Create a PostgreSQL type cast expression
+/// Create a PostgreSQL type cast expression
+pub unsafe fn create_cast_expr(
+    arg: *mut pg_sys::Expr,
+    target_type_oid: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let cast_expr = pg_sys::coerce_type(
+        std::ptr::null_mut(),                         // ParseState *pstate
+        arg as *mut pg_sys::Node,                     // Node *node
+        pg_sys::exprType(arg as *const pg_sys::Node), // Oid inputTypeId
+        target_type_oid,                              // Oid targetTypeId
+        -1,                                           // int32 targetTypeMod
+        pg_sys::CoercionContext::COERCION_EXPLICIT,   // CoercionContext ccontext
+        pg_sys::CoercionPathType::COERCION_PATH_FUNC, // CoercionPathType ptype
+        -1,                                           // int location
+    );
+
+    if cast_expr.is_null() {
+        return Err(format!(
+            "Failed to coerce type from OID {} to OID {}",
+            pg_sys::exprType(arg as *const pg_sys::Node),
+            target_type_oid
+        )
+        .into());
+    }
+
+    Ok(cast_expr as *mut pg_sys::Expr)
+}
+
 /// Create a PostgreSQL binary operation expression
 pub unsafe fn create_binary_op_expr(
     left_arg: *mut pg_sys::Expr,
@@ -129,17 +362,34 @@ pub unsafe fn create_binary_op_expr(
     let op_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::OpExpr>()) as *mut pg_sys::OpExpr;
     (*op_expr).xpr.type_ = pg_sys::NodeTag::T_OpExpr;
     (*op_expr).opno = operator_oid;
-    (*op_expr).opfuncid = pg_sys::InvalidOid; // Will be resolved during planning
+    // Look up the function OID for this operator
+    (*op_expr).opfuncid = get_operator_function_oid(operator_oid)?;
     (*op_expr).opresulttype = result_type;
     (*op_expr).opretset = false;
-    (*op_expr).opcollid = pg_sys::InvalidOid;
-    (*op_expr).inputcollid = pg_sys::InvalidOid;
+    (*op_expr).opcollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*op_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
+
+    // Debug: Check for corruption right after creation
+    if (*op_expr).xpr.type_ as u32 == 124 {
+        eprintln!(
+            "ERROR: OpExpr node corruption detected! type_ = 124, opno = {}, opresulttype = {}",
+            operator_oid.to_u32(),
+            result_type.to_u32()
+        );
+        return Err("OpExpr node type corrupted to pg_type OID (124)".into());
+    }
 
     // Create argument list
     let mut args: *mut pg_sys::List = std::ptr::null_mut();
     args = pg_sys::lappend(args, left_arg as *mut std::ffi::c_void);
     args = pg_sys::lappend(args, right_arg as *mut std::ffi::c_void);
     (*op_expr).args = args;
+
+    // Final corruption check
+    if (*op_expr).xpr.type_ as u32 == 124 {
+        eprintln!("ERROR: OpExpr node corrupted after args setup! type_ = 124");
+        return Err("OpExpr node type corrupted after argument setup".into());
+    }
 
     Ok(op_expr as *mut pg_sys::Expr)
 }
@@ -193,8 +443,7 @@ pub unsafe fn convert_expression_to_postgres_with_context(
                         create_text_const(val)
                     }
                     substrait::proto::expression::literal::LiteralType::Date(val) => {
-                        // For now, treat date as int32 (days since epoch)
-                        create_int4_const(*val)
+                        create_date_const(*val)
                     }
                     substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
                         create_text_const(val)
@@ -218,9 +467,12 @@ pub unsafe fn convert_expression_to_postgres_with_context(
                 return Err("Cast expression missing input".into());
             };
 
-            // For now, just return the input expression without casting
-            // TODO: Implement proper type casting
-            Ok(input_expr)
+            if let Some(cast_type) = &cast.r#type {
+                let target_oid = get_pg_type_oid(cast_type)?;
+                create_cast_expr(input_expr, target_oid)
+            } else {
+                Err("Cast expression missing type".into())
+            }
         }
         Some(RexType::Subquery(subquery)) => {
             // Handle subquery expressions
@@ -274,6 +526,9 @@ unsafe fn convert_expression_to_target_entry_with_context(
                     }
                     substrait::proto::expression::literal::LiteralType::String(val) => {
                         create_text_const(val)?
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        create_date_const(*val)?
                     }
                     _ => {
                         return Err(
@@ -1824,8 +2079,9 @@ pub unsafe fn create_subquery_expr(
         Some(SubqueryType::InPredicate(_)) => {
             Err("IN predicate subqueries are not yet implemented".into())
         }
-        Some(SubqueryType::SetPredicate(_)) => {
-            Err("Set predicate subqueries are not yet implemented".into())
+        Some(SubqueryType::SetPredicate(set_predicate)) => {
+            // Handle EXISTS/UNIQUE predicates
+            create_set_predicate_expr(set_predicate, function_map)
         }
         Some(SubqueryType::SetComparison(_)) => {
             Err("Set comparison subqueries are not yet implemented".into())
@@ -1865,6 +2121,53 @@ unsafe fn create_scalar_subquery_expr(
 
     // Set location to unknown
     (*sublink).location = -1;
+
+    Ok(sublink as *mut pg_sys::Expr)
+}
+
+/// Create a PostgreSQL EXISTS/UNIQUE subquery expression from Substrait SetPredicate
+unsafe fn create_set_predicate_expr(
+    set_predicate: &substrait::proto::expression::subquery::SetPredicate,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::set_predicate::PredicateOp;
+
+    // Get the predicate operation type
+    let predicate_op = PredicateOp::try_from(set_predicate.predicate_op)
+        .map_err(|_| format!("Invalid predicate_op: {}", set_predicate.predicate_op))?;
+
+    // Determine the SubLink type based on the predicate operation
+    let sublink_type = match predicate_op {
+        PredicateOp::Exists => pg_sys::SubLinkType::EXISTS_SUBLINK,
+        PredicateOp::Unique => {
+            return Err("UNIQUE predicate subqueries are not yet implemented".into());
+        }
+        PredicateOp::Unspecified => {
+            return Err("Unspecified predicate operation not supported".into());
+        }
+    };
+
+    // Get the subquery relation
+    let tuples_relation = set_predicate
+        .tuples
+        .as_ref()
+        .ok_or("SetPredicate missing tuples relation")?;
+
+    // Convert the Substrait relation to a PostgreSQL Query node
+    // For now, create a placeholder query - this would need proper relation conversion
+    let query = create_placeholder_query_for_subquery();
+
+    // Create the SubLink node
+    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+    (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
+    (*sublink).subLinkType = sublink_type;
+    (*sublink).subLinkId = 0; // Will be assigned during planning
+    (*sublink).testexpr = std::ptr::null_mut(); // No test expression for EXISTS/UNIQUE
+    (*sublink).operName = std::ptr::null_mut(); // No operator for EXISTS/UNIQUE
+    (*sublink).subselect = query as *mut pg_sys::Node;
+    (*sublink).location = -1; // Unknown location
+
+    eprintln!("DEBUG: Created {:?} SubLink for SetPredicate", predicate_op);
 
     Ok(sublink as *mut pg_sys::Expr)
 }
@@ -1928,8 +2231,8 @@ pub unsafe fn create_function_call_expr(
     (*func_expr).funcretset = false;
     (*func_expr).funcvariadic = false;
     (*func_expr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
-    (*func_expr).funccollid = pg_sys::InvalidOid;
-    (*func_expr).inputcollid = pg_sys::InvalidOid;
+    (*func_expr).funccollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*func_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
 
     // Create args list
     let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();

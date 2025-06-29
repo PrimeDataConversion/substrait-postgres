@@ -226,9 +226,9 @@ unsafe fn extract_agg_args(args: &[substrait::proto::FunctionArgument]) -> *mut 
                 var.xpr.type_ = pg_sys::NodeTag::T_Var; // CRITICAL: Set the node type!
                 var.varno = 1;
                 var.varattno = (field.field + 1) as pg_sys::AttrNumber;
-                var.vartype = pg_sys::UNKNOWNOID;
+                var.vartype = pg_sys::TEXTOID; // Use TEXT as default
                 var.vartypmod = -1;
-                var.varcollid = pg_sys::InvalidOid;
+                var.varcollid = pg_sys::DEFAULT_COLLATION_OID;
                 list.push(var.into_pg());
             }
         }
@@ -274,7 +274,7 @@ unsafe fn get_column_type_from_input_plan(index: i32) -> (pg_sys::Oid, i32, pg_s
     match index {
         0 => (pg_sys::BPCHAROID, 5, pg_sys::DEFAULT_COLLATION_OID), // l_returnflag CHAR(1)
         1 => (pg_sys::BPCHAROID, 5, pg_sys::DEFAULT_COLLATION_OID), // l_linestatus CHAR(1)
-        _ => (pg_sys::INT8OID, -1, pg_sys::InvalidOid),             // Default to bigint
+        _ => (pg_sys::INT8OID, -1, pg_sys::DEFAULT_COLLATION_OID),  // Default to bigint
     }
 }
 
@@ -304,7 +304,38 @@ unsafe fn resolve_agg_return_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
 
 /// Look up function return type from pg_proc system catalog
 unsafe fn lookup_function_return_type(func_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
-    // For now, return a safe default instead of complex SPI lookup
-    // TODO: Implement proper pg_proc lookup if needed
-    Some(pg_sys::NUMERICOID)
+    // Use PostgreSQL's system catalog to get the return type for this function
+    let tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::PROCOID as i32,
+        pg_sys::Datum::from(func_oid.to_u32()),
+    );
+
+    if tuple.is_null() {
+        eprintln!(
+            "DEBUG: Function OID {} not found in pg_proc catalog",
+            func_oid.to_u32()
+        );
+        return Some(pg_sys::NUMERICOID); // Safe default
+    }
+
+    let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
+    let return_type = (*proc_form).prorettype;
+
+    eprintln!(
+        "DEBUG: Function OID {} has return type: {}",
+        func_oid.to_u32(),
+        return_type.to_u32()
+    );
+
+    pg_sys::ReleaseSysCache(tuple);
+
+    if return_type == pg_sys::InvalidOid || return_type.to_u32() == 0 {
+        eprintln!(
+            "DEBUG: Function OID {} has invalid return type, using NUMERICOID default",
+            func_oid.to_u32()
+        );
+        return Some(pg_sys::NUMERICOID);
+    }
+
+    Some(return_type)
 }

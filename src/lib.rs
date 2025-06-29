@@ -18,6 +18,48 @@ pub extern "C" fn _PG_init() {
     pgrx::info!("Substrait PostgreSQL extension loaded");
 }
 
+/// Debug function to check OID values and test simple expression creation
+#[pg_extern]
+fn debug_oid_values() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    unsafe {
+        let mut result = String::new();
+
+        result.push_str(&format!("INT4OID = {}, ", pg_sys::INT4OID.to_u32()));
+        result.push_str(&format!("TEXTOID = {}, ", pg_sys::TEXTOID.to_u32()));
+        result.push_str(&format!("BOOLOID = {}, ", pg_sys::BOOLOID.to_u32()));
+        result.push_str(&format!("FLOAT8OID = {}, ", pg_sys::FLOAT8OID.to_u32()));
+        result.push_str(&format!("T_Const = {}, ", pg_sys::NodeTag::T_Const as u32));
+        result.push_str(&format!("T_Var = {}, ", pg_sys::NodeTag::T_Var as u32));
+        result.push_str(&format!("T_OpExpr = {}", pg_sys::NodeTag::T_OpExpr as u32));
+
+        // Check if any of our common OIDs is 124
+        if pg_sys::INT4OID.to_u32() == 124 {
+            return Ok("ERROR: INT4OID is 124!".to_string());
+        }
+        if pg_sys::TEXTOID.to_u32() == 124 {
+            return Ok("ERROR: TEXTOID is 124!".to_string());
+        }
+        if pg_sys::NodeTag::T_Const as u32 == 124 {
+            return Ok("ERROR: T_Const NodeTag is 124!".to_string());
+        }
+
+        // Test simple expression creation
+        use crate::plan_translator::expressions::create_int4_const;
+        let test_const = create_int4_const(42)?;
+        let const_node = test_const as *const pg_sys::Const;
+        result.push_str(&format!(
+            ", Created const type_ = {}",
+            (*const_node).xpr.type_ as u32
+        ));
+
+        if (*const_node).xpr.type_ as u32 == 124 {
+            return Ok("ERROR: Simple const creation corrupted to 124!".to_string());
+        }
+
+        Ok(result)
+    }
+}
+
 /// Debug function to test PostgreSQL plan vs our execution wrapper
 #[pg_extern]
 fn debug_postgresql_execution() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

@@ -330,6 +330,9 @@ pub unsafe fn execute_postgres_plan(
     // Execute the plan using PostgreSQL's native executor
     eprintln!("DEBUG: Executing plan using PostgreSQL's native executor");
 
+    // Validate plan tree before execution
+    validate_plan_tree_node_types(plan_tree);
+
     let (tupdesc, tuplestore) =
         execute_plan_directly_from_ptr(plan_tree, column_names, range_table).map_err(|e| {
             eprintln!("DEBUG: Plan execution failed: {}", e);
@@ -665,4 +668,112 @@ unsafe fn collect_seqscan_nodes_for_range_table_raw(
     }
 
     Ok(())
+}
+
+/// Recursively validate all node types in a plan tree to catch corruption early
+unsafe fn validate_plan_tree_node_types(plan: *mut pg_sys::Plan) {
+    if plan.is_null() {
+        return;
+    }
+
+    let node_type = (*plan).type_;
+    eprintln!(
+        "DEBUG: Validating plan node type: {:?} (value: {})",
+        node_type, node_type as i32
+    );
+
+    // Check if this is a valid plan node type
+    match node_type {
+        pg_sys::NodeTag::T_SeqScan
+        | pg_sys::NodeTag::T_Sort
+        | pg_sys::NodeTag::T_Limit
+        | pg_sys::NodeTag::T_Result
+        | pg_sys::NodeTag::T_NestLoop
+        | pg_sys::NodeTag::T_Agg
+        | pg_sys::NodeTag::T_ValuesScan => {
+            // Valid plan node type
+        }
+        _ => {
+            eprintln!(
+                "ERROR: Invalid plan node type detected: {:?} (value: {})",
+                node_type, node_type as i32
+            );
+            if node_type as i32 == 124 {
+                eprintln!("ERROR: Found the problematic node type 124 in plan tree!");
+            }
+        }
+    }
+
+    // Recursively validate child nodes
+    if !(*plan).lefttree.is_null() {
+        validate_plan_tree_node_types((*plan).lefttree);
+    }
+    if !(*plan).righttree.is_null() {
+        validate_plan_tree_node_types((*plan).righttree);
+    }
+
+    // Validate target list expressions if present
+    if !(*plan).targetlist.is_null() {
+        validate_expression_list_node_types((*plan).targetlist);
+    }
+
+    // Validate qual expressions if present
+    if !(*plan).qual.is_null() {
+        validate_expression_list_node_types((*plan).qual);
+    }
+}
+
+/// Validate node types in an expression list
+unsafe fn validate_expression_list_node_types(list: *mut pg_sys::List) {
+    if list.is_null() {
+        return;
+    }
+
+    // Use PostgreSQL's list iteration for PostgreSQL 15+
+    let length = (*list).length;
+    for i in 0..length {
+        let element = (*list).elements.offset(i as isize);
+        if !element.is_null() {
+            let node = (*element).ptr_value as *mut pg_sys::Node;
+            if !node.is_null() {
+                validate_expression_node_types(node);
+            }
+        }
+    }
+}
+
+/// Validate node types in expression nodes
+unsafe fn validate_expression_node_types(node: *mut pg_sys::Node) {
+    if node.is_null() {
+        return;
+    }
+
+    let node_type = (*node).type_;
+    eprintln!(
+        "DEBUG: Validating expression node type: {:?} (value: {})",
+        node_type, node_type as i32
+    );
+
+    match node_type {
+        pg_sys::NodeTag::T_TargetEntry
+        | pg_sys::NodeTag::T_Var
+        | pg_sys::NodeTag::T_Const
+        | pg_sys::NodeTag::T_OpExpr
+        | pg_sys::NodeTag::T_FuncExpr
+        | pg_sys::NodeTag::T_BoolExpr
+        | pg_sys::NodeTag::T_SubLink
+        | pg_sys::NodeTag::T_Query
+        | pg_sys::NodeTag::T_Aggref => {
+            // Valid expression node type
+        }
+        _ => {
+            eprintln!(
+                "ERROR: Invalid expression node type detected: {:?} (value: {})",
+                node_type, node_type as i32
+            );
+            if node_type as i32 == 124 {
+                eprintln!("ERROR: Found the problematic node type 124 in expression!");
+            }
+        }
+    }
 }
