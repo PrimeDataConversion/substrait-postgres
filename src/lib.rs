@@ -1,4 +1,7 @@
-use pgrx::{pg_extern, pg_guard, pg_schema, pg_sys, Spi};
+use pgrx::{pg_extern, pg_guard, pg_sys, Spi};
+
+#[cfg(any(test, feature = "pg_test"))]
+use pgrx::pg_schema;
 use prost::Message;
 use substrait::proto::Plan;
 
@@ -6,7 +9,6 @@ mod executor;
 mod plan_translator;
 
 use executor::execute_postgres_plan;
-use plan_translator::translate_substrait_plan;
 
 pgrx::pg_module_magic!();
 
@@ -316,52 +318,6 @@ pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
 pub extern "C" fn pg_finfo_from_substrait_json_wrapper() -> &'static pg_sys::Pg_finfo_record {
     const V1_API: pg_sys::Pg_finfo_record = pg_sys::Pg_finfo_record { api_version: 1 };
     &V1_API
-}
-
-/// Helper function to generate schema information for dynamic functions
-#[allow(dead_code)]
-fn extract_plan_schema(plan: &Plan) -> String {
-    // Extract schema information from a Substrait plan
-    // Use separate translation and execution
-    match plan_translator::translate_substrait_plan_with_function_map(&plan, function_map) {
-        Ok((postgres_plan, column_names, range_table)) => {
-            match unsafe { execute_postgres_plan(postgres_plan, column_names, range_table) } {
-                Ok(result_data) => {
-                    let schema = result_data
-                        .columns
-                        .iter()
-                        .map(|col| {
-                            serde_json::json!({
-                                "name": col.name,
-                                "type": match col.type_oid {
-                                    pg_sys::INT4OID => "integer",
-                                    pg_sys::INT8OID => "bigint",
-                                    pg_sys::TEXTOID => "text",
-                                    _ => "unknown"
-                                },
-                                "postgres_type": match col.type_oid {
-                                    pg_sys::INT4OID => "int4",
-                                    pg_sys::INT8OID => "int8",
-                                    pg_sys::TEXTOID => "text",
-                                    _ => "text"
-                                }
-                            })
-                        })
-                        .collect::<Vec<_>>();
-
-                    serde_json::to_string(&schema).unwrap_or_else(|_| "[]".to_string())
-                }
-                Err(e) => {
-                    pgrx::warning!("Failed to execute plan: {}", e);
-                    serde_json::json!([{"error": format!("Execution failed: {}", e)}]).to_string()
-                }
-            }
-        }
-        Err(e) => {
-            pgrx::warning!("Failed to translate plan: {}", e);
-            serde_json::json!([{"error": format!("Translation failed: {}", e)}]).to_string()
-        }
-    }
 }
 
 #[pg_extern(
@@ -1105,26 +1061,23 @@ mod tests {
                     function_map.len()
                 );
 
-                let as_clause = match plan_translator::translate_substrait_plan_with_function_map(
-                    &plan,
-                    function_map,
-                ) {
-                    Ok((postgres_plan, column_names, range_table)) => {
-                        match unsafe {
-                            execute_postgres_plan(postgres_plan, column_names, range_table)
-                        } {
-                            Ok(result_data) => {
-                                let clause = generate_as_clause(&result_data);
-                                pgrx::info!("{} - Generated AS clause: {}", $file_name, clause);
-                                clause
-                            }
-                            Err(e) => {
-                                panic!("{} - Execution failed: {}", $file_name, e);
-                            }
-                        }
+                let (postgres_plan, column_names, range_table) =
+                    plan_translator::translate_substrait_plan_with_function_map(
+                        &plan,
+                        function_map,
+                    )
+                    .expect("Translation failed");
+
+                let as_clause = match unsafe {
+                    execute_postgres_plan(postgres_plan, column_names, range_table)
+                } {
+                    Ok(result_data) => {
+                        let clause = generate_as_clause(&result_data);
+                        pgrx::info!("{} - Generated AS clause: {}", $file_name, clause);
+                        clause
                     }
                     Err(e) => {
-                        panic!("{} - Translation failed: {}", $file_name, e);
+                        panic!("{} - Execution failed: {}", $file_name, e);
                     }
                 };
 
@@ -1660,7 +1613,6 @@ mod tests {
 pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {
         // perform one-off initialization when the pg_test framework starts
-        n
     }
 
     #[must_use]

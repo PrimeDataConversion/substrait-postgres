@@ -1,6 +1,5 @@
 use anyhow::Result;
 use pgrx::pg_sys;
-use pgrx::spi;
 use std::collections::HashMap;
 use substrait::proto::Expression;
 
@@ -41,101 +40,78 @@ fn get_pg_type_oid(
     }
 }
 
-/// Look up the function OID for a given operator OID
-unsafe fn get_operator_function_oid(
-    operator_oid: pg_sys::Oid,
-) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!(
-        "DEBUG: Looking up function OID for operator OID: {}",
-        operator_oid.to_u32()
-    );
-
-    // Use PostgreSQL's system catalog to get the function OID for this operator
-    let tuple = pg_sys::SearchSysCache1(
-        pg_sys::SysCacheIdentifier::OPEROID as i32,
-        pg_sys::Datum::from(operator_oid.to_u32()),
-    );
-
-    if tuple.is_null() {
-        eprintln!(
-            "DEBUG: Operator OID {} not found in system catalog",
-            operator_oid.to_u32()
-        );
-        return Err(format!("Operator OID {} not found in system catalog", operator_oid).into());
-    }
-
-    let operator_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_operator;
-    let function_oid = (*operator_form).oprcode;
-
-    eprintln!(
-        "DEBUG: Operator OID {} maps to function OID: {}",
-        operator_oid.to_u32(),
-        function_oid.to_u32()
-    );
-
-    pg_sys::ReleaseSysCache(tuple);
-
-    if function_oid == pg_sys::InvalidOid || function_oid.to_u32() == 0 {
-        return Err(format!("Operator OID {} has no associated function", operator_oid).into());
-    }
-
-    Ok(function_oid)
-}
-
 /// Look up the function OID for a given function name and argument types.
 /// This function queries pg_proc to find the OID of a function.
 pub unsafe fn lookup_function_oid(
     function_name: &str,
     argument_types: &[pg_sys::Oid],
 ) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
-    let mut query = format!(
-        "SELECT oid FROM pg_proc WHERE proname = '{}' AND pronargs = {}",
-        function_name,
-        argument_types.len()
-    );
+    let func_name_c = std::ffi::CString::new(function_name).unwrap();
+    let n_args = argument_types.len() as i32;
 
-    if !argument_types.is_empty() {
-        query.push_str(" AND proargtypes = ARRAY[");
-        for (i, oid) in argument_types.iter().enumerate() {
-            if i > 0 {
-                query.push_str(", ");
-            }
-            query.push_str(&oid.to_string());
-        }
-        query.push_str("]::oid[]");
+    // Construct oidvector for proargtypes
+    let mut oid_vector = std::ptr::null_mut();
+    if n_args > 0 {
+        oid_vector = pg_sys::buildoidvector(argument_types.as_ptr(), n_args);
     }
 
-    eprintln!("DEBUG: Executing function OID lookup query: {}", query);
+    let tuple = pg_sys::SearchSysCache4(
+        pg_sys::SysCacheIdentifier::PROCNAMEARGSNSP as i32,
+        pg_sys::Datum::from(func_name_c.as_ptr()),
+        pg_sys::Datum::from(oid_vector),
+        pg_sys::Datum::from(pg_sys::PG_CATALOG_NAMESPACE), // Search in pg_catalog schema
+        0.into(),
+    );
 
-    let result = spi::Spi::connect(|mut client| {
-        let mut found_oid: Option<pg_sys::Oid> = None;
-        let tuple_table = client.select(&query, None, &[])?;
-        for row in tuple_table {
-            if let Some(oid_val) = row["oid"].value::<pg_sys::Oid>().ok() {
-                found_oid = oid_val;
-                break; // Assuming we only need the first match
-            }
-        }
-        Ok::<Option<pg_sys::Oid>, Box<dyn std::error::Error + Send + Sync>>(found_oid)
-    })?;
-
-    match result {
-        Some(oid) => {
-            eprintln!(
-                "DEBUG: Found function OID {} for function '{}' with {} arguments",
-                oid,
-                function_name,
-                argument_types.len()
-            );
-            Ok(oid)
-        }
-        None => Err(format!(
+    if tuple.is_null() {
+        return Err(format!(
             "Function '{}' with {} arguments not found in pg_proc",
             function_name,
             argument_types.len()
         )
-        .into()),
+        .into());
     }
+
+    let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
+    let function_oid = (*proc_form).oid;
+
+    pg_sys::ReleaseSysCache(tuple);
+
+    Ok(function_oid)
+}
+
+/// Look up the function OID for a given operator OID.
+/// This function queries pg_operator to find the OID of the function.
+pub unsafe fn get_operator_function_oid(
+    operator_oid: pg_sys::Oid,
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    let tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::OPEROID as i32,
+        pg_sys::Datum::from(operator_oid),
+    );
+
+    if tuple.is_null() {
+        return Err(format!(
+            "Operator with OID '{}' not found in pg_operator",
+            operator_oid
+        )
+        .into());
+    }
+
+    let op_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_operator;
+    let function_oid = (*op_form).oprcode;
+
+    pg_sys::ReleaseSysCache(tuple);
+
+    if function_oid == pg_sys::InvalidOid || function_oid.to_u32() == 0 {
+        return Err(format!(
+            "Operator with OID '{}' has no underlying function (oprcode is 0)",
+            operator_oid
+        )
+        .into());
+    }
+
+    Ok(function_oid)
 }
 
 // PostgreSQL's date epoch is 2000-01-01, while Substrait's is 1970-01-01.
@@ -676,8 +652,8 @@ pub unsafe fn create_subquery_expr(
             // The scalar_subquery should contain the inner relation
             create_scalar_subquery_expr(scalar_subquery, function_map)
         }
-        Some(SubqueryType::InPredicate(_)) => {
-            Err("IN predicate subqueries not yet supported".into())
+        Some(SubqueryType::InPredicate(in_predicate)) => {
+            create_in_predicate_expr(in_predicate, function_map)
         }
         Some(SubqueryType::SetPredicate(set_predicate)) => {
             // Handle EXISTS/UNIQUE subqueries
@@ -709,17 +685,18 @@ unsafe fn create_scalar_subquery_expr(
         (*sublink).testexpr = std::ptr::null_mut();
         (*sublink).operName = std::ptr::null_mut();
 
-        let plan_tree = convert_rel_to_plan_tree_with_context(rel, function_map, None)?;
+        let (plan_tree, range_table) =
+            convert_rel_to_plan_tree_with_context(rel, function_map, None)?;
         let query_node =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
         (*query_node).type_ = pg_sys::NodeTag::T_Query;
         (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
         (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
         (*query_node).canSetTag = true;
-        (*query_node).rtable = std::ptr::null_mut();
+        (*query_node).rtable = range_table;
         (*query_node).jointree =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
-        (*(*query_node).jointree).fromlist = std::ptr::null_mut();
+        (*(*query_node).jointree).fromlist = range_table;
         (*(*query_node).jointree).quals = std::ptr::null_mut();
         (*query_node).targetList = (*plan_tree).targetlist;
 
@@ -729,6 +706,57 @@ unsafe fn create_scalar_subquery_expr(
     } else {
         Err("Scalar subquery missing input relation".into())
     }
+}
+
+/// Create a PostgreSQL IN predicate expression
+unsafe fn create_in_predicate_expr(
+    in_predicate: &substrait::proto::expression::subquery::InPredicate,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("DEBUG: create_in_predicate_expr called");
+
+    if in_predicate.haystack.is_none() {
+        return Err("IN predicate missing haystack relation".into());
+    }
+
+    if in_predicate.needles.is_empty() {
+        return Err("IN predicate missing needles expression".into());
+    }
+
+    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+    (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
+    (*sublink).subLinkType = pg_sys::SubLinkType::ANY_SUBLINK; // Use ANY_SUBLINK for IN predicates
+    (*sublink).subLinkId = 0;
+    (*sublink).operName = std::ptr::null_mut();
+
+    // Translate the haystack (subquery relation)
+    let haystack_rel = in_predicate.haystack.as_ref().unwrap();
+    let (plan_tree, range_table) =
+        convert_rel_to_plan_tree_with_context(haystack_rel, function_map, None)?;
+
+    let query_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+    (*query_node).type_ = pg_sys::NodeTag::T_Query;
+    (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
+    (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
+    (*query_node).canSetTag = true;
+    (*query_node).rtable = range_table; // Use the rtable from the translated plan_tree
+    (*query_node).jointree =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
+    (*(*query_node).jointree).fromlist = range_table; // Use the rtable from the translated plan_tree
+    (*(*query_node).jointree).quals = std::ptr::null_mut();
+    (*query_node).targetList = (*plan_tree).targetlist;
+
+    (*sublink).subselect = query_node as *mut pg_sys::Node;
+
+    // Translate the needles (expressions to check against the subquery result)
+    let pg_needles = convert_expressions_to_target_list_with_context(
+        &in_predicate.needles,
+        function_map,
+        None, // No current_table_oid for needles in IN predicate
+    )?;
+    (*sublink).testexpr = pg_needles as *mut pg_sys::Node;
+
+    Ok(sublink as *mut pg_sys::Node)
 }
 
 /// Create a PostgreSQL EXISTS/UNIQUE subquery expression from Substrait SetPredicate
@@ -1375,11 +1403,18 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let start_type = get_expr_type_oid(start_expr)?;
                 let count_type = get_expr_type_oid(count_expr)?;
 
+                eprintln!(
+                    "DEBUG: char_substr - string_type: {}, start_type: {}, count_type: {}",
+                    string_type.to_u32(),
+                    start_type.to_u32(),
+                    count_type.to_u32()
+                );
+
                 let func_oid =
-                    lookup_function_oid("text_substr", &[string_type, start_type, count_type])?;
+                    lookup_function_oid("char_substr", &[string_type, start_type, count_type])?;
                 create_function_call_expr(
                     func_oid,
-                    pg_sys::TEXTOID,
+                    pg_sys::TEXTOID, // Assuming char_substr returns TEXTOID
                     &[string_expr, start_expr, count_expr],
                 )
             } else {

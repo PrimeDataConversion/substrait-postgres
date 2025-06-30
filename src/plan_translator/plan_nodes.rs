@@ -909,6 +909,45 @@ pub unsafe fn create_cross_join_node(
     Ok(nestloop_node as *mut pg_sys::Plan)
 }
 
+/// Create a PostgreSQL NestLoop plan node for Join operations
+pub unsafe fn create_join_node(
+    left_plan: *mut pg_sys::Plan,
+    right_plan: *mut pg_sys::Plan,
+    join_type: u32,
+    join_qual: *mut pg_sys::List,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a NestLoop plan node for the join
+    let nestloop_node =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::NestLoop>()) as *mut pg_sys::NestLoop;
+    (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
+    (*nestloop_node).join.plan.lefttree = left_plan;
+    (*nestloop_node).join.plan.righttree = right_plan;
+    (*nestloop_node).join.plan.initPlan = std::ptr::null_mut();
+    (*nestloop_node).join.plan.extParam = std::ptr::null_mut();
+    (*nestloop_node).join.plan.allParam = std::ptr::null_mut();
+    (*nestloop_node).join.plan.startup_cost = 0.0;
+    (*nestloop_node).join.plan.total_cost = 1000.0;
+    (*nestloop_node).join.plan.plan_rows = 1000.0;
+    (*nestloop_node).join.plan.plan_width = 64;
+    (*nestloop_node).join.plan.parallel_aware = false;
+    (*nestloop_node).join.plan.parallel_safe = true;
+    (*nestloop_node).join.plan.async_capable = false;
+    (*nestloop_node).join.plan.plan_node_id = 0;
+    (*nestloop_node).join.plan.qual = std::ptr::null_mut();
+
+    // Set join type
+    (*nestloop_node).join.jointype = join_type;
+
+    // Set join condition
+    (*nestloop_node).join.joinqual = join_qual;
+
+    // Create target list combining both input relations
+    let combined_target_list = create_combined_target_list(left_plan, right_plan)?;
+    (*nestloop_node).join.plan.targetlist = combined_target_list;
+
+    Ok(nestloop_node as *mut pg_sys::Plan)
+}
+
 /// Create a combined target list for join operations
 unsafe fn create_combined_target_list(
     left_plan: *mut pg_sys::Plan,

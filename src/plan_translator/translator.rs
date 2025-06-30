@@ -76,7 +76,7 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: About to call convert_plan_relation_to_plan_tree_with_context");
         pgrx::info!("DEBUG: About to call convert_plan_relation_to_plan_tree_with_context");
 
-        let plan_tree =
+        let (plan_tree, _range_table) =
             convert_plan_relation_to_plan_tree_with_context(relation, &function_map, None)?;
 
         eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context returned successfully, plan_tree: {:p}", plan_tree);
