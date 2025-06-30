@@ -1,5 +1,4 @@
-use pgrx::pg_sys;
-use pgrx::prelude::*;
+use pgrx::{pg_extern, pg_guard, pg_schema, pg_sys, Spi};
 use prost::Message;
 use substrait::proto::Plan;
 
@@ -276,7 +275,6 @@ pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
     let arg = &*arg_ptr;
 
     if arg.isnull {
-        pgrx::info!("Argument is null");
         return pg_sys::Datum::null();
     }
 
@@ -325,7 +323,7 @@ pub extern "C" fn pg_finfo_from_substrait_json_wrapper() -> &'static pg_sys::Pg_
 fn extract_plan_schema(plan: &Plan) -> String {
     // Extract schema information from a Substrait plan
     // Use separate translation and execution
-    match translate_substrait_plan(plan) {
+    match plan_translator::translate_substrait_plan_with_function_map(&plan, function_map) {
         Ok((postgres_plan, column_names, range_table)) => {
             match unsafe { execute_postgres_plan(postgres_plan, column_names, range_table) } {
                 Ok(result_data) => {
@@ -376,7 +374,7 @@ unsafe fn extract_bytea_arg(fcinfo: pg_sys::FunctionCallInfo, arg_num: i32) -> &
         return &[];
     }
 
-    let arg_ptr = (*fcinfo).args.as_ptr().offset(arg_num as isize);
+    let arg_ptr = (*fcinfo).args.as_ptr().offset(0);
     let arg = &*arg_ptr;
 
     if arg.isnull {
@@ -435,6 +433,7 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                     range_table,
                 );
             }
+
             pgrx::info!("DEBUG: Multi-column bytea path, using table scan workaround");
             return handle_table_scan_properly(fcinfo, postgres_plan, column_names, range_table);
         }
@@ -618,7 +617,7 @@ unsafe fn execute_substrait_as_srf_with_function_map(
 mod tests {
     use crate::executor::execute_postgres_plan;
     use crate::plan_translator;
-    use pgrx::prelude::*;
+    use pgrx::{pg_sys, pg_test, prelude::*, AnyNumeric};
 
     // Helper function to convert a numeric datum to a string for comparison
     fn numeric_datum_to_string(datum: pg_sys::Datum) -> String {
@@ -697,8 +696,6 @@ mod tests {
         let const_node = unsafe { &*(result as *mut pg_sys::Const) };
         assert_eq!(numeric_datum_to_string(const_node.constvalue), "0.00123");
     }
-
-    use pgrx::prelude::*;
 
     /// Generate an AS clause string from ExecutionResult schema
     fn generate_as_clause(results: &crate::plan_translator::ExecutionResult) -> String {
@@ -981,8 +978,7 @@ mod tests {
                             }]
                         }
                     }
-                }
-            }]
+                }            }]
         }"#;
 
         // Test that the function can be called - simplified to single column to avoid issues
@@ -1664,6 +1660,7 @@ mod tests {
 pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {
         // perform one-off initialization when the pg_test framework starts
+        n
     }
 
     #[must_use]

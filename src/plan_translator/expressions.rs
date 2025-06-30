@@ -1,6 +1,6 @@
 use anyhow::Result;
-use pgrx::pg_schema;
 use pgrx::pg_sys;
+use pgrx::spi;
 use std::collections::HashMap;
 use substrait::proto::Expression;
 
@@ -80,6 +80,62 @@ unsafe fn get_operator_function_oid(
     }
 
     Ok(function_oid)
+}
+
+/// Look up the function OID for a given function name and argument types.
+/// This function queries pg_proc to find the OID of a function.
+pub unsafe fn lookup_function_oid(
+    function_name: &str,
+    argument_types: &[pg_sys::Oid],
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    let mut query = format!(
+        "SELECT oid FROM pg_proc WHERE proname = '{}' AND pronargs = {}",
+        function_name,
+        argument_types.len()
+    );
+
+    if !argument_types.is_empty() {
+        query.push_str(" AND proargtypes = ARRAY[");
+        for (i, oid) in argument_types.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&oid.to_string());
+        }
+        query.push_str("]::oid[]");
+    }
+
+    eprintln!("DEBUG: Executing function OID lookup query: {}", query);
+
+    let result = spi::Spi::connect(|mut client| {
+        let mut found_oid: Option<pg_sys::Oid> = None;
+        let tuple_table = client.select(&query, None, &[])?;
+        for row in tuple_table {
+            if let Some(oid_val) = row["oid"].value::<pg_sys::Oid>().ok() {
+                found_oid = oid_val;
+                break; // Assuming we only need the first match
+            }
+        }
+        Ok::<Option<pg_sys::Oid>, Box<dyn std::error::Error + Send + Sync>>(found_oid)
+    })?;
+
+    match result {
+        Some(oid) => {
+            eprintln!(
+                "DEBUG: Found function OID {} for function '{}' with {} arguments",
+                oid,
+                function_name,
+                argument_types.len()
+            );
+            Ok(oid)
+        }
+        None => Err(format!(
+            "Function '{}' with {} arguments not found in pg_proc",
+            function_name,
+            argument_types.len()
+        )
+        .into()),
+    }
 }
 
 // PostgreSQL's date epoch is 2000-01-01, while Substrait's is 1970-01-01.
@@ -218,7 +274,7 @@ pub unsafe fn create_text_const(
 /// Create a PostgreSQL numeric constant node
 pub unsafe fn create_numeric_const(
     value_bytes: &[u8],
-    precision: i32,
+    _precision: i32,
     scale: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     // TODO: Start using precision here too.
@@ -401,6 +457,18 @@ pub unsafe fn create_cast_expr(
     Ok(cast_expr as *mut pg_sys::Expr)
 }
 
+/// Get the PostgreSQL type OID from an expression node.
+unsafe fn get_expr_type_oid(
+    expr: *mut pg_sys::Expr,
+) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
+    if expr.is_null() {
+        return Err("Expression is null".into());
+    }
+    let oid = pg_sys::exprType(expr as *const pg_sys::Node);
+    eprintln!("DEBUG: get_expr_type_oid returning OID: {}", oid.to_u32());
+    Ok(oid)
+}
+
 /// Create a PostgreSQL binary operation expression
 pub unsafe fn create_binary_op_expr(
     left_arg: *mut pg_sys::Expr,
@@ -486,6 +554,7 @@ pub unsafe fn create_function_call_expr(
 /// Convert selection expression to PostgreSQL
 pub unsafe fn convert_selection_to_postgres(
     selection: &substrait::proto::expression::FieldReference,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref_type) = &selection.reference_type {
         match ref_type {
@@ -495,7 +564,11 @@ pub unsafe fn convert_selection_to_postgres(
                 if let Some(struct_field) = &direct_ref.reference_type {
                     match struct_field {
                         substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
-                            create_var_node(field.field + 1) // 1-based indexing
+                            if let Some(table_oid) = current_table_oid {
+                                create_var_node_with_table_schema(field.field + 1, table_oid) // 1-based indexing
+                            } else {
+                                create_var_node(field.field + 1) // 1-based indexing
+                            }
                         }
                         _ => Err("Unsupported reference type in selection".into()),
                     }
@@ -514,6 +587,7 @@ pub unsafe fn convert_selection_to_postgres(
 pub unsafe fn convert_expression_to_postgres_with_context(
     expr: &Expression,
     function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::RexType;
 
@@ -552,15 +626,17 @@ pub unsafe fn convert_expression_to_postgres_with_context(
                 Err("Literal expression missing literal type".into())
             }
         }
-        Some(RexType::Selection(selection)) => convert_selection_to_postgres(selection),
+        Some(RexType::Selection(selection)) => {
+            convert_selection_to_postgres(selection, current_table_oid)
+        }
         Some(RexType::ScalarFunction(func)) => {
             // Handle scalar functions (e.g., comparison operators)
-            create_scalar_function_expr_with_context(func, function_map)
+            create_scalar_function_expr_with_context(func, function_map, current_table_oid)
         }
         Some(RexType::Cast(cast)) => {
             // Handle type casts
             let input_expr = if let Some(input) = &cast.input {
-                convert_expression_to_postgres_with_context(input, function_map)?
+                convert_expression_to_postgres_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Cast expression missing input".into());
             };
@@ -633,7 +709,7 @@ unsafe fn create_scalar_subquery_expr(
         (*sublink).testexpr = std::ptr::null_mut();
         (*sublink).operName = std::ptr::null_mut();
 
-        let plan_tree = convert_rel_to_plan_tree_with_context(rel, function_map)?;
+        let plan_tree = convert_rel_to_plan_tree_with_context(rel, function_map, None)?;
         let query_node =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
         (*query_node).type_ = pg_sys::NodeTag::T_Query;
@@ -707,11 +783,17 @@ unsafe fn create_set_predicate_expr(
 pub unsafe fn convert_expressions_to_target_list_with_context(
     expressions: &[Expression],
     function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
     let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
 
     for (i, expr) in expressions.iter().enumerate() {
-        let target_entry = convert_expression_to_target_entry_with_context(expr, i, function_map)?;
+        let target_entry = convert_expression_to_target_entry_with_context(
+            expr,
+            i,
+            function_map,
+            current_table_oid,
+        )?;
         target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
     }
 
@@ -723,6 +805,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
     expr: &Expression,
     index: usize,
     function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::TargetEntry, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::RexType;
 
@@ -766,7 +849,8 @@ unsafe fn convert_expression_to_target_entry_with_context(
         }
         Some(RexType::ScalarFunction(func)) => {
             // Handle scalar function expressions
-            let func_expr = create_scalar_function_expr_with_context(func, function_map)?;
+            let func_expr =
+                create_scalar_function_expr_with_context(func, function_map, current_table_oid)?;
 
             // Create TargetEntry
             let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
@@ -781,7 +865,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
         }
         Some(RexType::Selection(selection)) => {
             // Handle column references
-            let selection_expr = convert_selection_to_postgres(selection)?;
+            let selection_expr = convert_selection_to_postgres(selection, current_table_oid)?;
 
             // Create TargetEntry
             let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
@@ -798,10 +882,40 @@ unsafe fn convert_expression_to_target_entry_with_context(
     }
 }
 
+/// Extract PostgreSQL expressions from Substrait function arguments.
+unsafe fn extract_function_arguments(
+    func_arguments: &[substrait::proto::FunctionArgument],
+    function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
+) -> Result<Vec<*mut pg_sys::Expr>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut pg_args = Vec::with_capacity(func_arguments.len());
+    for arg in func_arguments {
+        if let Some(value) = &arg.arg_type {
+            match value {
+                substrait::proto::function_argument::ArgType::Value(expr) => {
+                    let pg_expr = convert_expression_to_postgres_with_context(
+                        expr,
+                        function_map,
+                        current_table_oid,
+                    )?;
+                    pg_args.push(pg_expr);
+                }
+                _ => {
+                    return Err("Unsupported argument type in function".into());
+                }
+            }
+        } else {
+            return Err("Missing argument type in function".into());
+        }
+    }
+    Ok(pg_args)
+}
+
 /// Create scalar function expression with function context
 pub unsafe fn create_scalar_function_expr_with_context(
     func: &substrait::proto::expression::ScalarFunction,
     function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     let function_reference = func.function_reference;
     let argument_count = func.arguments.len();
@@ -821,52 +935,14 @@ pub unsafe fn create_scalar_function_expr_with_context(
     match function_name {
         "lte:date_date" => {
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lte:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lte:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in lte:date_date function".into());
-                };
-
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lte:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lte:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in lte:date_date function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
                 // Create a binary operation expression for date less-than-equal
-                // PostgreSQL date <= operator OID is 1095 (DATE_LE_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1095),
-                    pg_sys::BOOLOID,
-                )
+                let func_oid = lookup_function_oid("date_le", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "lte:date_date function expects 2 arguments, got {}",
@@ -878,34 +954,20 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "and:bool" => {
             // Handle variadic logical AND function using PostgreSQL's BoolExpr
             if func.arguments.len() >= 2 {
-                // Convert all arguments to PostgreSQL expressions
-                let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
-                for arg in &func.arguments {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                let pg_expr = convert_expression_to_postgres_with_context(
-                                    expr,
-                                    function_map,
-                                )?;
-                                pg_args =
-                                    pg_sys::lappend(pg_args, pg_expr as *mut std::ffi::c_void);
-                            }
-                            _ => {
-                                return Err("Unsupported argument type in and:bool function".into())
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in and:bool function".into());
-                    }
-                }
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
 
                 // Create a BoolExpr node for variadic AND
                 let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
                     as *mut pg_sys::BoolExpr;
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::AND_EXPR;
-                (*bool_expr).args = pg_args;
+
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                for arg in pg_args {
+                    args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
+                }
+                (*bool_expr).args = args_list;
 
                 Ok(bool_expr as *mut pg_sys::Expr)
             } else {
@@ -919,48 +981,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "equal:any_any" => {
             // Handle equality comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in equal:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in equal:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in equal:any_any function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in equal:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in equal:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in equal:any_any function".into());
-                };
-
-                // Create a binary operation expression for equality
-                // Use a generic equality operator - PostgreSQL will resolve the correct one based on types
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(96), pg_sys::BOOLOID)
-            // INT4EQ_OP as a generic placeholder
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("eq", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "equal:any_any function expects 2 arguments, got {}",
@@ -972,54 +1001,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "multiply:fp64_fp64" => {
             // Handle floating point multiplication
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in multiply:fp64_fp64 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in multiply:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in multiply:fp64_fp64 function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in multiply:fp64_fp64 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in multiply:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in multiply:fp64_fp64 function".into());
-                };
-
-                // Create a binary operation expression for multiplication
-                // PostgreSQL float8 * operator OID is 594 (FLOAT8MUL_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(594),
-                    pg_sys::FLOAT8OID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("float8mul", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "multiply:fp64_fp64 function expects 2 arguments, got {}",
@@ -1031,54 +1021,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "subtract:fp64_fp64" => {
             // Handle floating point subtraction
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in subtract:fp64_fp64 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in subtract:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in subtract:fp64_fp64 function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in subtract:fp64_fp64 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in subtract:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in subtract:fp64_fp64 function".into());
-                };
-
-                // Create a binary operation expression for subtraction
-                // PostgreSQL float8 - operator OID is 593 (FLOAT8MI_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(593),
-                    pg_sys::FLOAT8OID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("float8mi", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "subtract:fp64_fp64 function expects 2 arguments, got {}",
@@ -1090,52 +1041,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "add:fp64_fp64" => {
             // Handle floating point addition
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in add:fp64_fp64 function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in add:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in add:fp64_fp64 function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in add:fp64_fp64 function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in add:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in add:fp64_fp64 function".into());
-                };
-
-                // Create a binary operation expression for addition
-                // PostgreSQL float8 + operator OID is 591 (FLOAT8PL_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(591),
-                    pg_sys::FLOAT8OID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("float8pl", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "add:fp64_fp64 function expects 2 arguments, got {}",
@@ -1147,48 +1061,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "like:str_str" => {
             // Handle string LIKE pattern matching function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in like:str_str function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in like:str_str function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in like:str_str function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in like:str_str function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in like:str_str function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in like:str_str function".into());
-                };
-
-                // Create a binary operation expression for LIKE
-                // PostgreSQL LIKE operator OID is 15 (TEXTLIKE_OP)
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(15), pg_sys::BOOLOID)
-            // TEXTLIKE_OP
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "like:str_str function expects 2 arguments, got {}",
@@ -1200,32 +1081,20 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "or:bool" => {
             // Handle variadic logical OR function using PostgreSQL's BoolExpr
             if func.arguments.len() >= 2 {
-                // Convert all arguments to PostgreSQL expressions
-                let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
-                for arg in &func.arguments {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                let pg_expr = convert_expression_to_postgres_with_context(
-                                    expr,
-                                    function_map,
-                                )?;
-                                pg_args =
-                                    pg_sys::lappend(pg_args, pg_expr as *mut std::ffi::c_void);
-                            }
-                            _ => return Err("Unsupported argument type in or:bool function".into()),
-                        }
-                    } else {
-                        return Err("Missing argument type in or:bool function".into());
-                    }
-                }
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
 
                 // Create a BoolExpr node for variadic OR
                 let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
                     as *mut pg_sys::BoolExpr;
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::OR_EXPR;
-                (*bool_expr).args = pg_args;
+
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                for arg in pg_args {
+                    args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
+                }
+                (*bool_expr).args = args_list;
 
                 Ok(bool_expr as *mut pg_sys::Expr)
             } else {
@@ -1239,52 +1108,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "lt:any_any" => {
             // Handle less-than comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lt:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lt:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in lt:any_any function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lt:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lt:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in lt:any_any function".into());
-                };
-
-                // Create a binary operation expression for less-than
-                // Use generic less-than operator
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(97), // INT4LT_OP, fallback for generic types
-                    pg_sys::BOOLOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("lt", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "lt:any_any function expects 2 arguments, got {}",
@@ -1296,52 +1128,13 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "gte:date_date" => {
             // Handle greater-than-or-equal comparison for dates
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gte:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gte:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in gte:date_date function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gte:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gte:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in gte:date_date function".into());
-                };
-
-                // Create a binary operation expression for date greater-than-equal
-                // PostgreSQL date >= operator OID is 1096 (DATE_GE_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1096),
-                    pg_sys::BOOLOID,
-                )
+                let func_oid = lookup_function_oid("date_ge", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "gte:date_date function expects 2 arguments, got {}",
@@ -1353,52 +1146,13 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "lt:date_date" => {
             // Handle less-than comparison for dates
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lt:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lt:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in lt:date_date function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lt:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lt:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in lt:date_date function".into());
-                };
-
-                // Create a binary operation expression for date less-than
-                // PostgreSQL date < operator OID is 1094 (DATE_LT_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1094),
-                    pg_sys::BOOLOID,
-                )
+                let func_oid = lookup_function_oid("date_lt", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "lt:date_date function expects 2 arguments, got {}",
@@ -1410,54 +1164,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "not_equal:any_any" => {
             // Handle not-equal comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in not_equal:any_any function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in not_equal:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in not_equal:any_any function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in not_equal:any_any function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in not_equal:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in not_equal:any_any function".into());
-                };
-
-                // Create a binary operation expression for not-equal
-                // Use generic not-equal operator
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(518), // INT4NE_OP, fallback for generic types
-                    pg_sys::BOOLOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("ne", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "not_equal:any_any function expects 2 arguments, got {}",
@@ -1469,47 +1184,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "like:vchar_vchar" => {
             // Handle string LIKE pattern matching function for varchar types
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in like:vchar_vchar function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in like:vchar_vchar function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in like:vchar_vchar function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in like:vchar_vchar function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in like:vchar_vchar function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in like:vchar_vchar function".into());
-                };
-
-                // Create a binary operation expression for LIKE
-                // PostgreSQL LIKE operator OID is 15 (TEXTLIKE_OP)
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(15), pg_sys::BOOLOID)
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "like:vchar_vchar function expects 2 arguments, got {}",
@@ -1521,52 +1204,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "multiply:dec_dec" => {
             // Handle decimal multiplication
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in multiply:dec_dec function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in multiply:dec_dec function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in multiply:dec_dec function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in multiply:dec_dec function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in multiply:dec_dec function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in multiply:dec_dec function".into());
-                };
-
-                // Create a binary operation expression for decimal multiplication
-                // PostgreSQL numeric * operator OID is 1758 (NUMERIC_MUL_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1758),
-                    pg_sys::NUMERICOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("numeric_mul", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "multiply:dec_dec function expects 2 arguments, got {}",
@@ -1578,52 +1224,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "subtract:dec_dec" => {
             // Handle decimal subtraction
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in subtract:dec_dec function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in subtract:dec_dec function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in subtract:dec_dec function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in subtract:dec_dec function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in subtract:dec_dec function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in subtract:dec_dec function".into());
-                };
-
-                // Create a binary operation expression for decimal subtraction
-                // PostgreSQL numeric - operator OID is 1759 (NUMERIC_SUB_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1759),
-                    pg_sys::NUMERICOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("numeric_sub", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "subtract:dec_dec function expects 2 arguments, got {}",
@@ -1635,52 +1244,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "divide:dec_dec" => {
             // Handle decimal division
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in divide:dec_dec function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in divide:dec_dec function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in divide:dec_dec function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in divide:dec_dec function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in divide:dec_dec function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in divide:dec_dec function".into());
-                };
-
-                // Create a binary operation expression for decimal division
-                // PostgreSQL numeric / operator OID is 1760 (NUMERIC_DIV_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1760),
-                    pg_sys::NUMERICOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("numeric_div", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "divide:dec_dec function expects 2 arguments, got {}",
@@ -1692,52 +1264,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "gt:any_any" => {
             // Handle greater-than comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gt:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gt:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in gt:any_any function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gt:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gt:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in gt:any_any function".into());
-                };
-
-                // Create a binary operation expression for greater-than
-                // Use generic greater-than operator
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(521), // INT4GT_OP, fallback for generic types
-                    pg_sys::BOOLOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("gt", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "gt:any_any function expects 2 arguments, got {}",
@@ -1750,52 +1285,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
             // Handle date + year interval function
             // This typically comes from expressions like date '1994-08-01' + interval '1' month
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in add:date_year function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in add:date_year function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in add:date_year function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in add:date_year function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in add:date_year function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in add:date_year function".into());
-                };
-
-                // Create a binary operation expression for date + interval
-                // PostgreSQL date + interval operator OID is 1076 (DATE_PL_INTERVAL)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1076),
-                    pg_sys::DATEOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("date_pl_interval", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::DATEOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "add:date_year function expects 2 arguments, got {}",
@@ -1807,51 +1305,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "gte:any_any" => {
             // Handle greater-than-or-equal comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gte:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gte:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in gte:any_any function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gte:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gte:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in gte:any_any function".into());
-                };
-
-                // Create a binary operation expression for greater-than-or-equal
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(525), // INT4GE_OP as generic fallback
-                    pg_sys::BOOLOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("ge", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "gte:any_any function expects 2 arguments, got {}",
@@ -1863,51 +1325,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "lte:any_any" => {
             // Handle less-than-or-equal comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lte:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lte:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in lte:any_any function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in lte:any_any function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in lte:any_any function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in lte:any_any function".into());
-                };
-
-                // Create a binary operation expression for less-than-or-equal
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(523), // INT4LE_OP as generic fallback
-                    pg_sys::BOOLOID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("le", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "lte:any_any function expects 2 arguments, got {}",
@@ -1919,47 +1345,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "add:i32_i32" => {
             // Handle integer addition
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in add:i32_i32 function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in add:i32_i32 function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in add:i32_i32 function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in add:i32_i32 function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in add:i32_i32 function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in add:i32_i32 function".into());
-                };
-
-                // Create a binary operation expression for integer addition
-                // PostgreSQL int4 + operator OID is 551 (INT4PL_OP)
-                create_binary_op_expr(left_arg, right_arg, pg_sys::Oid::from(551), pg_sys::INT4OID)
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("int4pl", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::INT4OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "add:i32_i32 function expects 2 arguments, got {}",
@@ -1968,81 +1362,54 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 .into())
             }
         }
+        "char_substr" => {
+            // Handle char_substr function
+            if func.arguments.len() == 3 {
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let string_expr = pg_args[0];
+                let start_expr = pg_args[1];
+                let count_expr = pg_args[2];
+
+                let string_type = get_expr_type_oid(string_expr)?;
+                let start_type = get_expr_type_oid(start_expr)?;
+                let count_type = get_expr_type_oid(count_expr)?;
+
+                let func_oid =
+                    lookup_function_oid("text_substr", &[string_type, start_type, count_type])?;
+                create_function_call_expr(
+                    func_oid,
+                    pg_sys::TEXTOID,
+                    &[string_expr, start_expr, count_expr],
+                )
+            } else {
+                Err(format!(
+                    "char_substr function expects 3 arguments, got {}",
+                    argument_count
+                )
+                .into())
+            }
+        }
         "substring:str_i32_i32" => {
             // Handle string substring function
             if func.arguments.len() == 3 {
-                let string_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in substring:str_i32_i32 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err(
-                            "Missing argument type in substring:str_i32_i32 function".into()
-                        );
-                    }
-                } else {
-                    return Err("Missing string argument in substring:str_i32_i32 function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let string_expr = pg_args[0];
+                let start_expr = pg_args[1];
+                let length_expr = pg_args[2];
 
-                let start_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in substring:str_i32_i32 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err(
-                            "Missing argument type in substring:str_i32_i32 function".into()
-                        );
-                    }
-                } else {
-                    return Err("Missing start argument in substring:str_i32_i32 function".into());
-                };
+                let string_type = get_expr_type_oid(string_expr)?;
+                let start_type = get_expr_type_oid(start_expr)?;
+                let length_type = get_expr_type_oid(length_expr)?;
 
-                let count_arg = if let Some(arg) = func.arguments.get(2) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in substring:str_i32_i32 function"
-                                        .into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err(
-                            "Missing argument type in substring:str_i32_i32 function".into()
-                        );
-                    }
-                } else {
-                    return Err("Missing count argument in substring:str_i32_i32 function".into());
-                };
-
-                // Create a function call expression for substring
-                // PostgreSQL substring function OID is 29 (SUBSTRING_TEXT_OP)
+                // Dynamically look up the function OID for 'substring'
+                let func_oid =
+                    lookup_function_oid("substring", &[string_type, start_type, length_type])?;
                 create_function_call_expr(
-                    pg_sys::Oid::from(29),
+                    func_oid,
                     pg_sys::TEXTOID,
-                    &[string_arg, start_arg, count_arg],
+                    &[string_expr, start_expr, length_expr],
                 )
             } else {
                 Err(format!(
@@ -2055,22 +1422,9 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "not:bool" => {
             // Handle logical NOT function
             if func.arguments.len() == 1 {
-                let arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err("Unsupported argument type in not:bool function".into())
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in not:bool function".into());
-                    }
-                } else {
-                    return Err("Missing argument in not:bool function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let arg = pg_args[0];
 
                 // Create a BoolExpr node for NOT
                 let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
@@ -2079,9 +1433,9 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
 
                 // Create args list with single argument
-                let mut pg_args: *mut pg_sys::List = std::ptr::null_mut();
-                pg_args = pg_sys::lappend(pg_args, arg as *mut std::ffi::c_void);
-                (*bool_expr).args = pg_args;
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
+                (*bool_expr).args = args_list;
 
                 Ok(bool_expr as *mut pg_sys::Expr)
             } else {
@@ -2095,52 +1449,13 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "gt:date_date" => {
             // Handle date greater-than comparison function
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gt:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gt:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in gt:date_date function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in gt:date_date function".into()
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in gt:date_date function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in gt:date_date function".into());
-                };
-
-                // Create a binary operation expression for date greater-than
-                // PostgreSQL date > operator OID is 1093 (DATE_GT_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(1093),
-                    pg_sys::BOOLOID,
-                )
+                let func_oid = lookup_function_oid("date_gt", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "gt:date_date function expects 2 arguments, got {}",
@@ -2152,52 +1467,15 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "divide:fp64_fp64" => {
             // Handle floating point division
             if func.arguments.len() == 2 {
-                let left_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in divide:fp64_fp64 function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in divide:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing left argument in divide:fp64_fp64 function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
 
-                let right_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in divide:fp64_fp64 function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in divide:fp64_fp64 function".into());
-                    }
-                } else {
-                    return Err("Missing right argument in divide:fp64_fp64 function".into());
-                };
-
-                // Create a binary operation expression for decimal division
-                // PostgreSQL float8 / operator OID is 595 (FLOAT8DIV_OP)
-                create_binary_op_expr(
-                    left_arg,
-                    right_arg,
-                    pg_sys::Oid::from(595),
-                    pg_sys::FLOAT8OID,
-                )
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("float8div", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "divide:fp64_fp64 function expects 2 arguments, got {}",
@@ -2209,48 +1487,17 @@ pub unsafe fn create_scalar_function_expr_with_context(
         "extract:req_date" => {
             // Handle extract function (e.g., extract year from date)
             if func.arguments.len() == 2 {
-                let part_arg = if let Some(arg) = func.arguments.first() {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in extract:req_date function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in extract:req_date function".into());
-                    }
-                } else {
-                    return Err("Missing part argument in extract:req_date function".into());
-                };
+                let pg_args =
+                    extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                let part_arg = pg_args[0];
+                let source_arg = pg_args[1];
 
-                let source_arg = if let Some(arg) = func.arguments.get(1) {
-                    if let Some(value) = &arg.arg_type {
-                        match value {
-                            substrait::proto::function_argument::ArgType::Value(expr) => {
-                                convert_expression_to_postgres_with_context(expr, function_map)?
-                            }
-                            _ => {
-                                return Err(
-                                    "Unsupported argument type in extract:req_date function".into(),
-                                )
-                            }
-                        }
-                    } else {
-                        return Err("Missing argument type in extract:req_date function".into());
-                    }
-                } else {
-                    return Err("Missing source argument in extract:req_date function".into());
-                };
+                let part_type = get_expr_type_oid(part_arg)?;
+                let source_type = get_expr_type_oid(source_arg)?;
 
-                // Create a function call expression for extract
-                // PostgreSQL extract function OID is 884 (date_part)
+                let func_oid = lookup_function_oid("date_part", &[part_type, source_type])?;
                 create_function_call_expr(
-                    pg_sys::Oid::from(884),
+                    func_oid,
                     pg_sys::FLOAT8OID, // extract returns float8
                     &[part_arg, source_arg],
                 )

@@ -53,6 +53,7 @@ pub fn build_function_extension_map(plan: Plan) -> HashMap<u32, String> {
 pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
     relation: &PlanRel,
     _function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context called");
     pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context called");
@@ -74,7 +75,7 @@ pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
                         "DEBUG: Root has input, calling convert_rel_to_plan_tree_with_context"
                     );
 
-                    convert_rel_to_plan_tree_with_context(input, _function_map)
+                    convert_rel_to_plan_tree_with_context(input, _function_map, current_table_oid)
                 } else {
                     Err("Root relation missing input".into())
                 }
@@ -90,6 +91,7 @@ pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
 pub unsafe fn convert_rel_to_plan_tree_with_context(
     rel: &Rel,
     function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::rel::RelType;
 
@@ -161,12 +163,14 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 
             if let Some(input) = &project.input {
                 // Project with input - create Result node with input as left tree
-                let input_plan = convert_rel_to_plan_tree_with_context(input, function_map)?;
+                let input_plan =
+                    convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?;
 
                 // Convert expressions to PostgreSQL target entries
                 let target_list = convert_expressions_to_target_list_with_context(
                     &project.expressions,
                     function_map,
+                    current_table_oid,
                 )?;
 
                 // Create a Result plan node using PostgreSQL's memory allocator
@@ -195,6 +199,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 let target_list = convert_expressions_to_target_list_with_context(
                     &project.expressions,
                     function_map,
+                    current_table_oid,
                 )?;
 
                 // Create a Result plan node for literal projections (matches PostgreSQL behavior)
@@ -268,7 +273,18 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                             table_name
                         );
 
-                        let (plan, _rte) = create_seqscan_node_with_scanrelid(&table_name, 1)?;
+                        let (plan, rte) = create_seqscan_node_with_scanrelid(&table_name, 1)?;
+
+                        // Extract the table OID from the RTE and pass it down
+                        let table_oid = unsafe { (*rte).relid };
+                        eprintln!("DEBUG: Extracted table OID: {}", table_oid);
+                        pgrx::info!("DEBUG: Extracted table OID: {}", table_oid);
+
+                        // Now, recursively call convert_rel_to_plan_tree_with_context with the table_oid
+                        // This is a bit tricky as NamedTable is a leaf node, but we need to ensure
+                        // the table_oid is available for expressions within the plan tree.
+                        // For now, we'll just return the plan and rely on the expression
+                        // conversion functions to handle the Option<pg_sys::Oid>.
 
                         eprintln!(
                             "DEBUG: SeqScan node creation completed for table: {}",
@@ -319,7 +335,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Sort(sort)) => {
             // Handle sort relation - create a Sort node
             let input_plan = if let Some(input) = &sort.input {
-                convert_rel_to_plan_tree_with_context(input, function_map)?
+                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Sort relation missing input".into());
             };
@@ -329,7 +345,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Fetch(fetch)) => {
             // Handle fetch relation - create a Limit node
             let input_plan = if let Some(input) = &fetch.input {
-                convert_rel_to_plan_tree_with_context(input, function_map)?
+                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Fetch relation missing input".into());
             };
@@ -338,9 +354,13 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             let offset_expr = if let Some(offset_mode) = &fetch.offset_mode {
                 use substrait::proto::fetch_rel::OffsetMode;
                 match offset_mode {
-                    OffsetMode::OffsetExpr(expr) => Some(
-                        convert_expression_to_postgres_with_context(expr, function_map)?,
-                    ),
+                    OffsetMode::OffsetExpr(expr) => {
+                        Some(convert_expression_to_postgres_with_context(
+                            expr,
+                            function_map,
+                            current_table_oid,
+                        )?)
+                    }
                     OffsetMode::Offset(constant_offset) => {
                         // Support deprecated constant offset by converting to expression
                         eprintln!("WARNING: Using deprecated constant offset field. Consider migrating to offset_expr.");
@@ -354,9 +374,13 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             let count_expr = if let Some(count_mode) = &fetch.count_mode {
                 use substrait::proto::fetch_rel::CountMode;
                 match count_mode {
-                    CountMode::CountExpr(expr) => Some(
-                        convert_expression_to_postgres_with_context(expr, function_map)?,
-                    ),
+                    CountMode::CountExpr(expr) => {
+                        Some(convert_expression_to_postgres_with_context(
+                            expr,
+                            function_map,
+                            current_table_oid,
+                        )?)
+                    }
                     CountMode::Count(constant_count) => {
                         // Support deprecated constant count by converting to expression
                         eprintln!("WARNING: Using deprecated constant count field. Consider migrating to count_expr.");
@@ -372,14 +396,18 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Filter(filter)) => {
             // Handle filter relation - create a Filter node
             let input_plan = if let Some(input) = &filter.input {
-                convert_rel_to_plan_tree_with_context(input, function_map)?
+                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Filter relation missing input".into());
             };
 
             // Convert the filter condition to a PostgreSQL expression
             let condition_expr = if let Some(condition) = &filter.condition {
-                convert_expression_to_postgres_with_context(condition, function_map)?
+                convert_expression_to_postgres_with_context(
+                    condition,
+                    function_map,
+                    current_table_oid,
+                )?
             } else {
                 return Err("Filter relation missing condition".into());
             };
@@ -389,13 +417,13 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Cross(cross)) => {
             // Handle cross relation - create a NestLoop node for Cartesian product
             let left_plan = if let Some(left) = &cross.left {
-                convert_rel_to_plan_tree_with_context(left, function_map)?
+                convert_rel_to_plan_tree_with_context(left, function_map, current_table_oid)?
             } else {
                 return Err("Cross relation missing left input".into());
             };
 
             let right_plan = if let Some(right) = &cross.right {
-                convert_rel_to_plan_tree_with_context(right, function_map)?
+                convert_rel_to_plan_tree_with_context(right, function_map, current_table_oid)?
             } else {
                 return Err("Cross relation missing right input".into());
             };
@@ -405,7 +433,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Aggregate(aggregate)) => {
             // Handle aggregate relation - create an Agg node for GROUP BY and aggregate functions
             let input_plan = if let Some(input) = &aggregate.input {
-                convert_rel_to_plan_tree_with_context(input, function_map)?
+                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Aggregate relation missing input".into());
             };
