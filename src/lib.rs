@@ -1,7 +1,4 @@
 use pgrx::{pg_extern, pg_guard, pg_sys, Spi};
-
-#[cfg(any(test, feature = "pg_test"))]
-use pgrx::pg_schema;
 use prost::Message;
 use substrait::proto::Plan;
 
@@ -407,6 +404,8 @@ unsafe fn handle_literal_result_properly(
     range_table: *mut pg_sys::List,
 ) -> pg_sys::Datum {
     pgrx::info!("DEBUG: handle_literal_result_properly ENTRY");
+    pgrx::info!("DEBUG: handle_literal_result_properly: fcinfo={:p}, postgres_plan={:p}, column_names={:?}, range_table={:p}",
+                fcinfo, postgres_plan, column_names, range_table);
 
     // Get the result info and expected tuple descriptor
     let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
@@ -418,12 +417,15 @@ unsafe fn handle_literal_result_properly(
     pgrx::info!("DEBUG: AS clause has {} attrs", (*expected_tupdesc).natts);
 
     // Execute the plan to get the actual result
-    let execution_result = match execute_postgres_plan(postgres_plan, column_names, range_table) {
-        Ok(result) => result,
-        Err(e) => {
-            pgrx::error!("Failed to execute plan for literal result: {}", e);
-        }
-    };
+    pgrx::info!("DEBUG: Calling execute_postgres_plan from handle_literal_result_properly");
+    let execution_result =
+        match execute_postgres_plan(postgres_plan, column_names.clone(), range_table) {
+            Ok(result) => result,
+            Err(e) => {
+                pgrx::error!("Failed to execute plan for literal result: {}", e);
+            }
+        };
+    pgrx::info!("DEBUG: execute_postgres_plan returned successfully");
 
     // For single result functions, we can return the value directly using ValuePerCall mode
     (*result_info).returnMode = pg_sys::SetFunctionReturnMode::SFRM_ValuePerCall;
@@ -569,7 +571,7 @@ unsafe fn execute_substrait_as_srf_with_function_map(
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::executor::execute_postgres_plan;
     use crate::plan_translator;

@@ -870,6 +870,22 @@ unsafe fn convert_expression_to_target_entry_with_context(
                 (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
                 (*target_entry).resjunk = false;
 
+                // Debug: Validate that TargetEntry and its expression have correct NodeTags
+                if (*target_entry).xpr.type_ as u32 == 124 {
+                    eprintln!("ERROR: TargetEntry NodeTag corrupted to 124 after creation!");
+                    return Err("TargetEntry NodeTag corrupted to pg_type OID (124)".into());
+                }
+
+                if !const_expr.is_null() {
+                    let expr_node = const_expr as *const pg_sys::Node;
+                    if (*expr_node).type_ as u32 == 124 {
+                        eprintln!("ERROR: Const expression NodeTag corrupted to 124 after assignment to TargetEntry!");
+                        return Err(
+                            "Const expression NodeTag corrupted to pg_type OID (124)".into()
+                        );
+                    }
+                }
+
                 Ok(target_entry)
             } else {
                 Err(format!("Literal expression {} missing literal type", index).into())
@@ -888,6 +904,24 @@ unsafe fn convert_expression_to_target_entry_with_context(
             (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
             (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
             (*target_entry).resjunk = false;
+
+            // Debug: Validate NodeTags after creation
+            if (*target_entry).xpr.type_ as u32 == 124 {
+                eprintln!("ERROR: ScalarFunction TargetEntry NodeTag corrupted to 124!");
+                return Err(
+                    "ScalarFunction TargetEntry NodeTag corrupted to pg_type OID (124)".into(),
+                );
+            }
+
+            if !func_expr.is_null() {
+                let expr_node = func_expr as *const pg_sys::Node;
+                if (*expr_node).type_ as u32 == 124 {
+                    eprintln!("ERROR: ScalarFunction expression NodeTag corrupted to 124!");
+                    return Err(
+                        "ScalarFunction expression NodeTag corrupted to pg_type OID (124)".into(),
+                    );
+                }
+            }
 
             Ok(target_entry)
         }

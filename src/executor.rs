@@ -41,36 +41,39 @@ pub unsafe fn execute_plan_directly_raw(
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    eprintln!("DEBUG: execute_plan_directly_raw ENTRY");
     pgrx::info!("DEBUG: execute_plan_directly_raw ENTRY");
+    pgrx::info!(
+        "DEBUG: execute_plan_directly_raw: plan_tree={:p}, column_names={:?}, range_table={:p}",
+        plan_tree,
+        column_names,
+        range_table
+    );
 
     if plan_tree.is_null() {
         return Err("Plan tree pointer is null".into());
     }
 
-    eprintln!("DEBUG: plan_tree pointer is valid: {:p}", plan_tree);
+    pgrx::info!("DEBUG: plan_tree pointer is valid: {:p}", plan_tree);
 
     // Check memory context - plan might be in wrong context
     let current_context = pg_sys::CurrentMemoryContext;
-    eprintln!("DEBUG: Current memory context: {:p}", current_context);
+    pgrx::info!("DEBUG: Current memory context: {:p}", current_context);
 
     // Try to validate the plan tree pointer before dereferencing
-    eprintln!("DEBUG: About to access plan_tree.type_ - this is where crash happens");
+    pgrx::info!("DEBUG: About to access plan_tree.type_");
 
     // Use a more careful approach to access the plan tree
     let plan_type = (*plan_tree).type_;
-    eprintln!("DEBUG: Successfully accessed plan_type: {:?}", plan_type);
+    pgrx::info!("DEBUG: Successfully accessed plan_type: {:?}", plan_type);
 
     let targetlist = (*plan_tree).targetlist;
-    eprintln!("DEBUG: Successfully accessed targetlist: {:p}", targetlist);
+    pgrx::info!("DEBUG: Successfully accessed targetlist: {:p}", targetlist);
 
-    eprintln!("DEBUG: About to call ExecTypeFromTL");
-
-    // Use PostgreSQL's standard execution path for all node types including SeqScan
+    pgrx::info!("DEBUG: About to call ExecTypeFromTL");
 
     // Get the tuple descriptor from the plan's target list
     let tupdesc = pg_sys::ExecTypeFromTL(targetlist);
-    eprintln!("DEBUG: ExecTypeFromTL returned tupdesc: {:p}", tupdesc);
+    pgrx::info!("DEBUG: ExecTypeFromTL returned tupdesc: {:p}", tupdesc);
     if tupdesc.is_null() {
         return Err("Failed to create tuple descriptor from plan".into());
     }
@@ -87,24 +90,27 @@ pub unsafe fn execute_plan_directly_raw(
             *name_data.add(src_len) = 0; // null terminate
         }
     }
+    pgrx::info!("DEBUG: Updated column names in tupdesc");
 
     // Create a tuplestore to collect results
     let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
     if tuplestore.is_null() {
         return Err("Failed to create tuplestore".into());
     }
+    pgrx::info!("DEBUG: Tuplestore created: {:p}", tuplestore);
 
     // SURPRISE FIX: Use PostgreSQL's complete executor startup sequence
-    eprintln!("DEBUG: Implementing surprise fix with ExecutorStart pattern");
+    pgrx::info!("DEBUG: Implementing surprise fix with ExecutorStart pattern");
 
     // Ensure we have a valid transaction state and snapshot
     if !pg_sys::IsTransactionState() {
-        eprintln!("DEBUG: No transaction state - this might cause ExecutorStart to fail");
+        pgrx::info!("DEBUG: No transaction state - this might cause ExecutorStart to fail");
     }
 
     // Create a minimal QueryDesc that PostgreSQL's executor expects
     let query_desc =
         pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
+    pgrx::info!("DEBUG: QueryDesc allocated: {:p}", query_desc);
 
     // Create a minimal PlannedStmt wrapper
     let planned_stmt =
@@ -113,6 +119,7 @@ pub unsafe fn execute_plan_directly_raw(
     (*planned_stmt).planTree = plan_tree;
     (*planned_stmt).rtable = range_table as *mut pg_sys::List;
     (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+    pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt);
 
     // Set up the QueryDesc
     (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
@@ -124,13 +131,14 @@ pub unsafe fn execute_plan_directly_raw(
     (*query_desc).params = std::ptr::null_mut();
     (*query_desc).queryEnv = std::ptr::null_mut();
     (*query_desc).instrument_options = 0;
+    pgrx::info!("DEBUG: QueryDesc setup complete");
 
-    eprintln!("DEBUG: QueryDesc and PlannedStmt created, calling ExecutorStart");
+    pgrx::info!("DEBUG: Calling ExecutorStart");
 
     // Call PostgreSQL's standard ExecutorStart function instead of manual setup
     pg_sys::ExecutorStart(query_desc, 0);
 
-    eprintln!("DEBUG: ExecutorStart succeeded!");
+    pgrx::info!("DEBUG: ExecutorStart succeeded!");
 
     // Get the plan state - ExecutorStart already called ExecInitNode for us!
     let plan_state = (*query_desc).planstate;
@@ -140,34 +148,43 @@ pub unsafe fn execute_plan_directly_raw(
         return Err("ExecutorStart failed to create plan state".into());
     }
 
-    eprintln!("DEBUG: Plan state from ExecutorStart: {:p}", plan_state);
+    pgrx::info!("DEBUG: Plan state from ExecutorStart: {:p}", plan_state);
 
     // Execute the plan and collect tuples into tuplestore with error handling
     let mut tuple_count = 0u64;
     loop {
+        pgrx::info!("DEBUG: Calling ExecProcNode (tuple_count: {})", tuple_count);
         // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
         let slot = pg_sys::ExecProcNode(plan_state);
+        pgrx::info!("DEBUG: ExecProcNode returned slot: {:p}", slot);
         if slot.is_null() {
             break; // No more tuples
         }
 
         // Store tuple directly in tuplestore
         pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        pgrx::info!("DEBUG: Tuple stored in tuplestore");
         tuple_count += 1;
 
         // Prevent infinite loops and excessive memory usage
         if tuple_count > 1000000 {
+            pgrx::warning!("Query returned too many rows (> 1M), execution aborted");
             // Clean up using PostgreSQL's proper sequence
             pg_sys::ExecutorFinish(query_desc);
             pg_sys::ExecutorEnd(query_desc);
             return Err("Query returned too many rows (> 1M), execution aborted".into());
         }
     }
+    pgrx::info!(
+        "DEBUG: ExecProcNode loop finished. Total tuples: {}",
+        tuple_count
+    );
 
     // Clean up using PostgreSQL's proper ExecutorFinish and ExecutorEnd sequence
-    eprintln!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
+    pgrx::info!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
     pg_sys::ExecutorFinish(query_desc);
     pg_sys::ExecutorEnd(query_desc);
+    pgrx::info!("DEBUG: ExecutorFinish and ExecutorEnd completed");
 
     Ok((tupdesc, tuplestore))
 }
