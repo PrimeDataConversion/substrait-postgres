@@ -138,6 +138,93 @@ pub unsafe fn create_values_scan_with_target_list(
     Ok(plan_ptr)
 }
 
+/// Create a SeqScan node with proper PostgreSQL statistics integration
+/// This helper function encapsulates the working SeqScan construction logic
+unsafe fn create_seqscan_with_postgresql_stats(
+    table_oid: pg_sys::Oid,
+    scanrelid: pg_sys::Index,
+    target_list: *mut pg_sys::List,
+) -> *mut pg_sys::SeqScan {
+    // Create the SeqScan node using PostgreSQL's allocation pattern
+    let seqscan_node =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
+
+    // Use PostgreSQL's own estimation functions for accurate statistics
+    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
+
+    // Get cardinality estimate using PostgreSQL's estimate_rel_size
+    let mut pages: pg_sys::BlockNumber = 0;
+    let mut tuples: f64 = 0.0;
+    let mut allvisfrac: f64 = 0.0;
+    pg_sys::estimate_rel_size(
+        relation,
+        std::ptr::null_mut(), // attr_widths - we'll calculate separately
+        &mut pages,
+        &mut tuples,
+        &mut allvisfrac,
+    );
+
+    // Get row width estimate using PostgreSQL's get_relation_data_width
+    let plan_width = pg_sys::get_relation_data_width(table_oid, std::ptr::null_mut());
+
+    // Close the relation
+    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+    // Set up the SeqScan node with PostgreSQL version compatibility
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    {
+        // Set node tag FIRST (critical for ExecInitNode dispatch)
+        (*seqscan_node).plan.type_ = pg_sys::NodeTag::T_SeqScan;
+
+        // Set the critical SeqScan fields
+        (*seqscan_node).plan.targetlist = target_list;
+        (*seqscan_node).plan.qual = std::ptr::null_mut(); // No qualification
+        (*seqscan_node).scanrelid = scanrelid; // Critical: 1-based index into range table
+
+        // Initialize base Plan fields with PostgreSQL's estimates
+        (*seqscan_node).plan.lefttree = std::ptr::null_mut();
+        (*seqscan_node).plan.righttree = std::ptr::null_mut();
+        (*seqscan_node).plan.initPlan = std::ptr::null_mut();
+        (*seqscan_node).plan.extParam = std::ptr::null_mut();
+        (*seqscan_node).plan.allParam = std::ptr::null_mut();
+        (*seqscan_node).plan.startup_cost = 0.0;
+        (*seqscan_node).plan.total_cost = 1.0;
+        (*seqscan_node).plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
+        (*seqscan_node).plan.plan_width = plan_width; // Use PostgreSQL's width estimate
+        (*seqscan_node).plan.parallel_aware = false;
+        (*seqscan_node).plan.parallel_safe = true;
+        (*seqscan_node).plan.async_capable = false;
+        (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
+    }
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    {
+        // Set node tag FIRST (critical for ExecInitNode dispatch)
+        (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+
+        // Set the critical SeqScan fields
+        (*seqscan_node).scan.plan.targetlist = target_list;
+        (*seqscan_node).scan.plan.qual = std::ptr::null_mut(); // No qualification
+        (*seqscan_node).scan.scanrelid = scanrelid; // Critical: 1-based index into range table
+
+        // Initialize base Plan fields with PostgreSQL's estimates
+        (*seqscan_node).scan.plan.lefttree = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.righttree = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.initPlan = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.extParam = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.allParam = std::ptr::null_mut();
+        (*seqscan_node).scan.plan.startup_cost = 0.0;
+        (*seqscan_node).scan.plan.total_cost = 1.0;
+        (*seqscan_node).scan.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
+        (*seqscan_node).scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
+        (*seqscan_node).scan.plan.parallel_aware = false;
+        (*seqscan_node).scan.plan.parallel_safe = true;
+        (*seqscan_node).scan.plan.async_capable = false;
+        (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
+    }
+
+    seqscan_node
+}
+
 /// Create a PostgreSQL SeqScan node for table scans
 /// This function creates a SeqScan node and a range table entry.
 /// Returns both the plan node and the range table entry.
@@ -169,61 +256,8 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     // Create target list FIRST - PostgreSQL pattern
     let target_list = create_target_list_for_table(table_oid)?;
 
-    // Create the SeqScan node using PostgreSQL's allocation pattern
-    let seqscan_node =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
-
-    // Follow PostgreSQL's make_seqscan pattern exactly
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    {
-        // Set node tag FIRST (critical for ExecInitNode dispatch)
-        (*seqscan_node).plan.type_ = pg_sys::NodeTag::T_SeqScan;
-
-        // Set the three critical SeqScan fields from PostgreSQL's make_seqscan
-        (*seqscan_node).plan.targetlist = target_list;
-        (*seqscan_node).plan.qual = std::ptr::null_mut(); // No qualification
-        (*seqscan_node).scanrelid = scanrelid; // Critical: 1-based index into range table
-
-        // Initialize base Plan fields (following copy_generic_plan_info pattern)
-        (*seqscan_node).plan.lefttree = std::ptr::null_mut();
-        (*seqscan_node).plan.righttree = std::ptr::null_mut();
-        (*seqscan_node).plan.initPlan = std::ptr::null_mut();
-        (*seqscan_node).plan.extParam = std::ptr::null_mut();
-        (*seqscan_node).plan.allParam = std::ptr::null_mut();
-        (*seqscan_node).plan.startup_cost = 0.0;
-        (*seqscan_node).plan.total_cost = 1000.0;
-        (*seqscan_node).plan.plan_rows = 1000.0;
-        (*seqscan_node).plan.plan_width = 32;
-        (*seqscan_node).plan.parallel_aware = false;
-        (*seqscan_node).plan.parallel_safe = true;
-        (*seqscan_node).plan.async_capable = false;
-        (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
-    }
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-    {
-        // Set node tag FIRST (critical for ExecInitNode dispatch)
-        (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
-
-        // Set the three critical SeqScan fields from PostgreSQL's make_seqscan
-        (*seqscan_node).scan.plan.targetlist = target_list;
-        (*seqscan_node).scan.plan.qual = std::ptr::null_mut(); // No qualification
-        (*seqscan_node).scan.scanrelid = scanrelid; // Critical: 1-based index into range table
-
-        // Initialize base Plan fields (following copy_generic_plan_info pattern)
-        (*seqscan_node).scan.plan.lefttree = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.righttree = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.initPlan = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.extParam = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.allParam = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.startup_cost = 0.0;
-        (*seqscan_node).scan.plan.total_cost = 1000.0;
-        (*seqscan_node).scan.plan.plan_rows = 1000.0;
-        (*seqscan_node).scan.plan.plan_width = 32;
-        (*seqscan_node).scan.plan.parallel_aware = false;
-        (*seqscan_node).scan.plan.parallel_safe = true;
-        (*seqscan_node).scan.plan.async_capable = false;
-        (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
-    }
+    // Use our improved SeqScan construction with PostgreSQL statistics
+    let seqscan_node = create_seqscan_with_postgresql_stats(table_oid, scanrelid, target_list);
 
     eprintln!("DEBUG: SeqScan node created following PostgreSQL pattern");
     pgrx::info!("DEBUG: SeqScan node created following PostgreSQL pattern");
@@ -413,6 +447,23 @@ unsafe fn create_target_list_for_table(
         (*var_node).vartypmod = (*attr).atttypmod;
         (*var_node).varcollid = (*attr).attcollation;
         (*var_node).varlevelsup = 0;
+
+        eprintln!(
+            "DEBUG: Column {}: attnum={}, atttypid={}, atttypmod={}, attcollation={}",
+            i + 1,
+            (*attr).attnum,
+            (*attr).atttypid,
+            (*attr).atttypmod,
+            (*attr).attcollation
+        );
+        pgrx::info!(
+            "DEBUG: Column {}: attnum={}, atttypid={}, atttypmod={}, attcollation={}",
+            i + 1,
+            (*attr).attnum,
+            (*attr).atttypid,
+            (*attr).atttypmod,
+            (*attr).attcollation
+        );
 
         eprintln!(
             "DEBUG: Var node fields set, creating TargetEntry for column {}",

@@ -195,8 +195,26 @@ unsafe fn collect_range_table_from_plan_tree(
     let mut range_table = std::ptr::null_mut::<pg_sys::List>();
     let mut current_scanrelid = 1u32;
 
+    eprintln!(
+        "DEBUG: collect_range_table_from_plan_tree starting with plan_tree: {:p}",
+        plan_tree
+    );
+    pgrx::info!(
+        "DEBUG: collect_range_table_from_plan_tree starting with plan_tree: {:p}",
+        plan_tree
+    );
+
     // Traverse the plan tree and collect all SeqScan nodes with error handling
     collect_seqscan_nodes_recursive(plan_tree, &mut range_table, &mut current_scanrelid)?;
+
+    eprintln!(
+        "DEBUG: collect_range_table_from_plan_tree finished, range_table: {:p}",
+        range_table
+    );
+    pgrx::info!(
+        "DEBUG: collect_range_table_from_plan_tree finished, range_table: {:p}",
+        range_table
+    );
 
     Ok(range_table)
 }
@@ -208,10 +226,22 @@ unsafe fn collect_seqscan_nodes_recursive(
     current_scanrelid: &mut u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if plan.is_null() {
+        eprintln!("DEBUG: collect_seqscan_nodes_recursive - plan is null, returning");
+        pgrx::info!("DEBUG: collect_seqscan_nodes_recursive - plan is null, returning");
         return Ok(());
     }
 
-    match (*plan).type_ {
+    let node_type = (*plan).type_;
+    eprintln!(
+        "DEBUG: collect_seqscan_nodes_recursive - found node type: {:?}",
+        node_type
+    );
+    pgrx::info!(
+        "DEBUG: collect_seqscan_nodes_recursive - found node type: {:?}",
+        node_type
+    );
+
+    match node_type {
         pg_sys::NodeTag::T_SeqScan => {
             // Get table OID from plan_node_id (stored during SeqScan creation)
             let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
@@ -253,11 +283,25 @@ unsafe fn collect_seqscan_nodes_recursive(
         }
         _ => {
             // For other node types, recurse into child nodes
+            eprintln!("DEBUG: Node type {:?} - checking child nodes", node_type);
+            pgrx::info!("DEBUG: Node type {:?} - checking child nodes", node_type);
+
             if !(*plan).lefttree.is_null() {
+                eprintln!("DEBUG: Recursing into lefttree: {:p}", (*plan).lefttree);
+                pgrx::info!("DEBUG: Recursing into lefttree: {:p}", (*plan).lefttree);
                 collect_seqscan_nodes_recursive((*plan).lefttree, range_table, current_scanrelid)?;
+            } else {
+                eprintln!("DEBUG: No lefttree to recurse into");
+                pgrx::info!("DEBUG: No lefttree to recurse into");
             }
+
             if !(*plan).righttree.is_null() {
+                eprintln!("DEBUG: Recursing into righttree: {:p}", (*plan).righttree);
+                pgrx::info!("DEBUG: Recursing into righttree: {:p}", (*plan).righttree);
                 collect_seqscan_nodes_recursive((*plan).righttree, range_table, current_scanrelid)?;
+            } else {
+                eprintln!("DEBUG: No righttree to recurse into");
+                pgrx::info!("DEBUG: No righttree to recurse into");
             }
         }
     }
