@@ -106,7 +106,8 @@ impl AggNodeBuilder {
     }
 
     pub fn into_plan_ptr(self) -> *mut pg_sys::Plan {
-        self.ptr as *mut pg_sys::Plan
+        // For Agg nodes, the plan field is directly accessible (no version differences)
+        unsafe { &mut (*self.ptr).plan as *mut pg_sys::Plan }
     }
 }
 
@@ -185,7 +186,7 @@ fn extract_grouping_cols(
     groupings: &[substrait::proto::aggregate_rel::Grouping],
 ) -> Result<Vec<pg_sys::AttrNumber>, Box<dyn std::error::Error + Send + Sync>> {
     let mut result = Vec::new();
-    if let Some(grouping) = groupings.get(0) {
+    if let Some(grouping) = groupings.first() {
         #[allow(deprecated)]
         for expr in &grouping.grouping_expressions {
             if let Ok(Some(field)) = extract_struct_field(expr) {
@@ -260,7 +261,7 @@ fn resolve_agg_oid(
 }
 
 unsafe fn palloc_array<T>(len: i32) -> *mut T {
-    pg_sys::palloc((len as usize * std::mem::size_of::<T>()) as usize) as *mut T
+    pg_sys::palloc(len as usize * std::mem::size_of::<T>()) as *mut T
 }
 
 /// Get column type information from input plan's target list

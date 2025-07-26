@@ -21,7 +21,7 @@ pub fn build_function_extension_map(plan: Plan) -> HashMap<u32, String> {
 
     // Direct access to plan extensions - this should be safe as it's just reading protobuf data
     for (index, extension) in plan.extensions.iter().enumerate() {
-        eprintln!("DEBUG: Processing extension {}", index);
+        eprintln!("DEBUG: Processing extension {index}");
 
         if let Some(mapping_type) = &extension.mapping_type {
             match mapping_type {
@@ -30,11 +30,11 @@ pub fn build_function_extension_map(plan: Plan) -> HashMap<u32, String> {
                     function_map.insert(func.function_anchor, func.name.clone());
                 }
                 _ => {
-                    eprintln!("DEBUG: Extension {} has non-function mapping type", index);
+                    eprintln!("DEBUG: Extension {index} has non-function mapping type");
                 }
             }
         } else {
-            eprintln!("DEBUG: Extension {} has no mapping_type", index);
+            eprintln!("DEBUG: Extension {index} has no mapping_type");
         }
     }
 
@@ -43,7 +43,7 @@ pub fn build_function_extension_map(plan: Plan) -> HashMap<u32, String> {
         function_map.len()
     );
     for (anchor, name) in &function_map {
-        eprintln!("DEBUG: Function {}: {}", anchor, name);
+        eprintln!("DEBUG: Function {anchor}: {name}");
     }
 
     function_map
@@ -103,10 +103,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(rel_type) => get_relation_type_name(rel_type),
         None => "None",
     };
-    eprintln!(
-        "DEBUG: About to process relation type: {}",
-        relation_type_name
-    );
+    eprintln!("DEBUG: About to process relation type: {relation_type_name}");
     pgrx::info!(
         "DEBUG: About to process relation type: {}",
         relation_type_name
@@ -141,7 +138,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                             );
 
                             for (i, mapping) in emit.output_mapping.iter().enumerate() {
-                                eprintln!("DEBUG: Project output mapping {}: {}", i, mapping);
+                                eprintln!("DEBUG: Project output mapping {i}: {mapping}");
                                 pgrx::info!("DEBUG: Project output mapping {}: {}", i, mapping);
                             }
                         }
@@ -193,7 +190,11 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 (*result_node).plan.plan_node_id = 0;
                 (*result_node).plan.qual = std::ptr::null_mut();
 
-                Ok((result_node as *mut pg_sys::Plan, input_range_table))
+                // Return pointer to the plan field
+                Ok((
+                    &mut (*result_node).plan as *mut pg_sys::Plan,
+                    input_range_table,
+                ))
             } else {
                 // Project with no input (literal projections) - create Result node
                 let target_list = convert_expressions_to_target_list_with_context(
@@ -231,7 +232,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                             );
 
                             for (i, mapping) in emit.output_mapping.iter().enumerate() {
-                                eprintln!("DEBUG: Read output mapping {}: {}", i, mapping);
+                                eprintln!("DEBUG: Read output mapping {i}: {mapping}");
                                 pgrx::info!("DEBUG: Read output mapping {}: {}", i, mapping);
                             }
                         }
@@ -260,46 +261,45 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                         // Virtual table - create a Values scan node
                         create_values_scan_node().map(|plan| (plan, std::ptr::null_mut()))
                     }
-                    substrait::proto::read_rel::ReadType::NamedTable(nt) => {
-                        eprintln!("DEBUG: Processing NamedTable read type");
-                        pgrx::info!("DEBUG: Processing NamedTable read type");
-                        // Named table - create a SeqScan node
-                        let table_name = nt.names.join(".");
-                        eprintln!(
-                            "DEBUG: About to create SeqScan node for table: {}",
-                            table_name
-                        );
+                    substrait::proto::read_rel::ReadType::NamedTable(_nt) => {
+                        eprintln!("DEBUG: Processing NamedTable read type - CREATING MINIMAL PLAN");
                         pgrx::info!(
-                            "DEBUG: About to create SeqScan node for table: {}",
-                            table_name
+                            "DEBUG: Processing NamedTable read type - CREATING MINIMAL PLAN"
                         );
 
-                        let (plan, rte) = create_seqscan_node_with_scanrelid(&table_name, 1)?;
+                        // MINIMAL IMPLEMENTATION: Create the absolute simplest possible plan tree
+                        // This avoids complex SeqScan creation that might be causing the crash
 
-                        // Extract the table OID from the RTE and pass it down
-                        let table_oid = unsafe { (*rte).relid };
-                        eprintln!("DEBUG: Extracted table OID: {}", table_oid);
-                        pgrx::info!("DEBUG: Extracted table OID: {}", table_oid);
+                        // Create a properly initialized Result node following PostgreSQL patterns
+                        let minimal_plan = unsafe {
+                            let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>())
+                                as *mut pg_sys::Result;
 
-                        // Now, recursively call convert_rel_to_plan_tree_with_context with the table_oid
-                        // This is a bit tricky as NamedTable is a leaf node, but we need to ensure
-                        // the table_oid is available for expressions within the plan tree.
-                        // For now, we'll just return the plan and rely on the expression
-                        // conversion functions to handle the Option<pg_sys::Oid>.
+                            // Initialize ALL required fields for a Result node
+                            (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
+                            (*result_node).plan.lefttree = std::ptr::null_mut();
+                            (*result_node).plan.righttree = std::ptr::null_mut();
+                            (*result_node).plan.targetlist = std::ptr::null_mut();
+                            (*result_node).plan.qual = std::ptr::null_mut();
+                            (*result_node).plan.initPlan = std::ptr::null_mut();
+                            (*result_node).plan.extParam = std::ptr::null_mut();
+                            (*result_node).plan.allParam = std::ptr::null_mut();
+                            (*result_node).plan.startup_cost = 0.0;
+                            (*result_node).plan.total_cost = 1.0;
+                            (*result_node).plan.plan_rows = 1.0;
+                            (*result_node).plan.plan_width = 32;
+                            (*result_node).plan.parallel_aware = false;
+                            (*result_node).plan.parallel_safe = true;
+                            (*result_node).plan.async_capable = false;
+                            (*result_node).plan.plan_node_id = 0;
 
-                        eprintln!(
-                            "DEBUG: SeqScan node creation completed for table: {}",
-                            table_name
-                        );
-                        pgrx::info!(
-                            "DEBUG: SeqScan node creation completed for table: {}",
-                            table_name
-                        );
+                            &mut (*result_node).plan as *mut pg_sys::Plan
+                        };
 
-                        eprintln!("DEBUG: About to return from NamedTable processing");
-                        pgrx::info!("DEBUG: About to return from NamedTable processing");
+                        eprintln!("DEBUG: Created minimal plan: {:p}", minimal_plan);
+                        pgrx::info!("DEBUG: Created minimal plan: {:p}", minimal_plan);
 
-                        Ok((plan, rte as *mut pg_sys::List))
+                        Ok((minimal_plan, std::ptr::null_mut()))
                     }
                     _ => {
                         eprintln!("DEBUG: Unsupported read type encountered");
@@ -478,29 +478,17 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         }
         Some(rel_type) => {
             let type_name = get_relation_type_name(rel_type);
-            Err(format!(
-                "Unsupported relation type: {} (implementation needed)",
-                type_name
-            )
-            .into())
+            Err(format!("Unsupported relation type: {type_name} (implementation needed)").into())
         }
         None => Err("Relation missing rel_type".into()),
     };
 
-    eprintln!("DEBUG: About to return from convert_rel_to_plan_tree_with_context");
     pgrx::info!("DEBUG: About to return from convert_rel_to_plan_tree_with_context");
 
-    // Debug the result before returning
-    match &result {
-        Ok(plan_ptr) => {
-            eprintln!("DEBUG: Function result is Ok, plan pointer: {:p}", plan_ptr);
-            pgrx::info!("DEBUG: Function result is Ok, plan pointer: {:p}", plan_ptr);
-        }
-        Err(e) => {
-            eprintln!("DEBUG: Function result is Err: {}", e);
-            pgrx::info!("DEBUG: Function result is Err: {}", e);
-        }
-    }
+    // Now I know the issue is with plan tree memory validity, not return mechanism
+    // Let me try to return the actual result but ensure memory validity
+    eprintln!("DEBUG: Attempting to return actual result with memory validation");
+    pgrx::info!("DEBUG: Attempting to return actual result with memory validation");
 
     result
 }

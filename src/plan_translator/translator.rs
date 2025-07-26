@@ -31,7 +31,7 @@ pub fn translate_substrait_plan(
         function_map.len()
     );
     for (ref_id, func_name) in &function_map {
-        eprintln!("  Function ref {}: {}", ref_id, func_name);
+        eprintln!("  Function ref {ref_id}: {func_name}");
     }
 
     translate_substrait_plan_with_function_map(plan, function_map)
@@ -76,10 +76,18 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: About to call convert_plan_relation_to_plan_tree_with_context");
         pgrx::info!("DEBUG: About to call convert_plan_relation_to_plan_tree_with_context");
 
-        let (plan_tree, _range_table) =
-            convert_plan_relation_to_plan_tree_with_context(relation, &function_map, None)?;
+        eprintln!("DEBUG: Calling convert_plan_relation_to_plan_tree_with_context");
+        pgrx::info!("DEBUG: Calling convert_plan_relation_to_plan_tree_with_context");
 
-        eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context returned successfully, plan_tree: {:p}", plan_tree);
+        let relation_result =
+            convert_plan_relation_to_plan_tree_with_context(relation, &function_map, None);
+
+        eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context call completed");
+        pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context call completed");
+
+        let (plan_tree, _range_table) = relation_result?;
+
+        eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context returned successfully, plan_tree: {plan_tree:p}");
         pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context returned successfully, plan_tree: {:p}", plan_tree);
 
         // DIAGNOSTIC: Check plan tree structure before nodeToString
@@ -93,22 +101,22 @@ pub fn translate_substrait_plan_with_function_map(
             return Err("Plan tree is null".into());
         }
 
-        eprintln!("DEBUG: plan_tree pointer is valid: {:p}", plan_tree);
+        eprintln!("DEBUG: plan_tree pointer is valid: {plan_tree:p}");
         pgrx::info!("DEBUG: plan_tree pointer is valid: {:p}", plan_tree);
 
         // Check the NodeTag of the root plan
         let node_tag = (*plan_tree).type_;
-        eprintln!("DEBUG: Root plan node type: {:?}", node_tag);
+        eprintln!("DEBUG: Root plan node type: {node_tag:?}");
         pgrx::info!("DEBUG: Root plan node type: {:?}", node_tag);
 
         // Check if targetlist is valid
         let targetlist = (*plan_tree).targetlist;
-        eprintln!("DEBUG: Target list pointer: {:p}", targetlist);
+        eprintln!("DEBUG: Target list pointer: {targetlist:p}");
         pgrx::info!("DEBUG: Target list pointer: {:p}", targetlist);
 
         if !targetlist.is_null() {
             let list_length = (*targetlist).length;
-            eprintln!("DEBUG: Target list length: {}", list_length);
+            eprintln!("DEBUG: Target list length: {list_length}");
             pgrx::info!("DEBUG: Target list length: {}", list_length);
         }
 
@@ -118,7 +126,7 @@ pub fn translate_substrait_plan_with_function_map(
         // Debug: Print the PostgreSQL plan tree structure
         let plan_str = pg_sys::nodeToString(plan_tree as *const std::ffi::c_void);
 
-        eprintln!("DEBUG: nodeToString returned, plan_str: {:p}", plan_str);
+        eprintln!("DEBUG: nodeToString returned, plan_str: {plan_str:p}");
         pgrx::info!("DEBUG: nodeToString returned, plan_str: {:p}", plan_str);
 
         if !plan_str.is_null() {
@@ -131,7 +139,7 @@ pub fn translate_substrait_plan_with_function_map(
             pgrx::info!("DEBUG: CStr created, converting to str");
 
             if let Ok(plan_string) = plan_cstr.to_str() {
-                eprintln!("DEBUG: PostgreSQL Plan Tree: {}", plan_string);
+                eprintln!("DEBUG: PostgreSQL Plan Tree: {plan_string}");
                 pgrx::info!("PostgreSQL Plan Tree: {}", plan_string);
             }
 
@@ -161,9 +169,9 @@ pub fn translate_substrait_plan_with_function_map(
                 rt
             }
             Err(e) => {
-                eprintln!("DEBUG: collect_range_table_from_plan_tree failed: {}", e);
+                eprintln!("DEBUG: collect_range_table_from_plan_tree failed: {e}");
                 pgrx::info!("DEBUG: collect_range_table_from_plan_tree failed: {}", e);
-                return Err(format!("Range table collection failed: {}", e).into());
+                return Err(format!("Range table collection failed: {e}").into());
             }
         };
 
@@ -208,20 +216,14 @@ unsafe fn collect_seqscan_nodes_recursive(
             // Get table OID from plan_node_id (stored during SeqScan creation)
             let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
 
-            eprintln!("DEBUG: Processing SeqScan with table OID: {}", table_oid);
+            eprintln!("DEBUG: Processing SeqScan with table OID: {table_oid}");
             pgrx::info!("DEBUG: Processing SeqScan with table OID: {}", table_oid);
 
             // Create range table entry for this table with proper error handling
             let rte =
                 super::plan_nodes::create_range_table_entry_from_oid(table_oid).map_err(|e| {
-                    eprintln!(
-                        "DEBUG: Failed to create RTE for table OID {}: {}",
-                        table_oid, e
-                    );
-                    format!(
-                        "Failed to create range table entry for table OID {}: {}",
-                        table_oid, e
-                    )
+                    eprintln!("DEBUG: Failed to create RTE for table OID {table_oid}: {e}");
+                    format!("Failed to create range table entry for table OID {table_oid}: {e}")
                 })?;
             *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
 

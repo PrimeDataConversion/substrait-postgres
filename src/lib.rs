@@ -163,8 +163,7 @@ fn debug_postgresql_execution() -> Result<String, Box<dyn std::error::Error + Se
             }
             Err(e) => {
                 return Err(format!(
-                    "Our execution wrapper FAILED with PostgreSQL's SeqScan plan: {}",
-                    e
+                    "Our execution wrapper FAILED with PostgreSQL's SeqScan plan: {e}"
                 )
                 .into());
             }
@@ -182,7 +181,7 @@ fn debug_postgresql_execution() -> Result<String, Box<dyn std::error::Error + Se
                     result
                 }
                 Err(e) => {
-                    return Err(format!("Failed to create our SeqScan node: {}", e).into());
+                    return Err(format!("Failed to create our SeqScan node: {e}").into());
                 }
             };
 
@@ -214,7 +213,7 @@ fn debug_postgresql_execution() -> Result<String, Box<dyn std::error::Error + Se
                 Ok(success_msg)
             }
             Err(e) => {
-                let failure_msg = format!("CONFIRMED: Our execution wrapper FAILS with OUR SeqScan plan: {}. This confirms the issue is in our plan construction!", e);
+                let failure_msg = format!("CONFIRMED: Our execution wrapper FAILS with OUR SeqScan plan: {e}. This confirms the issue is in our plan construction!");
                 pgrx::info!("DEBUG: {}", failure_msg);
                 Ok(failure_msg)
             }
@@ -373,22 +372,17 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
     match plan_translator::translate_substrait_plan_with_function_map(&plan, function_map) {
         Ok((postgres_plan, column_names, range_table)) => {
             pgrx::info!("Translation successful in bytea path");
-            // Apply same workaround for single-column cases to bypass OID 65536 issue
-            if column_names.len() == 1 {
-                pgrx::info!(
-                    "DEBUG: Handling single-column case in bytea path: {}",
-                    column_names[0]
-                );
-                return handle_literal_result_properly(
-                    fcinfo,
-                    postgres_plan,
-                    column_names,
-                    range_table,
-                );
-            }
-
-            pgrx::info!("DEBUG: Multi-column bytea path, using table scan workaround");
-            return handle_table_scan_properly(fcinfo, postgres_plan, column_names, range_table);
+            // Execute plan using proper SRF mechanism
+            pgrx::info!(
+                "DEBUG: Executing plan with {} columns using standard SRF approach",
+                column_names.len()
+            );
+            crate::executor::execute_postgres_plan_as_srf(
+                fcinfo,
+                postgres_plan,
+                column_names,
+                range_table as *mut pg_sys::List,
+            )
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -539,30 +533,21 @@ unsafe fn execute_substrait_as_srf_with_function_map(
                 pgrx::info!("DEBUG: Column {}: {}", i, name);
             }
 
-            // For literal results, use a fixed workaround
-            if column_names.len() == 1 {
-                pgrx::info!("DEBUG: Single column case, using fixed literal workaround");
-                return handle_literal_result_properly(
-                    fcinfo,
-                    postgres_plan,
-                    column_names,
-                    range_table,
-                );
-            }
-
-            pgrx::info!("DEBUG: Multi-column case with columns: {:?}", column_names);
+            // Execute plan using proper SRF mechanism
+            pgrx::info!(
+                "DEBUG: Executing plan with {} columns: {:?}",
+                column_names.len(),
+                column_names
+            );
             pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
             pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
 
-            // Try the table scan workaround for multi-column cases to bypass OID 65536
-            pgrx::info!("DEBUG: About to call handle_table_scan_properly");
-            let result =
-                handle_table_scan_properly(fcinfo, postgres_plan, column_names, range_table);
-            pgrx::info!(
-                "DEBUG: handle_table_scan_properly returned, result: {:?}",
-                result
-            );
-            return result;
+            crate::executor::execute_postgres_plan_as_srf(
+                fcinfo,
+                postgres_plan,
+                column_names,
+                range_table as *mut pg_sys::List,
+            )
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -737,13 +722,13 @@ mod tests {
         let plan: Plan = match serde_json::from_str(json_plan) {
             Ok(p) => p,
             Err(e) => {
-                panic!("Failed to parse literal plan JSON: {}", e);
+                panic!("Failed to parse literal plan JSON: {e}");
             }
         };
 
         let mut protobuf_bytes = Vec::new();
         if let Err(e) = plan.encode(&mut protobuf_bytes) {
-            panic!("Failed to encode literal plan to protobuf: {}", e);
+            panic!("Failed to encode literal plan to protobuf: {e}");
         }
 
         // Convert bytes to PostgreSQL bytea hex format
@@ -751,12 +736,12 @@ mod tests {
             "\\x{}",
             protobuf_bytes
                 .iter()
-                .map(|b| format!("{:02x}", b))
+                .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
 
         // Test the hex string length using SQL
-        let hex_length_query = format!("SELECT length('{}'::bytea)", hex_string);
+        let hex_length_query = format!("SELECT length('{hex_string}'::bytea)");
         let hex_length_result = Spi::get_one::<i32>(&hex_length_query);
 
         match hex_length_result {
@@ -770,14 +755,13 @@ mod tests {
                 );
             }
             Ok(None) => panic!("SQL length query returned NULL"),
-            Err(e) => panic!("SQL length query failed: {:?}", e),
+            Err(e) => panic!("SQL length query failed: {e:?}"),
         }
 
         // Test with the real execution function (not the safe mock version)
         // Since the function returns SETOF RECORD, we need to specify the column definition
         let query = format!(
-            "SELECT COUNT(*) FROM from_substrait('{}'::bytea) AS t(test_value int)",
-            hex_string
+            "SELECT COUNT(*) FROM from_substrait('{hex_string}'::bytea) AS t(test_value int)"
         );
         let result = Spi::get_one::<i64>(&query);
 
@@ -820,26 +804,25 @@ mod tests {
         let plan: Plan = match serde_json::from_str(json_plan) {
             Ok(p) => p,
             Err(e) => {
-                panic!("Failed to parse minimal plan JSON: {}", e);
+                panic!("Failed to parse minimal plan JSON: {e}");
             }
         };
 
         // Encode Plan to protobuf bytes
         let mut protobuf_bytes = Vec::new();
         if let Err(e) = plan.encode(&mut protobuf_bytes) {
-            panic!("Failed to encode minimal plan to protobuf: {}", e);
+            panic!("Failed to encode minimal plan to protobuf: {e}");
         }
 
         // Convert bytes to hex string for SQL
         let hex_string = protobuf_bytes
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{b:02x}"))
             .collect::<String>();
 
         // Test with the minimal valid protobuf data (SELECT 1 equivalent)
         let query = format!(
-            "SELECT COUNT(*) FROM from_substrait('\\x{}'::bytea) AS t(column_1 int)",
-            hex_string
+            "SELECT COUNT(*) FROM from_substrait('\\x{hex_string}'::bytea) AS t(column_1 int)"
         );
         let result = Spi::get_one::<i64>(&query);
 
@@ -902,13 +885,12 @@ mod tests {
         // Convert bytes to hex string for SQL
         let hex_string = protobuf_bytes
             .iter()
-            .map(|b| format!("{:02x}", b))
+            .map(|b| format!("{b:02x}"))
             .collect::<String>();
 
         // Test with the valid protobuf data
         let query = format!(
-            "SELECT COUNT(*) FROM from_substrait('\\x{}'::bytea) AS t(test_value int)",
-            hex_string
+            "SELECT COUNT(*) FROM from_substrait('\\x{hex_string}'::bytea) AS t(test_value int)"
         );
         let result = Spi::get_one::<i64>(&query);
 
@@ -941,10 +923,8 @@ mod tests {
 
         // Test that the function can be called - simplified to single column to avoid issues
         let escaped_plan = json_plan.replace("'", "''");
-        let query = format!(
-            "SELECT * FROM from_substrait_json('{}') AS t(test_column int)",
-            escaped_plan
-        );
+        let query =
+            format!("SELECT * FROM from_substrait_json('{escaped_plan}') AS t(test_column int)");
 
         let result = Spi::get_one::<i64>(&query);
         // TODO -- Modify this to verify that the single returned integer is exactly 42 instead.
@@ -980,8 +960,7 @@ mod tests {
         // Use the function
         let escaped_plan = json_plan.replace("'", "''");
         let query = format!(
-            "SELECT COUNT(*) FROM from_substrait_json('{}') AS t(result_value int)",
-            escaped_plan
+            "SELECT COUNT(*) FROM from_substrait_json('{escaped_plan}') AS t(result_value int)"
         );
 
         let result = Spi::get_one::<i64>(&query);
@@ -1063,25 +1042,35 @@ mod tests {
                     function_map.len()
                 );
 
+                // Step 2: Translate plan to get dynamic schema information
                 let (postgres_plan, column_names, range_table) =
                     plan_translator::translate_substrait_plan_with_function_map(
                         &plan,
                         function_map,
                     )
-                    .expect("Translation failed");
+                    .expect("Translation should succeed for valid TPC-H plan");
 
-                let as_clause = match unsafe {
-                    execute_postgres_plan(postgres_plan, column_names, range_table)
+                pgrx::info!(
+                    "{} - Translation successful, got {} columns: {:?}",
+                    $file_name,
+                    column_names.len(),
+                    column_names
+                );
+
+                // Execute to get schema information for dynamic AS clause generation
+                let execution_result = match unsafe {
+                    crate::executor::execute_postgres_plan(
+                        postgres_plan,
+                        column_names.clone(),
+                        range_table,
+                    )
                 } {
-                    Ok(result_data) => {
-                        let clause = generate_as_clause(&result_data);
-                        pgrx::info!("{} - Generated AS clause: {}", $file_name, clause);
-                        clause
-                    }
-                    Err(e) => {
-                        panic!("{} - Execution failed: {}", $file_name, e);
-                    }
+                    Ok(result) => result,
+                    Err(e) => panic!("{} - Plan execution failed: {}", $file_name, e),
                 };
+
+                // Generate dynamic AS clause from execution result
+                let as_clause = generate_as_clause(&execution_result);
 
                 // Step 3: Execute the Substrait plan and validate results with golden values
                 let execution_query = format!(
@@ -1311,10 +1300,8 @@ mod tests {
 
         // This should fail gracefully with a proper error, not crash
         let escaped_json = simple_scan_json.replace("'", "''");
-        let query = format!(
-            "SELECT * FROM from_substrait_json('{}') AS t(id int, name text)",
-            escaped_json
-        );
+        let query =
+            format!("SELECT * FROM from_substrait_json('{escaped_json}') AS t(id int, name text)");
         // This should panic with an error about the missing table
         let _result = Spi::get_one::<String>(&query);
     }
@@ -1354,7 +1341,7 @@ mod tests {
 
         // This should work and return data
         let escaped_json = simple_scan_json.replace("'", "''");
-        let query = format!("SELECT string_agg(id::text, ',') FROM from_substrait_json('{}') AS t(id int, name text)", escaped_json);
+        let query = format!("SELECT string_agg(id::text, ',') FROM from_substrait_json('{escaped_json}') AS t(id int, name text)");
         let result = Spi::get_one::<String>(&query);
 
         match result {
@@ -1362,12 +1349,11 @@ mod tests {
                 // Should get some result with our test data
                 assert!(
                     data.contains("1") || data.contains("2"),
-                    "Expected test data, got: {}",
-                    data
+                    "Expected test data, got: {data}"
                 );
             }
             Ok(None) => panic!("Expected data from table scan, got NULL"),
-            Err(e) => panic!("Expected successful table scan, got error: {:?}", e),
+            Err(e) => panic!("Expected successful table scan, got error: {e:?}"),
         }
     }
 
@@ -1395,10 +1381,8 @@ mod tests {
         let escaped_plan = json_plan.replace("'", "''");
 
         // Test WITH AS clause - should still work
-        let query_with_as = format!(
-            "SELECT * FROM from_substrait_json('{}') AS t(result int)",
-            escaped_plan
-        );
+        let query_with_as =
+            format!("SELECT * FROM from_substrait_json('{escaped_plan}') AS t(result int)");
         let result = Spi::get_one::<i32>(&query_with_as);
 
         // This should succeed - we have a valid plan with AS clause
@@ -1528,7 +1512,7 @@ mod tests {
         );
 
         // Build the DATABASE_URL for the test database
-        let db_url = format!("postgres://{}@{}:{}/{}", user, host, port, database);
+        let db_url = format!("postgres://{user}@{host}:{port}/{database}");
 
         // Run the setup script with the correct connection parameters
         let output = Command::new("bash")
@@ -1545,10 +1529,7 @@ mod tests {
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!(
-                "TPC-H setup script failed:\nSTDOUT:\n{}\nSTDERR:\n{}",
-                stdout, stderr
-            );
+            panic!("TPC-H setup script failed:\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1647,7 +1628,7 @@ unsafe fn execute_simple_table_scan(
     // Open the table for reading
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
     if relation.is_null() {
-        return Err(format!("Could not open relation with OID {}", table_oid).into());
+        return Err(format!("Could not open relation with OID {table_oid}").into());
     }
 
     pgrx::info!("DEBUG: Opened table successfully");
@@ -1796,7 +1777,7 @@ unsafe fn extract_table_oid_from_plan_tree(
             let rt_entry = pg_sys::list_nth(range_table, rt_index);
 
             if rt_entry.is_null() {
-                return Err(format!("Range table entry {} not found", scanrelid).into());
+                return Err(format!("Range table entry {scanrelid} not found").into());
             }
 
             let rte = rt_entry as *mut pg_sys::RangeTblEntry;

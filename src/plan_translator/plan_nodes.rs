@@ -25,7 +25,8 @@ pub unsafe fn create_values_scan_node(
     (*result_node).plan.qual = std::ptr::null_mut();
     (*result_node).plan.targetlist = std::ptr::null_mut();
 
-    Ok(result_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*result_node).plan as *mut pg_sys::Plan)
 }
 
 /// Create a Result node with target list for literal projections
@@ -51,7 +52,8 @@ pub unsafe fn create_result_node_with_target_list(
     (*result_node).plan.qual = std::ptr::null_mut();
     (*result_node).plan.targetlist = target_list;
 
-    Ok(result_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*result_node).plan as *mut pg_sys::Plan)
 }
 
 /// Create a Values scan node with specific target list for literal projections
@@ -127,7 +129,13 @@ pub unsafe fn create_values_scan_with_target_list(
     values_lists = pg_sys::lappend(values_lists, row_values as *mut std::ffi::c_void);
     (*values_scan).values_lists = values_lists;
 
-    Ok(values_scan as *mut pg_sys::Plan)
+    // Return the correct Plan pointer based on PostgreSQL version
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    let plan_ptr = &mut (*values_scan).plan as *mut pg_sys::Plan;
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    let plan_ptr = &mut (*values_scan).scan.plan as *mut pg_sys::Plan;
+
+    Ok(plan_ptr)
 }
 
 /// Create a PostgreSQL SeqScan node for table scans
@@ -139,10 +147,7 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     scanrelid: pg_sys::Index,
 ) -> Result<(*mut pg_sys::Plan, *mut pg_sys::RangeTblEntry), Box<dyn std::error::Error + Send + Sync>>
 {
-    eprintln!(
-        "DEBUG: create_seqscan_node called for table: {}",
-        table_name
-    );
+    eprintln!("DEBUG: create_seqscan_node called for table: {table_name}");
     pgrx::info!(
         "DEBUG: create_seqscan_node called for table: {}",
         table_name
@@ -154,7 +159,7 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
 
     let table_oid = lookup_table_oid(table_name)?;
 
-    eprintln!("DEBUG: Successfully looked up table OID: {}", table_oid);
+    eprintln!("DEBUG: Successfully looked up table OID: {table_oid}");
     pgrx::info!("DEBUG: Successfully looked up table OID: {}", table_oid);
 
     // Create a SeqScan node following PostgreSQL's exact pattern
@@ -250,14 +255,20 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
         (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
 
-    Ok((seqscan_node as *mut pg_sys::Plan, rte))
+    // Return the correct Plan pointer based on PostgreSQL version
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    let plan_ptr = &mut (*seqscan_node).plan as *mut pg_sys::Plan;
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    let plan_ptr = &mut (*seqscan_node).scan.plan as *mut pg_sys::Plan;
+
+    Ok((plan_ptr, rte))
 }
 
 /// Look up a table OID by name
 unsafe fn lookup_table_oid(
     table_name: &str,
 ) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!("DEBUG: lookup_table_oid called for table: {}", table_name);
+    eprintln!("DEBUG: lookup_table_oid called for table: {table_name}");
     pgrx::info!("DEBUG: lookup_table_oid called for table: {}", table_name);
 
     // Try to look up the table in the current search path
@@ -280,7 +291,7 @@ unsafe fn lookup_table_oid(
     );
 
     if relation_oid == pg_sys::InvalidOid {
-        return Err(format!("Table '{}' not found", table_name).into());
+        return Err(format!("Table '{table_name}' not found").into());
     }
 
     Ok(relation_oid)
@@ -292,8 +303,7 @@ unsafe fn create_range_table_entry(
     table_name: &str,
 ) -> Result<*mut pg_sys::RangeTblEntry, Box<dyn std::error::Error + Send + Sync>> {
     eprintln!(
-        "DEBUG: create_range_table_entry called for table: {} with OID: {}",
-        table_name, table_oid
+        "DEBUG: create_range_table_entry called for table: {table_name} with OID: {table_oid}"
     );
     pgrx::info!(
         "DEBUG: create_range_table_entry called for table: {} with OID: {}",
@@ -339,10 +349,7 @@ unsafe fn create_range_table_entry(
 unsafe fn create_target_list_for_table(
     table_oid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!(
-        "DEBUG: create_target_list_for_table called for OID: {}",
-        table_oid
-    );
+    eprintln!("DEBUG: create_target_list_for_table called for OID: {table_oid}");
     pgrx::info!(
         "DEBUG: create_target_list_for_table called for OID: {}",
         table_oid
@@ -351,7 +358,7 @@ unsafe fn create_target_list_for_table(
     // Open the relation to get its tuple descriptor
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
     if relation.is_null() {
-        return Err(format!("Could not open relation with OID {}", table_oid).into());
+        return Err(format!("Could not open relation with OID {table_oid}").into());
     }
 
     eprintln!("DEBUG: Successfully opened relation");
@@ -363,7 +370,7 @@ unsafe fn create_target_list_for_table(
     let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
 
     // Create target entries for each column
-    eprintln!("DEBUG: About to iterate through {} columns", num_attrs);
+    eprintln!("DEBUG: About to iterate through {num_attrs} columns");
     pgrx::info!("DEBUG: About to iterate through {} columns", num_attrs);
 
     for i in 0..num_attrs {
@@ -492,23 +499,19 @@ unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
     let indent = "  ".repeat(depth);
 
     if plan.is_null() {
-        eprintln!(
-            "{}DEBUG: validate_plan_tree_recursive - plan is null at depth {}",
-            indent, depth
-        );
+        eprintln!("{indent}DEBUG: validate_plan_tree_recursive - plan is null at depth {depth}");
         return;
     }
 
     let node_tag = (*plan).type_;
     eprintln!(
-        "{}DEBUG: validate_plan_tree_recursive - depth {}, node type: {:?}",
-        indent, depth, node_tag
+        "{indent}DEBUG: validate_plan_tree_recursive - depth {depth}, node type: {node_tag:?}"
     );
 
     // Print detailed node information WITHOUT calling nodeToString yet
-    eprintln!("{}DEBUG: Node details at depth {}:", indent, depth);
-    eprintln!("{}  Node type: {:?}", indent, node_tag);
-    eprintln!("{}  Node pointer: {:p}", indent, plan);
+    eprintln!("{indent}DEBUG: Node details at depth {depth}:");
+    eprintln!("{indent}  Node type: {node_tag:?}");
+    eprintln!("{indent}  Node pointer: {plan:p}");
     eprintln!("{}  Left tree: {:p}", indent, (*plan).lefttree);
     eprintln!("{}  Right tree: {:p}", indent, (*plan).righttree);
     eprintln!("{}  Target list: {:p}", indent, (*plan).targetlist);
@@ -522,17 +525,17 @@ unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
 
         // Additional Agg field diagnostics
         if (*agg_node).numCols > 0 && !(*agg_node).grpColIdx.is_null() {
-            eprintln!("{}  Agg group columns:", indent);
+            eprintln!("{indent}  Agg group columns:");
             for i in 0..(*agg_node).numCols {
                 let col_idx = *(*agg_node).grpColIdx.offset(i as isize);
-                eprintln!("{}    Group col {}: {}", indent, i, col_idx);
+                eprintln!("{indent}    Group col {i}: {col_idx}");
             }
         }
 
         // Check target list structure for Agg node
         if !(*plan).targetlist.is_null() {
             let tlist_len = (*(*plan).targetlist).length;
-            eprintln!("{}  Agg target list length: {}", indent, tlist_len);
+            eprintln!("{indent}  Agg target list length: {tlist_len}");
 
             // Check each target entry
             for i in 0..tlist_len {
@@ -548,12 +551,12 @@ unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
 
                     if !(*te).expr.is_null() {
                         let expr_type = (*(*te).expr).type_;
-                        eprintln!("{}      Expression type: {:?}", indent, expr_type);
+                        eprintln!("{indent}      Expression type: {expr_type:?}");
 
                         // If it's an Aggref, check its structure
                         if expr_type == pg_sys::NodeTag::T_Aggref {
                             let aggref = (*te).expr as *mut pg_sys::Aggref;
-                            eprintln!("{}      Aggref details:", indent);
+                            eprintln!("{indent}      Aggref details:");
                             eprintln!("{}        aggfnoid: {}", indent, (*aggref).aggfnoid);
                             eprintln!("{}        args: {:p}", indent, (*aggref).args);
                             eprintln!("{}        aggstar: {}", indent, (*aggref).aggstar);
@@ -561,26 +564,23 @@ unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
                             // Check args list if it exists
                             if !(*aggref).args.is_null() {
                                 let args_len = (*(*aggref).args).length;
-                                eprintln!("{}        args length: {}", indent, args_len);
+                                eprintln!("{indent}        args length: {args_len}");
 
                                 for j in 0..args_len {
                                     let arg =
                                         pg_sys::list_nth((*aggref).args, j) as *mut pg_sys::Expr;
                                     if !arg.is_null() {
                                         let arg_type = (*arg).type_;
-                                        eprintln!(
-                                            "{}          Arg {}: type={:?}",
-                                            indent, j, arg_type
-                                        );
+                                        eprintln!("{indent}          Arg {j}: type={arg_type:?}");
                                     } else {
-                                        eprintln!("{}          Arg {}: NULL", indent, j);
+                                        eprintln!("{indent}          Arg {j}: NULL");
                                     }
                                 }
                             }
                         }
                     }
                 } else {
-                    eprintln!("{}    TargetEntry {}: NULL", indent, i);
+                    eprintln!("{indent}    TargetEntry {i}: NULL");
                 }
             }
         }
@@ -606,30 +606,18 @@ unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
     }
 
     // ONLY AFTER checking children, try nodeToString on this node
-    eprintln!(
-        "{}DEBUG: About to call nodeToString on depth {} node type {:?}",
-        indent, depth, node_tag
-    );
+    eprintln!("{indent}DEBUG: About to call nodeToString on depth {depth} node type {node_tag:?}");
 
     let node_str = pg_sys::nodeToString(plan as *const std::ffi::c_void);
 
     if !node_str.is_null() {
-        eprintln!(
-            "{}DEBUG: nodeToString SUCCESS for depth {} node",
-            indent, depth
-        );
+        eprintln!("{indent}DEBUG: nodeToString SUCCESS for depth {depth} node");
         pg_sys::pfree(node_str as *mut std::ffi::c_void);
     } else {
-        eprintln!(
-            "{}DEBUG: nodeToString returned null for depth {} node",
-            indent, depth
-        );
+        eprintln!("{indent}DEBUG: nodeToString returned null for depth {depth} node");
     }
 
-    eprintln!(
-        "{}DEBUG: validate_plan_tree_recursive completed for depth {} node",
-        indent, depth
-    );
+    eprintln!("{indent}DEBUG: validate_plan_tree_recursive completed for depth {depth} node");
 }
 
 /// Create a PostgreSQL Sort plan node from Substrait sort specification
@@ -658,20 +646,17 @@ pub unsafe fn create_sort_node(
 
     // Validate the input plan node type
     let input_node_type = (*input_plan).type_;
-    eprintln!("DEBUG: Input plan node type: {:?}", input_node_type);
+    eprintln!("DEBUG: Input plan node type: {input_node_type:?}");
     pgrx::info!("DEBUG: Input plan node type: {:?}", input_node_type);
 
     // Validate the input plan's target list
     let input_targetlist = (*input_plan).targetlist;
-    eprintln!("DEBUG: Input plan target list: {:p}", input_targetlist);
+    eprintln!("DEBUG: Input plan target list: {input_targetlist:p}");
     pgrx::info!("DEBUG: Input plan target list: {:p}", input_targetlist);
 
     if !input_targetlist.is_null() {
         let input_list_length = (*input_targetlist).length;
-        eprintln!(
-            "DEBUG: Input plan target list length: {}",
-            input_list_length
-        );
+        eprintln!("DEBUG: Input plan target list length: {input_list_length}");
         pgrx::info!(
             "DEBUG: Input plan target list length: {}",
             input_list_length
@@ -707,7 +692,7 @@ pub unsafe fn create_sort_node(
 
     // Create a Sort plan node following PostgreSQL's make_sort pattern
     let sort_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Sort>()) as *mut pg_sys::Sort;
-    eprintln!("DEBUG: Sort node allocated at: {:p}", sort_node);
+    eprintln!("DEBUG: Sort node allocated at: {sort_node:p}");
     pgrx::info!("DEBUG: Sort node allocated at: {:p}", sort_node);
 
     // Set node tag FIRST (critical for ExecInitNode dispatch)
@@ -739,7 +724,7 @@ pub unsafe fn create_sort_node(
     (*sort_node).numCols = num_cols;
 
     // All arrays must have exactly numCols elements (PostgreSQL requirement)
-    eprintln!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
+    eprintln!("DEBUG: Creating Sort arrays with numCols = {num_cols}");
     pgrx::info!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
 
     // sortColIdx array - which columns to sort by (1-based target list indices)
@@ -789,7 +774,8 @@ pub unsafe fn create_sort_node(
 
     pgrx::info!("DEBUG: Sort node comprehensive validation completed");
 
-    Ok(sort_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*sort_node).plan as *mut pg_sys::Plan)
 }
 
 /// Create a PostgreSQL Limit plan node with expression-based offset and count
@@ -833,7 +819,8 @@ pub unsafe fn create_limit_node_with_expressions(
         std::ptr::null_mut()
     };
 
-    Ok(limit_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*limit_node).plan as *mut pg_sys::Plan)
 }
 
 /// Create a PostgreSQL Filter plan node from Substrait filter specification
@@ -868,7 +855,8 @@ pub unsafe fn create_filter_node(
     qual_list = pg_sys::lappend(qual_list, condition_expr as *mut std::ffi::c_void);
     (*result_node).plan.qual = qual_list;
 
-    Ok(result_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*result_node).plan as *mut pg_sys::Plan)
 }
 
 /// Create a PostgreSQL NestLoop plan node for Cross (Cartesian product) join
@@ -906,7 +894,8 @@ pub unsafe fn create_cross_join_node(
     let combined_target_list = create_combined_target_list(left_plan, right_plan)?;
     (*nestloop_node).join.plan.targetlist = combined_target_list;
 
-    Ok(nestloop_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*nestloop_node).join.plan as *mut pg_sys::Plan)
 }
 
 /// Create a PostgreSQL NestLoop plan node for Join operations
@@ -945,7 +934,8 @@ pub unsafe fn create_join_node(
     let combined_target_list = create_combined_target_list(left_plan, right_plan)?;
     (*nestloop_node).join.plan.targetlist = combined_target_list;
 
-    Ok(nestloop_node as *mut pg_sys::Plan)
+    // Return pointer to the plan field
+    Ok(&mut (*nestloop_node).join.plan as *mut pg_sys::Plan)
 }
 
 /// Create a combined target list for join operations
@@ -1031,15 +1021,12 @@ unsafe fn get_table_name_from_oid(
     table_oid: pg_sys::Oid,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Use relation_open approach - much safer than SearchSysCache1
-    eprintln!(
-        "DEBUG: get_table_name_from_oid opening relation for OID: {}",
-        table_oid
-    );
+    eprintln!("DEBUG: get_table_name_from_oid opening relation for OID: {table_oid}");
 
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
     if relation.is_null() {
-        eprintln!("DEBUG: relation_open returned null for OID: {}", table_oid);
-        return Err(format!("Could not open relation with OID {}", table_oid).into());
+        eprintln!("DEBUG: relation_open returned null for OID: {table_oid}");
+        return Err(format!("Could not open relation with OID {table_oid}").into());
     }
 
     eprintln!("DEBUG: relation_open succeeded, extracting name");
@@ -1049,7 +1036,7 @@ unsafe fn get_table_name_from_oid(
         .to_string_lossy()
         .to_string();
 
-    eprintln!("DEBUG: Got table name: {}", table_name);
+    eprintln!("DEBUG: Got table name: {table_name}");
 
     // Close the relation
     pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);

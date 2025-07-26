@@ -210,7 +210,7 @@ pub unsafe fn execute_plan_directly(
 
     // Get the tuple descriptor from the plan's target list
     let tupdesc = pg_sys::ExecTypeFromTL(plan_tree.targetlist);
-    eprintln!("DEBUG: ExecTypeFromTL returned tupdesc: {:p}", tupdesc);
+    eprintln!("DEBUG: ExecTypeFromTL returned tupdesc: {tupdesc:p}");
     if tupdesc.is_null() {
         return Err("Failed to create tuple descriptor from plan".into());
     }
@@ -315,7 +315,7 @@ pub unsafe fn execute_plan_directly(
                 let relation = *(*estate).es_relations.add(i as usize);
                 if !relation.is_null() {
                     pg_sys::table_close(relation, pg_sys::AccessShareLock as i32);
-                    eprintln!("DEBUG: Closed relation at index {}", i);
+                    eprintln!("DEBUG: Closed relation at index {i}");
                 }
             }
         }
@@ -333,15 +333,37 @@ pub unsafe fn execute_postgres_plan(
     range_table: *const pg_sys::List,
 ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
     eprintln!(
-        "DEBUG: execute_postgres_plan called with plan tree pointer: {:p}",
+        "DEBUG: execute_postgres_plan ENTRY - plan_tree={:p}",
         plan_tree
     );
+    pgrx::info!(
+        "DEBUG: execute_postgres_plan ENTRY - plan_tree={:p}",
+        plan_tree
+    );
+
     if plan_tree.is_null() {
+        eprintln!("DEBUG: ERROR - plan_tree is null!");
+        pgrx::info!("DEBUG: ERROR - plan_tree is null!");
         return Err("Plan tree pointer is null".into());
     }
-    eprintln!(
-        "DEBUG: execute_postgres_plan called with plan tree type: {:?}",
-        (*plan_tree).type_
+
+    eprintln!("DEBUG: plan_tree pointer is valid, about to check node type");
+    pgrx::info!("DEBUG: plan_tree pointer is valid, about to check node type");
+
+    // Check for the specific type 124 corruption issue
+    let plan_type = (*plan_tree).type_;
+    let plan_type_value = plan_type as i32;
+
+    if plan_type_value == 124 {
+        pgrx::error!(
+            "ERROR: Plan tree has invalid node type 124 - this is a known corruption issue"
+        );
+    }
+
+    pgrx::info!(
+        "DEBUG: Plan tree type: {:?} (value: {})",
+        plan_type,
+        plan_type_value
     );
 
     // Execute the plan using PostgreSQL's native executor
@@ -352,7 +374,7 @@ pub unsafe fn execute_postgres_plan(
 
     let (tupdesc, tuplestore) =
         execute_plan_directly_from_ptr(plan_tree, column_names, range_table).map_err(|e| {
-            eprintln!("DEBUG: Plan execution failed: {}", e);
+            eprintln!("DEBUG: Plan execution failed: {e}");
             e
         })?;
 
@@ -392,7 +414,7 @@ pub unsafe fn execute_postgres_plan(
         // Extract values from slot
         for i in 0..natts {
             let mut is_null = false;
-            let attr_num = (i + 1) as i32;
+            let attr_num = i + 1;
             let datum = pg_sys::slot_getattr(slot, attr_num, &mut is_null);
             row_data.push(datum);
             row_nulls.push(is_null);
@@ -443,16 +465,13 @@ unsafe fn collect_seqscan_nodes_for_range_table(
 
         // Extract table OID from plan_node_id (where we stored it during translation)
         let table_oid = pg_sys::Oid::from(plan.plan_node_id as u32);
-        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {}", table_oid);
+        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {table_oid}");
 
         if table_oid != pg_sys::InvalidOid {
             // Create a range table entry for this table
             let rte = create_range_table_entry_from_oid(table_oid)?;
             *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
-            eprintln!(
-                "DEBUG: Added range table entry for table OID: {}",
-                table_oid
-            );
+            eprintln!("DEBUG: Added range table entry for table OID: {table_oid}");
         }
     }
 
@@ -572,15 +591,12 @@ pub unsafe fn execute_postgres_plan_as_srf(
 unsafe fn create_range_table_entry_from_oid(
     table_oid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::RangeTblEntry, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!(
-        "DEBUG: create_range_table_entry_from_oid called for OID: {}",
-        table_oid
-    );
+    eprintln!("DEBUG: create_range_table_entry_from_oid called for OID: {table_oid}");
 
     // Get table name from OID for the alias
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
     if relation.is_null() {
-        return Err(format!("Could not open relation with OID {}", table_oid).into());
+        return Err(format!("Could not open relation with OID {table_oid}").into());
     }
 
     let rel_name = std::ffi::CStr::from_ptr((*(*relation).rd_rel).relname.data.as_ptr())
@@ -623,10 +639,7 @@ unsafe fn create_range_table_entry_from_oid(
     (*rte).extraUpdatedCols = std::ptr::null_mut();
     (*rte).securityQuals = std::ptr::null_mut();
 
-    eprintln!(
-        "DEBUG: Range table entry created successfully for table: {}",
-        rel_name
-    );
+    eprintln!("DEBUG: Range table entry created successfully for table: {rel_name}");
 
     Ok(rte)
 }
@@ -663,16 +676,13 @@ unsafe fn collect_seqscan_nodes_for_range_table_raw(
 
         // Extract table OID from plan_node_id (where we stored it during translation)
         let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
-        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {}", table_oid);
+        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {table_oid}");
 
         if table_oid != pg_sys::InvalidOid {
             // Create a range table entry for this table
             let rte = create_range_table_entry_from_oid(table_oid)?;
             *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
-            eprintln!(
-                "DEBUG: Added range table entry for table OID: {}",
-                table_oid
-            );
+            eprintln!("DEBUG: Added range table entry for table OID: {table_oid}");
         }
     }
 

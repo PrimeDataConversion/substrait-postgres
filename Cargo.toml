@@ -19,7 +19,7 @@ name = "pgrx_embed_pg_substrait"
 path = "./src/bin/pgrx_embed.rs"
 
 [dependencies]
-pgrx = "=0.14.3"
+pgrx = "0.15.0"
 substrait = { version = "0.57.0", features = ["serde"] }
 prost = "0.13.5"
 protobuf = "3.5.0"
@@ -30,7 +30,7 @@ base64 = "0.21"
 num-bigint = "0.4"
 
 [dev-dependencies]
-pgrx-tests = "=0.14.3"
+pgrx-tests = "0.15.0"
 
 [features]
 default = ["pg15"]

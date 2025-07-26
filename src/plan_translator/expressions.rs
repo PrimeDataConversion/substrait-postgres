@@ -91,11 +91,7 @@ pub unsafe fn get_operator_function_oid(
     );
 
     if tuple.is_null() {
-        return Err(format!(
-            "Operator with OID '{}' not found in pg_operator",
-            operator_oid
-        )
-        .into());
+        return Err(format!("Operator with OID '{operator_oid}' not found in pg_operator").into());
     }
 
     let op_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_operator;
@@ -105,8 +101,7 @@ pub unsafe fn get_operator_function_oid(
 
     if function_oid == pg_sys::InvalidOid || function_oid.to_u32() == 0 {
         return Err(format!(
-            "Operator with OID '{}' has no underlying function (oprcode is 0)",
-            operator_oid
+            "Operator with OID '{operator_oid}' has no underlying function (oprcode is 0)"
         )
         .into());
     }
@@ -126,7 +121,7 @@ pub unsafe fn create_date_const(
 
     // Validate that the OID is reasonable
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
-        return Err(format!("Invalid DATEOID: {}", type_oid).into());
+        return Err(format!("Invalid DATEOID: {type_oid}").into());
     }
 
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
@@ -153,7 +148,7 @@ pub unsafe fn create_int4_const(
 
     // Validate that the OID is reasonable (should not be 0 or InvalidOid)
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
-        return Err(format!("Invalid INT4OID: {}", type_oid).into());
+        return Err(format!("Invalid INT4OID: {type_oid}").into());
     }
 
     // Check if type_oid is suspiciously 124 (pg_type OID)
@@ -203,7 +198,7 @@ pub unsafe fn create_int8_const(
 
     // Validate that the OID is reasonable (should not be 0 or InvalidOid)
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
-        return Err(format!("Invalid INT8OID: {}", type_oid).into());
+        return Err(format!("Invalid INT8OID: {type_oid}").into());
     }
 
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
@@ -228,7 +223,7 @@ pub unsafe fn create_text_const(
 
     // Validate that the OID is reasonable (should not be 0 or InvalidOid)
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
-        return Err(format!("Invalid TEXTOID: {}", type_oid).into());
+        return Err(format!("Invalid TEXTOID: {type_oid}").into());
     }
 
     let text_datum =
@@ -257,7 +252,7 @@ pub unsafe fn create_numeric_const(
     let type_oid = pg_sys::NUMERICOID;
 
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
-        return Err(format!("Invalid NUMERICOID: {}", type_oid).into());
+        return Err(format!("Invalid NUMERICOID: {type_oid}").into());
     }
 
     // Convert the two's complement byte array to a BigInt
@@ -284,7 +279,7 @@ pub unsafe fn create_numeric_const(
     }
 
     let numeric_value: AnyNumeric = AnyNumeric::from_str(&numeric_string)
-        .map_err(|e| format!("Failed to parse numeric value from string: {}", e))?;
+        .map_err(|e| format!("Failed to parse numeric value from string: {e}"))?;
     let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
     (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
     (*const_node).consttype = type_oid;
@@ -306,7 +301,7 @@ unsafe fn resolve_column_type_info(
     // Open the relation to get schema information
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
     if relation.is_null() {
-        return Err(format!("Could not open relation with OID {}", table_oid).into());
+        return Err(format!("Could not open relation with OID {table_oid}").into());
     }
 
     let tuple_desc = (*relation).rd_att;
@@ -314,11 +309,7 @@ unsafe fn resolve_column_type_info(
     // Validate attribute number
     if attnum <= 0 || (attnum as i32) > (*tuple_desc).natts {
         pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
-        return Err(format!(
-            "Invalid attribute number {} for relation {}",
-            attnum, table_oid
-        )
-        .into());
+        return Err(format!("Invalid attribute number {attnum} for relation {table_oid}").into());
     }
 
     // Get the attribute (1-based indexing, so subtract 1)
@@ -326,7 +317,7 @@ unsafe fn resolve_column_type_info(
 
     if (*attr).attisdropped {
         pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
-        return Err(format!("Attribute {} is dropped", attnum).into());
+        return Err(format!("Attribute {attnum} is dropped").into());
     }
 
     // Extract the actual type information
@@ -567,16 +558,13 @@ pub unsafe fn convert_expression_to_postgres_with_context(
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::RexType;
 
-    eprintln!(
-        "DEBUG: convert_expression_to_postgres_with_context called with expr: {:?}",
-        expr
-    );
+    eprintln!("DEBUG: convert_expression_to_postgres_with_context called with expr: {expr:?}");
 
     match &expr.rex_type {
         Some(RexType::Literal(literal)) => {
             // Handle literal values
             if let Some(literal_type) = &literal.literal_type {
-                eprintln!("DEBUG: Literal type: {:?}", literal_type);
+                eprintln!("DEBUG: Literal type: {literal_type:?}");
                 match literal_type {
                     substrait::proto::expression::literal::LiteralType::I32(val) => {
                         create_int4_const(*val)
@@ -630,11 +618,7 @@ pub unsafe fn convert_expression_to_postgres_with_context(
         }
         Some(rex_type) => {
             let type_name = get_expression_type_name(rex_type);
-            Err(format!(
-                "Unsupported expression type in filter condition: {}",
-                type_name
-            )
-            .into())
+            Err(format!("Unsupported expression type in filter condition: {type_name}").into())
         }
         None => Err("Expression missing rex_type".into()),
     }
@@ -787,7 +771,7 @@ unsafe fn create_set_predicate_expr(
     let _tuples_relation = set_predicate
         .tuples
         .as_ref()
-        .ok_or_else(|| "SetPredicate missing tuples relation")?;
+        .ok_or("SetPredicate missing tuples relation")?;
 
     // Create a placeholder Query node for the subselect
     let query = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
@@ -856,7 +840,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
                     }
                     _ => {
                         return Err(
-                            format!("Unsupported literal type for expression {}", index).into()
+                            format!("Unsupported literal type for expression {index}").into()
                         )
                     }
                 };
@@ -888,7 +872,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
 
                 Ok(target_entry)
             } else {
-                Err(format!("Literal expression {} missing literal type", index).into())
+                Err(format!("Literal expression {index} missing literal type").into())
             }
         }
         Some(RexType::ScalarFunction(func)) => {
@@ -940,7 +924,7 @@ unsafe fn convert_expression_to_target_entry_with_context(
 
             Ok(target_entry)
         }
-        _ => Err(format!("Unsupported expression type at index {}", index).into()),
+        _ => Err(format!("Unsupported expression type at index {index}").into()),
     }
 }
 
@@ -989,9 +973,9 @@ pub unsafe fn create_scalar_function_expr_with_context(
         .unwrap_or("unknown");
 
     eprintln!("DEBUG: Scalar function details:");
-    eprintln!("  function_reference: {}", function_reference);
-    eprintln!("  function_name: {}", function_name);
-    eprintln!("  arguments.len(): {}", argument_count);
+    eprintln!("  function_reference: {function_reference}");
+    eprintln!("  function_name: {function_name}");
+    eprintln!("  arguments.len(): {argument_count}");
 
     // Handle specific function types based on name
     match function_name {
@@ -1006,11 +990,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("date_le", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "lte:date_date function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("lte:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "and:bool" => {
@@ -1033,11 +1016,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 Ok(bool_expr as *mut pg_sys::Expr)
             } else {
-                Err(format!(
-                    "and:bool function expects at least 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("and:bool function expects at least 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "equal:any_any" => {
@@ -1053,11 +1035,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("eq", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "equal:any_any function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("equal:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "multiply:fp64_fp64" => {
@@ -1074,8 +1055,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
-                    "multiply:fp64_fp64 function expects 2 arguments, got {}",
-                    argument_count
+                    "multiply:fp64_fp64 function expects 2 arguments, got {argument_count}"
                 )
                 .into())
             }
@@ -1094,8 +1074,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
-                    "subtract:fp64_fp64 function expects 2 arguments, got {}",
-                    argument_count
+                    "subtract:fp64_fp64 function expects 2 arguments, got {argument_count}"
                 )
                 .into())
             }
@@ -1113,11 +1092,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("float8pl", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "add:fp64_fp64 function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("add:fp64_fp64 function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "like:str_str" => {
@@ -1133,11 +1111,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "like:str_str function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("like:str_str function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "or:bool" => {
@@ -1160,11 +1137,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 Ok(bool_expr as *mut pg_sys::Expr)
             } else {
-                Err(format!(
-                    "or:bool function expects at least 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("or:bool function expects at least 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "lt:any_any" => {
@@ -1180,11 +1156,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("lt", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "lt:any_any function expects 2 arguments, got {}",
-                    argument_count
-                )
-                .into())
+                Err(format!("lt:any_any function expects 2 arguments, got {argument_count}").into())
             }
         }
         "gte:date_date" => {
@@ -1198,11 +1170,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("date_ge", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "gte:date_date function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("gte:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "lt:date_date" => {
@@ -1216,11 +1187,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("date_lt", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "lt:date_date function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("lt:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "not_equal:any_any" => {
@@ -1236,11 +1206,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("ne", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "not_equal:any_any function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("not_equal:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "like:vchar_vchar" => {
@@ -1256,11 +1225,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "like:vchar_vchar function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("like:vchar_vchar function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "multiply:dec_dec" => {
@@ -1276,11 +1244,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("numeric_mul", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "multiply:dec_dec function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("multiply:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "subtract:dec_dec" => {
@@ -1296,11 +1263,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("numeric_sub", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "subtract:dec_dec function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("subtract:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "divide:dec_dec" => {
@@ -1316,11 +1282,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("numeric_div", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "divide:dec_dec function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("divide:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "gt:any_any" => {
@@ -1336,11 +1301,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("gt", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "gt:any_any function expects 2 arguments, got {}",
-                    argument_count
-                )
-                .into())
+                Err(format!("gt:any_any function expects 2 arguments, got {argument_count}").into())
             }
         }
         "add:date_year" => {
@@ -1357,11 +1318,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("date_pl_interval", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::DATEOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "add:date_year function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("add:date_year function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "gte:any_any" => {
@@ -1377,11 +1337,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("ge", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "gte:any_any function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("gte:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "lte:any_any" => {
@@ -1397,11 +1356,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("le", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "lte:any_any function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("lte:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "add:i32_i32" => {
@@ -1417,11 +1375,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("int4pl", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::INT4OID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "add:i32_i32 function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("add:i32_i32 function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "char_substr" => {
@@ -1452,11 +1409,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     &[string_expr, start_expr, count_expr],
                 )
             } else {
-                Err(format!(
-                    "char_substr function expects 3 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("char_substr function expects 3 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "substring:str_i32_i32" => {
@@ -1482,8 +1438,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 )
             } else {
                 Err(format!(
-                    "substring:str_i32_i32 function expects 3 arguments, got {}",
-                    argument_count
+                    "substring:str_i32_i32 function expects 3 arguments, got {argument_count}"
                 )
                 .into())
             }
@@ -1508,11 +1463,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 Ok(bool_expr as *mut pg_sys::Expr)
             } else {
-                Err(format!(
-                    "not:bool function expects 1 argument, got {}",
-                    argument_count
-                )
-                .into())
+                Err(format!("not:bool function expects 1 argument, got {argument_count}").into())
             }
         }
         "gt:date_date" => {
@@ -1526,11 +1477,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("date_gt", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "gt:date_date function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("gt:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "divide:fp64_fp64" => {
@@ -1546,11 +1496,10 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let func_oid = lookup_function_oid("float8div", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
-                Err(format!(
-                    "divide:fp64_fp64 function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("divide:fp64_fp64 function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         "extract:req_date" => {
@@ -1571,16 +1520,14 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     &[part_arg, source_arg],
                 )
             } else {
-                Err(format!(
-                    "extract:req_date function expects 2 arguments, got {}",
-                    argument_count
+                Err(
+                    format!("extract:req_date function expects 2 arguments, got {argument_count}")
+                        .into(),
                 )
-                .into())
             }
         }
         _ => Err(format!(
-            "Unsupported scalar function: {} with {} arguments",
-            function_name, argument_count
+            "Unsupported scalar function: {function_name} with {argument_count} arguments"
         )
         .into()),
     }
