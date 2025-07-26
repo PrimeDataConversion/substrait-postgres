@@ -2679,6 +2679,46 @@ mod tests {
 
         (host, port, database, user)
     }
+
+    #[pg_test]
+    fn test_extract_table_name_from_named_table() {
+        use crate::plan_translator::relations::extract_table_name_from_named_table;
+        use substrait::proto::read_rel::NamedTable;
+
+        // Test with single table name
+        let mut named_table = NamedTable {
+            names: vec!["test_table".to_string()],
+            ..Default::default()
+        };
+
+        let result = extract_table_name_from_named_table(&named_table);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test_table");
+
+        // Test with schema-qualified name
+        named_table.names = vec!["public".to_string(), "my_table".to_string()];
+        let result = extract_table_name_from_named_table(&named_table);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "my_table");
+
+        // Test with catalog.schema.table name
+        named_table.names = vec![
+            "catalog".to_string(),
+            "schema".to_string(),
+            "table_name".to_string(),
+        ];
+        let result = extract_table_name_from_named_table(&named_table);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "table_name");
+
+        // Test with empty names vector
+        named_table.names = vec![];
+        let result = extract_table_name_from_named_table(&named_table);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "NamedTable has no names");
+
+        pgrx::info!("test_extract_table_name_from_named_table: All tests passed");
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]

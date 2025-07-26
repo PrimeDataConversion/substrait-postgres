@@ -87,6 +87,27 @@ pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
     }
 }
 
+/// Extract table name from a NamedTable
+pub fn extract_table_name_from_named_table(
+    named_table: &substrait::proto::read_rel::NamedTable,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if named_table.names.is_empty() {
+        return Err("NamedTable has no names".into());
+    }
+
+    // Get the last name in the hierarchy (the actual table name)
+    let table_name = named_table
+        .names
+        .last()
+        .ok_or("NamedTable names list is empty")?
+        .clone();
+
+    eprintln!("DEBUG: Extracted table name: {}", table_name);
+    pgrx::info!("DEBUG: Extracted table name: {}", table_name);
+
+    Ok(table_name)
+}
+
 /// Convert relation with function context
 pub unsafe fn convert_rel_to_plan_tree_with_context(
     rel: &Rel,
@@ -261,45 +282,39 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                         // Virtual table - create a Values scan node
                         create_values_scan_node().map(|plan| (plan, std::ptr::null_mut()))
                     }
-                    substrait::proto::read_rel::ReadType::NamedTable(_nt) => {
-                        eprintln!("DEBUG: Processing NamedTable read type - CREATING MINIMAL PLAN");
+                    substrait::proto::read_rel::ReadType::NamedTable(nt) => {
+                        eprintln!(
+                            "DEBUG: Processing NamedTable read type - CREATING PROPER SEQSCAN"
+                        );
                         pgrx::info!(
-                            "DEBUG: Processing NamedTable read type - CREATING MINIMAL PLAN"
+                            "DEBUG: Processing NamedTable read type - CREATING PROPER SEQSCAN"
                         );
 
-                        // MINIMAL IMPLEMENTATION: Create the absolute simplest possible plan tree
-                        // This avoids complex SeqScan creation that might be causing the crash
+                        // Extract table name from the NamedTable
+                        let table_name = extract_table_name_from_named_table(nt)?;
 
-                        // Create a properly initialized Result node following PostgreSQL patterns
-                        let minimal_plan = unsafe {
-                            let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>())
-                                as *mut pg_sys::Result;
+                        // Create a proper SeqScan node with range table entry
+                        // We use scanrelid 1 as this will be the first (and possibly only) table
+                        let (seqscan_plan, range_table_entry) =
+                            create_seqscan_node_with_scanrelid(&table_name, 1)?;
 
-                            // Initialize ALL required fields for a Result node
-                            (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-                            (*result_node).plan.lefttree = std::ptr::null_mut();
-                            (*result_node).plan.righttree = std::ptr::null_mut();
-                            (*result_node).plan.targetlist = std::ptr::null_mut();
-                            (*result_node).plan.qual = std::ptr::null_mut();
-                            (*result_node).plan.initPlan = std::ptr::null_mut();
-                            (*result_node).plan.extParam = std::ptr::null_mut();
-                            (*result_node).plan.allParam = std::ptr::null_mut();
-                            (*result_node).plan.startup_cost = 0.0;
-                            (*result_node).plan.total_cost = 1.0;
-                            (*result_node).plan.plan_rows = 1.0;
-                            (*result_node).plan.plan_width = 32;
-                            (*result_node).plan.parallel_aware = false;
-                            (*result_node).plan.parallel_safe = true;
-                            (*result_node).plan.async_capable = false;
-                            (*result_node).plan.plan_node_id = 0;
+                        // Create a range table list with our single entry
+                        let mut range_table_list: *mut pg_sys::List = std::ptr::null_mut();
+                        range_table_list = pg_sys::lappend(
+                            range_table_list,
+                            range_table_entry as *mut std::ffi::c_void,
+                        );
 
-                            &mut (*result_node).plan as *mut pg_sys::Plan
-                        };
+                        eprintln!(
+                            "DEBUG: Created SeqScan plan: {:p} with range table",
+                            seqscan_plan
+                        );
+                        pgrx::info!(
+                            "DEBUG: Created SeqScan plan: {:p} with range table",
+                            seqscan_plan
+                        );
 
-                        eprintln!("DEBUG: Created minimal plan: {:p}", minimal_plan);
-                        pgrx::info!("DEBUG: Created minimal plan: {:p}", minimal_plan);
-
-                        Ok((minimal_plan, std::ptr::null_mut()))
+                        Ok((seqscan_plan, range_table_list))
                     }
                     _ => {
                         eprintln!("DEBUG: Unsupported read type encountered");
