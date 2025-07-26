@@ -1474,6 +1474,1095 @@ mod tests {
         Ok(())
     }
 
+    // ============================================================================
+    // PHASE 1: DIRECT POSTGRESQL BASELINE TESTS (BYPASS EXTENSION ENTIRELY)
+    // ============================================================================
+
+    /// Test direct PostgreSQL execution of "SELECT 42" to establish baseline
+    /// This bypasses the extension entirely and proves PostgreSQL works independently
+    #[pg_test]
+    fn test_direct_postgresql_select_42() {
+        pgrx::info!("DIRECT_PG_TEST: Testing PostgreSQL 'SELECT 42' baseline");
+
+        unsafe {
+            // Test 1: Use PostgreSQL's complete API sequence
+            let query_string = std::ffi::CString::new("SELECT 42").unwrap();
+
+            pgrx::info!("DIRECT_PG_TEST: About to parse query");
+            let raw_parse_tree = pg_sys::pg_parse_query(query_string.as_ptr());
+            assert!(!raw_parse_tree.is_null(), "Parse query should succeed");
+
+            pgrx::info!("DIRECT_PG_TEST: About to analyze query");
+            let stmt_list = raw_parse_tree as *mut pg_sys::List;
+            let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
+
+            let query = pg_sys::parse_analyze_fixedparams(
+                raw_stmt,
+                query_string.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+            assert!(!query.is_null(), "Query analysis should succeed");
+
+            pgrx::info!("DIRECT_PG_TEST: About to plan query");
+            let planned_stmt =
+                pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
+            assert!(!planned_stmt.is_null(), "Query planning should succeed");
+
+            pgrx::info!("DIRECT_PG_TEST: PostgreSQL planning succeeded!");
+
+            // Test the plan tree structure
+            let plan_tree = (*planned_stmt).planTree;
+            assert!(!plan_tree.is_null(), "Plan tree should not be null");
+
+            pgrx::info!("DIRECT_PG_TEST: Plan tree type: {:?}", (*plan_tree).type_);
+
+            // Validate that nodeToString works on PostgreSQL's plan
+            let plan_str = pg_sys::nodeToString(plan_tree as *const std::ffi::c_void);
+            if !plan_str.is_null() {
+                pgrx::info!("DIRECT_PG_TEST: nodeToString works on PostgreSQL plan");
+                pg_sys::pfree(plan_str as *mut std::ffi::c_void);
+            }
+
+            pgrx::info!("DIRECT_PG_TEST: PostgreSQL 'SELECT 42' baseline test PASSED");
+        }
+    }
+
+    /// Test direct PostgreSQL execution without ExecutorStart - just validate planning
+    #[pg_test]
+    fn test_direct_postgresql_planning_only() {
+        pgrx::info!("DIRECT_PG_TEST: Testing PostgreSQL planning-only for multiple queries");
+
+        let queries = vec!["SELECT 42", "SELECT 1 + 2", "SELECT 'hello'", "SELECT true"];
+
+        for query_sql in queries {
+            unsafe {
+                pgrx::info!("DIRECT_PG_TEST: Testing query: {}", query_sql);
+
+                let query_string = std::ffi::CString::new(query_sql).unwrap();
+                let raw_parse_tree = pg_sys::pg_parse_query(query_string.as_ptr());
+                assert!(
+                    !raw_parse_tree.is_null(),
+                    "Parse should succeed for: {}",
+                    query_sql
+                );
+
+                let stmt_list = raw_parse_tree as *mut pg_sys::List;
+                let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
+
+                let query = pg_sys::parse_analyze_fixedparams(
+                    raw_stmt,
+                    query_string.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                );
+                assert!(
+                    !query.is_null(),
+                    "Analysis should succeed for: {}",
+                    query_sql
+                );
+
+                let planned_stmt =
+                    pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
+                assert!(
+                    !planned_stmt.is_null(),
+                    "Planning should succeed for: {}",
+                    query_sql
+                );
+
+                let plan_tree = (*planned_stmt).planTree;
+                assert!(!plan_tree.is_null());
+
+                pgrx::info!(
+                    "DIRECT_PG_TEST: {} - Plan type: {:?}",
+                    query_sql,
+                    (*plan_tree).type_
+                );
+            }
+        }
+
+        pgrx::info!("DIRECT_PG_TEST: All planning tests PASSED");
+    }
+
+    /// Test direct PostgreSQL execution with ExecutorStart - full execution test
+    #[pg_test]
+    fn test_direct_postgresql_full_execution() {
+        pgrx::info!("DIRECT_PG_TEST: Testing full PostgreSQL execution for 'SELECT 42'");
+
+        unsafe {
+            let query_string = std::ffi::CString::new("SELECT 42").unwrap();
+
+            // Parse, analyze, and plan
+            let raw_parse_tree = pg_sys::pg_parse_query(query_string.as_ptr());
+            let stmt_list = raw_parse_tree as *mut pg_sys::List;
+            let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
+
+            let query = pg_sys::parse_analyze_fixedparams(
+                raw_stmt,
+                query_string.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+
+            let planned_stmt =
+                pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
+
+            // Create QueryDesc for execution
+            let query_desc =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
+            (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
+            (*query_desc).plannedstmt = planned_stmt;
+            (*query_desc).sourceText = query_string.as_ptr();
+            (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
+            (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
+            (*query_desc).dest = std::ptr::null_mut();
+            (*query_desc).params = std::ptr::null_mut();
+            (*query_desc).queryEnv = std::ptr::null_mut();
+            (*query_desc).instrument_options = 0;
+
+            pgrx::info!("DIRECT_PG_TEST: About to call ExecutorStart");
+
+            // Use PostgreSQL's standard executor startup
+            pg_sys::ExecutorStart(query_desc, 0);
+
+            pgrx::info!("DIRECT_PG_TEST: ExecutorStart succeeded!");
+
+            let plan_state = (*query_desc).planstate;
+            assert!(
+                !plan_state.is_null(),
+                "Plan state should be created by ExecutorStart"
+            );
+
+            pgrx::info!("DIRECT_PG_TEST: About to execute and get result");
+
+            // Execute and get one tuple
+            let slot = pg_sys::ExecProcNode(plan_state);
+            assert!(!slot.is_null(), "Should get a result tuple");
+
+            pgrx::info!("DIRECT_PG_TEST: Got result tuple!");
+
+            // Extract the value (should be 42)
+            let mut is_null = false;
+            let datum = pg_sys::slot_getattr(slot, 1, &mut is_null);
+            assert!(!is_null, "Result should not be null");
+
+            let value = datum.value() as i32;
+            assert_eq!(value, 42, "Result should be 42");
+
+            pgrx::info!("DIRECT_PG_TEST: Verified result value is 42!");
+
+            // Clean up
+            pg_sys::ExecutorFinish(query_desc);
+            pg_sys::ExecutorEnd(query_desc);
+
+            pgrx::info!("DIRECT_PG_TEST: Full execution test PASSED");
+        }
+    }
+
+    /// Compare SPI execution vs direct execution for the same query
+    #[pg_test]
+    fn test_spi_vs_direct_execution_comparison() {
+        pgrx::info!("DIRECT_PG_TEST: Comparing SPI vs direct execution");
+
+        // Test 1: SPI execution (known to work)
+        let spi_result = Spi::get_one::<i32>("SELECT 42");
+        assert!(spi_result.is_ok(), "SPI should work");
+        let spi_value = spi_result.unwrap().unwrap();
+        assert_eq!(spi_value, 42, "SPI should return 42");
+
+        pgrx::info!("DIRECT_PG_TEST: SPI execution returned: {}", spi_value);
+
+        // Test 2: Direct execution (what we just implemented)
+        unsafe {
+            let query_string = std::ffi::CString::new("SELECT 42").unwrap();
+
+            let raw_parse_tree = pg_sys::pg_parse_query(query_string.as_ptr());
+            let stmt_list = raw_parse_tree as *mut pg_sys::List;
+            let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
+
+            let query = pg_sys::parse_analyze_fixedparams(
+                raw_stmt,
+                query_string.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+
+            let planned_stmt =
+                pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
+
+            let query_desc =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
+            (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
+            (*query_desc).plannedstmt = planned_stmt;
+            (*query_desc).sourceText = query_string.as_ptr();
+            (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
+            (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
+            (*query_desc).dest = std::ptr::null_mut();
+            (*query_desc).params = std::ptr::null_mut();
+            (*query_desc).queryEnv = std::ptr::null_mut();
+            (*query_desc).instrument_options = 0;
+
+            pg_sys::ExecutorStart(query_desc, 0);
+            let plan_state = (*query_desc).planstate;
+
+            let slot = pg_sys::ExecProcNode(plan_state);
+            let mut is_null = false;
+            let datum = pg_sys::slot_getattr(slot, 1, &mut is_null);
+            let direct_value = datum.value() as i32;
+
+            pg_sys::ExecutorFinish(query_desc);
+            pg_sys::ExecutorEnd(query_desc);
+
+            pgrx::info!(
+                "DIRECT_PG_TEST: Direct execution returned: {}",
+                direct_value
+            );
+
+            // Both should return the same value
+            assert_eq!(
+                spi_value, direct_value,
+                "SPI and direct execution should return same result"
+            );
+        }
+
+        pgrx::info!("DIRECT_PG_TEST: SPI vs Direct comparison PASSED");
+    }
+
+    // ============================================================================
+    // PHASE 2: MANUAL PLAN CONSTRUCTION TESTS (BYPASS PARSER)
+    // ============================================================================
+
+    /// Test manual construction of Result node with Const expression
+    /// This tests our ability to build plan nodes programmatically like Substrait translation
+    #[pg_test]
+    fn test_manual_result_node_construction() {
+        pgrx::info!("MANUAL_PLAN_TEST: Testing manual Result node construction");
+
+        unsafe {
+            // Create a Const node for value 99
+            let const_node = crate::plan_translator::expressions::create_int4_const(99)
+                .expect("Should create const node");
+
+            pgrx::info!("MANUAL_PLAN_TEST: Created Const node for value 99");
+
+            // Create a TargetEntry for the const
+            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            (*target_entry).expr = const_node as *mut pg_sys::Expr;
+            (*target_entry).resno = 1;
+            (*target_entry).resname = std::ptr::null_mut(); // Will be set later
+            (*target_entry).ressortgroupref = 0;
+            (*target_entry).resorigtbl = pg_sys::InvalidOid;
+            (*target_entry).resorigcol = 0;
+            (*target_entry).resjunk = false;
+
+            pgrx::info!("MANUAL_PLAN_TEST: Created TargetEntry");
+
+            // Create target list
+            let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+            target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+
+            // Create Result plan node
+            let result_plan =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
+            (*result_plan).plan.type_ = pg_sys::NodeTag::T_Result;
+            (*result_plan).plan.targetlist = target_list;
+            (*result_plan).plan.qual = std::ptr::null_mut();
+            (*result_plan).plan.lefttree = std::ptr::null_mut();
+            (*result_plan).plan.righttree = std::ptr::null_mut();
+            (*result_plan).plan.plan_node_id = 1;
+            (*result_plan).plan.plan_width = 4; // int4 width
+            (*result_plan).resconstantqual = std::ptr::null_mut();
+
+            pgrx::info!("MANUAL_PLAN_TEST: Created Result plan node");
+
+            // Test that nodeToString works on our manual plan
+            let plan_str = pg_sys::nodeToString(result_plan as *const std::ffi::c_void);
+            if !plan_str.is_null() {
+                pgrx::info!("MANUAL_PLAN_TEST: nodeToString works on manual plan");
+                pg_sys::pfree(plan_str as *mut std::ffi::c_void);
+            }
+
+            // Create PlannedStmt wrapper for execution
+            let planned_stmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>())
+                as *mut pg_sys::PlannedStmt;
+            (*planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
+            (*planned_stmt).planTree = result_plan as *mut pg_sys::Plan;
+            (*planned_stmt).rtable = std::ptr::null_mut(); // No tables needed for Result node
+            (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+
+            // Test execution using our direct execution approach
+            let query_desc =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
+            (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
+            (*query_desc).plannedstmt = planned_stmt;
+            (*query_desc).sourceText = std::ptr::null_mut();
+            (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
+            (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
+            (*query_desc).dest = std::ptr::null_mut();
+            (*query_desc).params = std::ptr::null_mut();
+            (*query_desc).queryEnv = std::ptr::null_mut();
+            (*query_desc).instrument_options = 0;
+
+            pgrx::info!("MANUAL_PLAN_TEST: About to execute manual plan");
+
+            pg_sys::ExecutorStart(query_desc, 0);
+            let plan_state = (*query_desc).planstate;
+
+            let slot = pg_sys::ExecProcNode(plan_state);
+            assert!(!slot.is_null(), "Manual plan should return a result");
+
+            let mut is_null = false;
+            let datum = pg_sys::slot_getattr(slot, 1, &mut is_null);
+            let value = datum.value() as i32;
+
+            assert_eq!(value, 99, "Manual plan should return 99");
+
+            pgrx::info!(
+                "MANUAL_PLAN_TEST: Manual plan returned correct value: {}",
+                value
+            );
+
+            pg_sys::ExecutorFinish(query_desc);
+            pg_sys::ExecutorEnd(query_desc);
+
+            pgrx::info!("MANUAL_PLAN_TEST: Manual Result node construction PASSED");
+        }
+    }
+
+    /// Test manual construction of different Const types
+    #[pg_test]
+    fn test_manual_const_node_types() {
+        pgrx::info!("MANUAL_PLAN_TEST: Testing different Const node types");
+
+        unsafe {
+            // Test Int4 const
+            let int_const = crate::plan_translator::expressions::create_int4_const(42)
+                .expect("Should create int4 const");
+            let int_const_ptr = int_const as *const pg_sys::Const;
+            assert_eq!(
+                (*int_const_ptr).consttype,
+                pg_sys::INT4OID,
+                "Should be INT4OID"
+            );
+            assert_eq!(
+                (*int_const_ptr).constvalue.value() as i32,
+                42,
+                "Should be 42"
+            );
+            pgrx::info!("MANUAL_PLAN_TEST: Int4 const OK");
+
+            // Test Bool const
+            let bool_const = crate::plan_translator::expressions::create_bool_const(true)
+                .expect("Should create bool const");
+            let bool_const_ptr = bool_const as *const pg_sys::Const;
+            assert_eq!(
+                (*bool_const_ptr).consttype,
+                pg_sys::BOOLOID,
+                "Should be BOOLOID"
+            );
+            pgrx::info!("MANUAL_PLAN_TEST: Bool const OK");
+
+            // Test Text const
+            let text_const = crate::plan_translator::expressions::create_text_const("hello")
+                .expect("Should create text const");
+            let text_const_ptr = text_const as *const pg_sys::Const;
+            assert_eq!(
+                (*text_const_ptr).consttype,
+                pg_sys::TEXTOID,
+                "Should be TEXTOID"
+            );
+            pgrx::info!("MANUAL_PLAN_TEST: Text const OK");
+
+            pgrx::info!("MANUAL_PLAN_TEST: All Const node types PASSED");
+        }
+    }
+
+    /// Compare manual plan construction with PostgreSQL's parser
+    #[pg_test]
+    fn test_manual_vs_parsed_plan_comparison() {
+        pgrx::info!("MANUAL_PLAN_TEST: Comparing manual vs parsed plan for 'SELECT 123'");
+
+        unsafe {
+            // Method 1: PostgreSQL's parser
+            let query_string = std::ffi::CString::new("SELECT 123").unwrap();
+            let raw_parse_tree = pg_sys::pg_parse_query(query_string.as_ptr());
+            let stmt_list = raw_parse_tree as *mut pg_sys::List;
+            let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
+
+            let query = pg_sys::parse_analyze_fixedparams(
+                raw_stmt,
+                query_string.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+
+            let parsed_planned_stmt =
+                pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
+
+            // Execute parsed plan
+            let parsed_query_desc =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
+            (*parsed_query_desc).operation = pg_sys::CmdType::CMD_SELECT;
+            (*parsed_query_desc).plannedstmt = parsed_planned_stmt;
+            (*parsed_query_desc).sourceText = query_string.as_ptr();
+            (*parsed_query_desc).snapshot = pg_sys::GetActiveSnapshot();
+            (*parsed_query_desc).crosscheck_snapshot = std::ptr::null_mut();
+            (*parsed_query_desc).dest = std::ptr::null_mut();
+            (*parsed_query_desc).params = std::ptr::null_mut();
+            (*parsed_query_desc).queryEnv = std::ptr::null_mut();
+            (*parsed_query_desc).instrument_options = 0;
+
+            pg_sys::ExecutorStart(parsed_query_desc, 0);
+            let parsed_slot = pg_sys::ExecProcNode((*parsed_query_desc).planstate);
+            let mut parsed_is_null = false;
+            let parsed_datum = pg_sys::slot_getattr(parsed_slot, 1, &mut parsed_is_null);
+            let parsed_value = parsed_datum.value() as i32;
+            pg_sys::ExecutorFinish(parsed_query_desc);
+            pg_sys::ExecutorEnd(parsed_query_desc);
+
+            pgrx::info!("MANUAL_PLAN_TEST: Parsed plan returned: {}", parsed_value);
+
+            // Method 2: Manual construction
+            let manual_const = crate::plan_translator::expressions::create_int4_const(123)
+                .expect("Should create const");
+
+            let manual_target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
+                as *mut pg_sys::TargetEntry;
+            (*manual_target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            (*manual_target_entry).expr = manual_const as *mut pg_sys::Expr;
+            (*manual_target_entry).resno = 1;
+            (*manual_target_entry).resname = std::ptr::null_mut();
+            (*manual_target_entry).ressortgroupref = 0;
+            (*manual_target_entry).resorigtbl = pg_sys::InvalidOid;
+            (*manual_target_entry).resorigcol = 0;
+            (*manual_target_entry).resjunk = false;
+
+            let mut manual_target_list: *mut pg_sys::List = std::ptr::null_mut();
+            manual_target_list = pg_sys::lappend(
+                manual_target_list,
+                manual_target_entry as *mut std::ffi::c_void,
+            );
+
+            let manual_result_plan =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
+            (*manual_result_plan).plan.type_ = pg_sys::NodeTag::T_Result;
+            (*manual_result_plan).plan.targetlist = manual_target_list;
+            (*manual_result_plan).plan.qual = std::ptr::null_mut();
+            (*manual_result_plan).plan.lefttree = std::ptr::null_mut();
+            (*manual_result_plan).plan.righttree = std::ptr::null_mut();
+            (*manual_result_plan).plan.plan_node_id = 1;
+            (*manual_result_plan).plan.plan_width = 4;
+            (*manual_result_plan).resconstantqual = std::ptr::null_mut();
+
+            let manual_planned_stmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>())
+                as *mut pg_sys::PlannedStmt;
+            (*manual_planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
+            (*manual_planned_stmt).planTree = manual_result_plan as *mut pg_sys::Plan;
+            (*manual_planned_stmt).rtable = std::ptr::null_mut();
+            (*manual_planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+
+            // Execute manual plan
+            let manual_query_desc =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
+            (*manual_query_desc).operation = pg_sys::CmdType::CMD_SELECT;
+            (*manual_query_desc).plannedstmt = manual_planned_stmt;
+            (*manual_query_desc).sourceText = std::ptr::null_mut();
+            (*manual_query_desc).snapshot = pg_sys::GetActiveSnapshot();
+            (*manual_query_desc).crosscheck_snapshot = std::ptr::null_mut();
+            (*manual_query_desc).dest = std::ptr::null_mut();
+            (*manual_query_desc).params = std::ptr::null_mut();
+            (*manual_query_desc).queryEnv = std::ptr::null_mut();
+            (*manual_query_desc).instrument_options = 0;
+
+            pg_sys::ExecutorStart(manual_query_desc, 0);
+            let manual_slot = pg_sys::ExecProcNode((*manual_query_desc).planstate);
+            let mut manual_is_null = false;
+            let manual_datum = pg_sys::slot_getattr(manual_slot, 1, &mut manual_is_null);
+            let manual_value = manual_datum.value() as i32;
+            pg_sys::ExecutorFinish(manual_query_desc);
+            pg_sys::ExecutorEnd(manual_query_desc);
+
+            pgrx::info!("MANUAL_PLAN_TEST: Manual plan returned: {}", manual_value);
+
+            // Both should return the same value
+            assert_eq!(
+                parsed_value, manual_value,
+                "Parsed and manual plans should return same result"
+            );
+            assert_eq!(manual_value, 123, "Both should return 123");
+
+            pgrx::info!("MANUAL_PLAN_TEST: Manual vs Parsed comparison PASSED");
+        }
+    }
+
+    /// Helper function to safely access the first element of a PostgreSQL List
+    unsafe fn pg_list_get_first<T>(list: *mut pg_sys::List) -> Result<*mut T, String> {
+        if list.is_null() {
+            return Err("List is null".to_string());
+        }
+
+        if (*list).length == 0 {
+            return Err("List is empty".to_string());
+        }
+
+        // Access the first element from the elements array
+        let first_cell = (*list).elements;
+        if first_cell.is_null() {
+            return Err("First cell is null".to_string());
+        }
+
+        Ok((*first_cell).ptr_value as *mut T)
+    }
+
+    #[pg_test]
+    fn test_postgresql_comparison_code() {
+        unsafe {
+            pgrx::info!("PG_COMPARISON_TEST: Testing PostgreSQL planner comparison code");
+
+            // First create a simple test table
+            Spi::run("DROP TABLE IF EXISTS test_comparison_table");
+            Spi::run("CREATE TABLE test_comparison_table (id INT, name TEXT)");
+            Spi::run("INSERT INTO test_comparison_table VALUES (1, 'Alice'), (2, 'Bob')");
+
+            // Get the table's relation ID
+            let table_oid: pg_sys::Oid = Spi::get_one::<pg_sys::Oid>(
+                "SELECT oid FROM pg_class WHERE relname = 'test_comparison_table'",
+            )
+            .unwrap()
+            .unwrap();
+
+            pgrx::info!("PG_COMPARISON_TEST: Found table OID: {}", table_oid);
+
+            // Test PostgreSQL's planner comparison
+            let compare_query = "SELECT id, name FROM test_comparison_table\0";
+            pgrx::info!(
+                "PG_COMPARISON_TEST: About to parse query: '{}'",
+                compare_query
+            );
+
+            let compare_parse_tree = pg_sys::pg_parse_query(compare_query.as_ptr() as *const i8);
+            pgrx::info!(
+                "PG_COMPARISON_TEST: Parse tree created, address: {:p}",
+                compare_parse_tree
+            );
+
+            if compare_parse_tree.is_null() {
+                pgrx::error!("PG_COMPARISON_TEST: Parse tree is null!");
+            }
+
+            pgrx::info!(
+                "PG_COMPARISON_TEST: Parse tree length: {}",
+                (*compare_parse_tree).length
+            );
+
+            // Get first element from parse tree list using helper function
+            let first_stmt = match pg_list_get_first::<pg_sys::RawStmt>(compare_parse_tree) {
+                Ok(stmt) => {
+                    pgrx::info!(
+                        "PG_COMPARISON_TEST: Successfully got first statement: {:p}",
+                        stmt
+                    );
+                    stmt
+                }
+                Err(e) => {
+                    pgrx::error!(
+                        "PG_COMPARISON_TEST: Failed to get first statement from parse tree: {}",
+                        e
+                    );
+                }
+            };
+
+            pgrx::info!("PG_COMPARISON_TEST: About to call pg_analyze_and_rewrite_fixedparams");
+
+            let compare_querytree_list = pg_sys::pg_analyze_and_rewrite_fixedparams(
+                first_stmt,
+                compare_query.as_ptr() as *const i8,
+                std::ptr::null(),     // paramTypes
+                0,                    // numParams
+                std::ptr::null_mut(), // queryEnv
+            );
+
+            pgrx::info!(
+                "PG_COMPARISON_TEST: Query tree list created, address: {:p}",
+                compare_querytree_list
+            );
+
+            if compare_querytree_list.is_null() {
+                pgrx::error!("PG_COMPARISON_TEST: Query tree list is null!");
+            }
+
+            pgrx::info!(
+                "PG_COMPARISON_TEST: Query tree list length: {}",
+                (*compare_querytree_list).length
+            );
+
+            // Get first element from query tree list using helper function
+            let compare_querytree = match pg_list_get_first::<pg_sys::Query>(compare_querytree_list)
+            {
+                Ok(query) => {
+                    pgrx::info!(
+                        "PG_COMPARISON_TEST: Successfully got first query: {:p}",
+                        query
+                    );
+                    query
+                }
+                Err(e) => {
+                    pgrx::error!(
+                        "PG_COMPARISON_TEST: Failed to get first query from querytree list: {}",
+                        e
+                    );
+                }
+            };
+
+            pgrx::info!("PG_COMPARISON_TEST: About to call planner");
+
+            let compare_plan = pg_sys::planner(
+                compare_querytree,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+
+            pgrx::info!(
+                "PG_COMPARISON_TEST: Planner created plan: {:p}",
+                compare_plan
+            );
+
+            if compare_plan.is_null() {
+                pgrx::error!("PG_COMPARISON_TEST: Plan is null!");
+            }
+
+            if (*compare_plan).planTree.is_null() {
+                pgrx::error!("PG_COMPARISON_TEST: Plan tree is null!");
+            }
+
+            pgrx::info!("PG_COMPARISON_TEST: Plan tree created, checking if it's a SeqScan");
+
+            // Check if the plan tree is a SeqScan
+            let plan_tree = (*compare_plan).planTree;
+            let node_tag = (*plan_tree).type_;
+
+            pgrx::info!("PG_COMPARISON_TEST: Plan tree node type: {:?}", node_tag);
+
+            if node_tag == pg_sys::NodeTag::T_SeqScan {
+                let seqscan = plan_tree as *mut pg_sys::SeqScan;
+                pgrx::info!(
+                    "PG_COMPARISON_TEST: PostgreSQL planner created SeqScan with scanrelid: {}",
+                    (*seqscan).scan.scanrelid
+                );
+            } else {
+                pgrx::info!(
+                    "PG_COMPARISON_TEST: Plan tree is not a SeqScan, it's: {:?}",
+                    node_tag
+                );
+            }
+
+            pgrx::info!("PG_COMPARISON_TEST: PostgreSQL comparison test PASSED");
+
+            // Clean up
+            Spi::run("DROP TABLE test_comparison_table");
+        }
+    }
+
+    unsafe fn setup_seqscan_test_table() -> pg_sys::Oid {
+        // First create a simple test table
+        Spi::run("DROP TABLE IF EXISTS test_seqscan_table");
+        Spi::run("CREATE TABLE test_seqscan_table (id INT, name TEXT)");
+        Spi::run("INSERT INTO test_seqscan_table VALUES (1, 'Alice'), (2, 'Bob')");
+        // Update statistics so PostgreSQL knows the actual row count
+        Spi::run("ANALYZE test_seqscan_table");
+
+        // Get the table's relation ID
+        let table_oid: pg_sys::Oid = Spi::get_one::<pg_sys::Oid>(
+            "SELECT oid FROM pg_class WHERE relname = 'test_seqscan_table'",
+        )
+        .unwrap()
+        .unwrap();
+
+        pgrx::info!("SETUP_SEQSCAN_TABLE: Found table OID: {}", table_oid);
+        table_oid
+    }
+
+    #[pg_test]
+    fn test_manual_seqscan_node_construction() {
+        unsafe {
+            pgrx::info!("MANUAL_SEQSCAN_TEST: Testing manual SeqScan node construction");
+
+            let table_oid = setup_seqscan_test_table();
+
+            // First, let's see what PostgreSQL's planner creates for comparison
+            let compare_query = "SELECT id, name FROM test_seqscan_table\0";
+            let compare_parse_tree = pg_sys::pg_parse_query(compare_query.as_ptr() as *const i8);
+
+            // Get first element from parse tree list using helper function
+            let first_stmt = match pg_list_get_first::<pg_sys::RawStmt>(compare_parse_tree) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    pgrx::error!("Failed to get first statement from parse tree: {}", e);
+                }
+            };
+
+            let compare_querytree_list = pg_sys::pg_analyze_and_rewrite_fixedparams(
+                first_stmt,
+                compare_query.as_ptr() as *const i8,
+                std::ptr::null(),     // paramTypes
+                0,                    // numParams
+                std::ptr::null_mut(), // queryEnv
+            );
+
+            // Get first element from query tree list using helper function
+            let compare_querytree = match pg_list_get_first::<pg_sys::Query>(compare_querytree_list)
+            {
+                Ok(query) => query,
+                Err(e) => {
+                    pgrx::error!("Failed to get first query from querytree list: {}", e);
+                }
+            };
+
+            let compare_plan = pg_sys::planner(
+                compare_querytree,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            );
+
+            let pg_seqscan = (*compare_plan).planTree as *mut pg_sys::SeqScan;
+            pgrx::info!("MANUAL_SEQSCAN_TEST: PostgreSQL planner created SeqScan with:");
+            pgrx::info!("  scanrelid: {}", (*pg_seqscan).scan.scanrelid);
+            pgrx::info!(
+                "  plan.startup_cost: {}",
+                (*pg_seqscan).scan.plan.startup_cost
+            );
+            pgrx::info!("  plan.total_cost: {}", (*pg_seqscan).scan.plan.total_cost);
+            pgrx::info!("  plan.plan_rows: {}", (*pg_seqscan).scan.plan.plan_rows);
+            pgrx::info!("  plan.plan_width: {}", (*pg_seqscan).scan.plan.plan_width);
+            pgrx::info!(
+                "  plan.targetlist is null: {}",
+                (*pg_seqscan).scan.plan.targetlist.is_null()
+            );
+            if !(*pg_seqscan).scan.plan.targetlist.is_null() {
+                pgrx::info!(
+                    "  plan.targetlist length: {}",
+                    (*(*pg_seqscan).scan.plan.targetlist).length
+                );
+            }
+            pgrx::info!(
+                "  plan.qual is null: {}",
+                (*pg_seqscan).scan.plan.qual.is_null()
+            );
+            pgrx::info!(
+                "  plan.lefttree is null: {}",
+                (*pg_seqscan).scan.plan.lefttree.is_null()
+            );
+            pgrx::info!(
+                "  plan.righttree is null: {}",
+                (*pg_seqscan).scan.plan.righttree.is_null()
+            );
+
+            // Check additional PostgreSQL Plan fields
+            pgrx::info!(
+                "  plan.plan_node_id: {}",
+                (*pg_seqscan).scan.plan.plan_node_id
+            );
+            pgrx::info!(
+                "  plan.extParam is null: {}",
+                (*pg_seqscan).scan.plan.extParam.is_null()
+            );
+            pgrx::info!(
+                "  plan.allParam is null: {}",
+                (*pg_seqscan).scan.plan.allParam.is_null()
+            );
+
+            pgrx::info!(
+                "MANUAL_SEQSCAN_TEST: PlannedStmt rtable is null: {}",
+                (*compare_plan).rtable.is_null()
+            );
+            if !(*compare_plan).rtable.is_null() {
+                pgrx::info!(
+                    "MANUAL_SEQSCAN_TEST: PlannedStmt rtable length: {}",
+                    (*(*compare_plan).rtable).length
+                );
+            }
+
+            // Manually construct a SeqScan plan node
+            let seqscan =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
+            (*seqscan).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+
+            // Use PostgreSQL's own estimation functions
+            // First, open the relation to get statistics
+            let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
+
+            // Get cardinality estimate using PostgreSQL's estimate_rel_size
+            let mut pages: pg_sys::BlockNumber = 0;
+            let mut tuples: f64 = 0.0;
+            let mut allvisfrac: f64 = 0.0;
+            pg_sys::estimate_rel_size(
+                relation,
+                std::ptr::null_mut(), // attr_widths - we'll calculate separately
+                &mut pages,
+                &mut tuples,
+                &mut allvisfrac,
+            );
+
+            // Get row width estimate using PostgreSQL's get_relation_data_width
+            let plan_width = pg_sys::get_relation_data_width(table_oid, std::ptr::null_mut());
+
+            pgrx::info!("MANUAL_SEQSCAN_TEST: PostgreSQL estimates for table:");
+            pgrx::info!(
+                "  pages: {}, tuples: {}, width: {}",
+                pages,
+                tuples,
+                plan_width
+            );
+
+            // Close the relation
+            pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
+
+            // Set up the Scan part with PostgreSQL's estimates
+            let scan = &mut (*seqscan).scan;
+            scan.scanrelid = 1; // Index in range table (1-based)
+            scan.plan.startup_cost = 0.0;
+            scan.plan.total_cost = 1.0;
+            scan.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
+            scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
+            scan.plan.targetlist = std::ptr::null_mut(); // Will set later
+
+            // Build target list for "SELECT id, name FROM test_seqscan_table"
+            let mut target_entries = Vec::new();
+
+            // Target entry for 'id' column (INT4)
+            let id_var = pg_sys::makeVar(
+                1,                  // varno (range table index)
+                1,                  // varattno (column number, 1-based)
+                pg_sys::INT4OID,    // vartype
+                -1,                 // vartypmod
+                pg_sys::InvalidOid, // varcollid
+                0,                  // varlevelsup
+            );
+
+            let id_target = pg_sys::makeTargetEntry(
+                id_var as *mut pg_sys::Expr,
+                1, // resno (1-based)
+                pg_sys::pstrdup(b"id\0".as_ptr() as *const i8),
+                false, // resjunk
+            );
+            target_entries.push(id_target);
+
+            // Target entry for 'name' column (TEXT)
+            let name_var = pg_sys::makeVar(
+                1,                             // varno
+                2,                             // varattno (column 2)
+                pg_sys::TEXTOID,               // vartype
+                -1,                            // vartypmod
+                pg_sys::DEFAULT_COLLATION_OID, // varcollid
+                0,                             // varlevelsup
+            );
+
+            let name_target = pg_sys::makeTargetEntry(
+                name_var as *mut pg_sys::Expr,
+                2, // resno
+                pg_sys::pstrdup(b"name\0".as_ptr() as *const i8),
+                false, // resjunk
+            );
+            target_entries.push(name_target);
+
+            // Convert Vec to PostgreSQL List
+            let mut target_list = std::ptr::null_mut();
+            for target_entry in target_entries.iter().rev() {
+                target_list = pg_sys::lcons(*target_entry as *mut std::ffi::c_void, target_list);
+            }
+            scan.plan.targetlist = target_list;
+
+            // Create range table entry for the table
+            let rte = pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeTblEntry>())
+                as *mut pg_sys::RangeTblEntry;
+            (*rte).rtekind = pg_sys::RTEKind::RTE_RELATION;
+            (*rte).relid = table_oid;
+            (*rte).relkind = pg_sys::RELKIND_RELATION as i8;
+            (*rte).rellockmode = pg_sys::AccessShareLock as i32;
+            (*rte).lateral = false;
+            (*rte).inFromCl = true;
+
+            // Create the range table as a List
+            let range_table = pg_sys::lcons(rte as *mut std::ffi::c_void, std::ptr::null_mut());
+
+            // Create PlannedStmt
+            let planned_stmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>())
+                as *mut pg_sys::PlannedStmt;
+            (*planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
+            (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+            (*planned_stmt).planTree = seqscan as *mut pg_sys::Plan;
+            (*planned_stmt).rtable = range_table;
+            (*planned_stmt).canSetTag = true;
+
+            // Create QueryDesc for execution
+            let dest = pg_sys::CreateDestReceiver(pg_sys::CommandDest::DestNone);
+            let query_desc = pg_sys::CreateQueryDesc(
+                planned_stmt,
+                b"manual seqscan test\0".as_ptr() as *const i8,
+                pg_sys::GetActiveSnapshot(),
+                std::ptr::null_mut(), // crosscheck_snapshot
+                dest,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+
+            // Compare our manual SeqScan to PostgreSQL's
+            pgrx::info!("MANUAL_SEQSCAN_TEST: Our manual SeqScan has:");
+            pgrx::info!("  scanrelid: {}", (*seqscan).scan.scanrelid);
+            pgrx::info!("  plan.startup_cost: {}", (*seqscan).scan.plan.startup_cost);
+            pgrx::info!("  plan.total_cost: {}", (*seqscan).scan.plan.total_cost);
+            pgrx::info!("  plan.plan_rows: {}", (*seqscan).scan.plan.plan_rows);
+            pgrx::info!("  plan.plan_width: {}", (*seqscan).scan.plan.plan_width);
+            pgrx::info!(
+                "  plan.targetlist is null: {}",
+                (*seqscan).scan.plan.targetlist.is_null()
+            );
+            if !(*seqscan).scan.plan.targetlist.is_null() {
+                pgrx::info!(
+                    "  plan.targetlist length: {}",
+                    (*(*seqscan).scan.plan.targetlist).length
+                );
+            }
+            pgrx::info!(
+                "  plan.qual is null: {}",
+                (*seqscan).scan.plan.qual.is_null()
+            );
+            pgrx::info!(
+                "  plan.lefttree is null: {}",
+                (*seqscan).scan.plan.lefttree.is_null()
+            );
+            pgrx::info!(
+                "  plan.righttree is null: {}",
+                (*seqscan).scan.plan.righttree.is_null()
+            );
+
+            // Check additional Plan fields that might be important
+            pgrx::info!("  plan.plan_node_id: {}", (*seqscan).scan.plan.plan_node_id);
+            pgrx::info!(
+                "  plan.extParam is null: {}",
+                (*seqscan).scan.plan.extParam.is_null()
+            );
+            pgrx::info!(
+                "  plan.allParam is null: {}",
+                (*seqscan).scan.plan.allParam.is_null()
+            );
+
+            // Execute the plan
+            pgrx::info!("MANUAL_SEQSCAN_TEST: Starting executor...");
+            pg_sys::ExecutorStart(query_desc, 0);
+
+            pgrx::info!("MANUAL_SEQSCAN_TEST: Executor started, beginning scan...");
+
+            // Check if the planstate was properly initialized
+            let planstate = (*query_desc).planstate;
+            if planstate.is_null() {
+                pgrx::error!("MANUAL_SEQSCAN_TEST: planstate is NULL after ExecutorStart");
+            }
+
+            pgrx::info!(
+                "MANUAL_SEQSCAN_TEST: planstate type: {}",
+                (*planstate).type_ as u32
+            );
+            pgrx::info!(
+                "MANUAL_SEQSCAN_TEST: planstate plan is null: {}",
+                (*planstate).plan.is_null()
+            );
+
+            if !(*planstate).plan.is_null() {
+                pgrx::info!(
+                    "MANUAL_SEQSCAN_TEST: planstate.plan.type: {}",
+                    (*(*planstate).plan).type_ as u32
+                );
+            }
+
+            let mut row_count = 0;
+            loop {
+                let slot = pg_sys::ExecProcNode(planstate);
+                if slot.is_null() {
+                    pgrx::info!("MANUAL_SEQSCAN_TEST: ExecProcNode returned NULL, ending scan");
+                    break;
+                }
+                row_count += 1;
+                pgrx::info!("MANUAL_SEQSCAN_TEST: Found row {}", row_count);
+
+                // Extract values from the slot for verification
+                let mut is_null = false;
+                let id_datum = pg_sys::slot_getattr(slot, 1, &mut is_null);
+                if !is_null {
+                    let id_value = id_datum.value() as i32;
+                    pgrx::info!("MANUAL_SEQSCAN_TEST: Row {}: id = {}", row_count, id_value);
+                }
+
+                let name_datum = pg_sys::slot_getattr(slot, 2, &mut is_null);
+                if !is_null {
+                    // Convert Datum to String using pgrx's FromDatum trait - safer approach
+                    use pgrx::FromDatum;
+                    let name_str = unsafe {
+                        String::from_polymorphic_datum(name_datum, false, pg_sys::TEXTOID)
+                    };
+                    pgrx::info!(
+                        "MANUAL_SEQSCAN_TEST: Row {}: name = '{}'",
+                        row_count,
+                        name_str.unwrap_or_default()
+                    );
+                }
+            }
+
+            pg_sys::ExecutorFinish(query_desc);
+            pg_sys::ExecutorEnd(query_desc);
+
+            // DEBUGGING: Let's also test PostgreSQL's complete execution for comparison first
+            pgrx::info!("MANUAL_SEQSCAN_TEST: Testing PostgreSQL's complete execution path...");
+            let pg_query_desc = pg_sys::CreateQueryDesc(
+                compare_plan,
+                b"PostgreSQL comparison\0".as_ptr() as *const i8,
+                pg_sys::GetActiveSnapshot(),
+                std::ptr::null_mut(),
+                pg_sys::CreateDestReceiver(pg_sys::CommandDest::DestNone),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+
+            pg_sys::ExecutorStart(pg_query_desc, 0);
+            let mut pg_row_count = 0;
+            loop {
+                let slot = pg_sys::ExecProcNode((*pg_query_desc).planstate);
+                if slot.is_null() {
+                    break;
+                }
+                pg_row_count += 1;
+            }
+            pg_sys::ExecutorFinish(pg_query_desc);
+            pg_sys::ExecutorEnd(pg_query_desc);
+
+            pgrx::info!(
+                "MANUAL_SEQSCAN_TEST: PostgreSQL's execution returned {} rows",
+                pg_row_count
+            );
+
+            // Now verify our manual scan matches PostgreSQL's behavior
+            if row_count == pg_row_count {
+                pgrx::info!("MANUAL_SEQSCAN_TEST: Manual SeqScan construction PASSED - both scans returned {} rows", row_count);
+            } else {
+                pgrx::error!("MANUAL_SEQSCAN_TEST: Manual SeqScan returned {} rows but PostgreSQL returned {} rows", row_count, pg_row_count);
+            }
+
+            // Clean up
+            Spi::run("DROP TABLE test_seqscan_table");
+        }
+    }
+
     /// Sets up TPC-H database if needed (checks if LINEITEM table exists)
     fn setup_tpch_database_if_needed() {
         // Check if LINEITEM table already exists (uppercase to match Substrait)

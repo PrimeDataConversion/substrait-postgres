@@ -214,6 +214,30 @@ pub unsafe fn create_int8_const(
     Ok(const_node as *mut pg_sys::Expr)
 }
 
+/// Create a PostgreSQL boolean constant node
+pub unsafe fn create_bool_const(
+    value: bool,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let type_oid = pg_sys::BOOLOID;
+
+    // Validate that the OID is reasonable
+    if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
+        return Err(format!("Invalid BOOLOID: {type_oid}").into());
+    }
+
+    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
+    (*const_node).consttype = type_oid;
+    (*const_node).consttypmod = -1;
+    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    (*const_node).constlen = 1; // Boolean is 1 byte
+    (*const_node).constvalue = pg_sys::Datum::from(value);
+    (*const_node).constisnull = false;
+    (*const_node).constbyval = true;
+
+    Ok(const_node as *mut pg_sys::Expr)
+}
+
 /// Create a PostgreSQL text constant node
 pub unsafe fn create_text_const(
     value: &str,
