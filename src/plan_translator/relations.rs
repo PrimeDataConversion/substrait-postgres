@@ -192,28 +192,28 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 )?;
 
                 // Create a Result plan node using PostgreSQL's memory allocator
-                let result_node =
-                    pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-                (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-                (*result_node).plan.lefttree = input_plan;
-                (*result_node).plan.targetlist = target_list;
-                (*result_node).plan.righttree = std::ptr::null_mut();
-                (*result_node).plan.initPlan = std::ptr::null_mut();
-                (*result_node).plan.extParam = std::ptr::null_mut();
-                (*result_node).plan.allParam = std::ptr::null_mut();
-                (*result_node).plan.startup_cost = 0.0;
-                (*result_node).plan.total_cost = 1.0;
-                (*result_node).plan.plan_rows = 1.0;
-                (*result_node).plan.plan_width = 32;
-                (*result_node).plan.parallel_aware = false;
-                (*result_node).plan.parallel_safe = true;
-                (*result_node).plan.async_capable = false;
-                (*result_node).plan.plan_node_id = 0;
-                (*result_node).plan.qual = std::ptr::null_mut();
+                let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
+                result_node.plan.type_ = pg_sys::NodeTag::T_Result;
+                result_node.plan.lefttree = input_plan;
+                result_node.plan.targetlist = target_list;
+                result_node.plan.righttree = std::ptr::null_mut();
+                result_node.plan.initPlan = std::ptr::null_mut();
+                result_node.plan.extParam = std::ptr::null_mut();
+                result_node.plan.allParam = std::ptr::null_mut();
+                result_node.plan.startup_cost = 0.0;
+                result_node.plan.total_cost = 1.0;
+                result_node.plan.plan_rows = 1.0;
+                result_node.plan.plan_width = 32;
+                result_node.plan.parallel_aware = false;
+                result_node.plan.parallel_safe = true;
+                result_node.plan.async_capable = false;
+                result_node.plan.plan_node_id = 0;
+                result_node.plan.qual = std::ptr::null_mut();
 
+                let result_ptr = result_node.into_pg();
                 // Return pointer to the plan field
                 Ok((
-                    &mut (*result_node).plan as *mut pg_sys::Plan,
+                    &mut (*result_ptr).plan as *mut pg_sys::Plan,
                     input_range_table,
                 ))
             } else {

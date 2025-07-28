@@ -1,5 +1,5 @@
 use anyhow::Result;
-use pgrx::pg_sys;
+use pgrx::{pg_sys, PgBox};
 
 use super::expressions::create_cstring;
 
@@ -7,26 +7,27 @@ use super::expressions::create_cstring;
 pub unsafe fn create_values_scan_node(
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     // For now, just return a simple Result node with no input (constant projection)
-    let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-    (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-    (*result_node).plan.lefttree = std::ptr::null_mut();
-    (*result_node).plan.righttree = std::ptr::null_mut();
-    (*result_node).plan.initPlan = std::ptr::null_mut();
-    (*result_node).plan.extParam = std::ptr::null_mut();
-    (*result_node).plan.allParam = std::ptr::null_mut();
-    (*result_node).plan.startup_cost = 0.0;
-    (*result_node).plan.total_cost = 1.0;
-    (*result_node).plan.plan_rows = 1.0;
-    (*result_node).plan.plan_width = 32;
-    (*result_node).plan.parallel_aware = false;
-    (*result_node).plan.parallel_safe = true;
-    (*result_node).plan.async_capable = false;
-    (*result_node).plan.plan_node_id = 0;
-    (*result_node).plan.qual = std::ptr::null_mut();
-    (*result_node).plan.targetlist = std::ptr::null_mut();
+    let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
+    result_node.plan.type_ = pg_sys::NodeTag::T_Result;
+    result_node.plan.lefttree = std::ptr::null_mut();
+    result_node.plan.righttree = std::ptr::null_mut();
+    result_node.plan.initPlan = std::ptr::null_mut();
+    result_node.plan.extParam = std::ptr::null_mut();
+    result_node.plan.allParam = std::ptr::null_mut();
+    result_node.plan.startup_cost = 0.0;
+    result_node.plan.total_cost = 1.0;
+    result_node.plan.plan_rows = 1.0;
+    result_node.plan.plan_width = 32;
+    result_node.plan.parallel_aware = false;
+    result_node.plan.parallel_safe = true;
+    result_node.plan.async_capable = false;
+    result_node.plan.plan_node_id = 0;
+    result_node.plan.qual = std::ptr::null_mut();
+    result_node.plan.targetlist = std::ptr::null_mut();
 
+    let result_ptr = result_node.into_pg();
     // Return pointer to the plan field
-    Ok(&mut (*result_node).plan as *mut pg_sys::Plan)
+    Ok(&mut (*result_ptr).plan as *mut pg_sys::Plan)
 }
 
 /// Create a Result node with target list for literal projections
@@ -34,26 +35,27 @@ pub unsafe fn create_values_scan_node(
 pub unsafe fn create_result_node_with_target_list(
     target_list: *mut pg_sys::List,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-    (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-    (*result_node).plan.lefttree = std::ptr::null_mut();
-    (*result_node).plan.righttree = std::ptr::null_mut();
-    (*result_node).plan.initPlan = std::ptr::null_mut();
-    (*result_node).plan.extParam = std::ptr::null_mut();
-    (*result_node).plan.allParam = std::ptr::null_mut();
-    (*result_node).plan.startup_cost = 0.0;
-    (*result_node).plan.total_cost = 1.0;
-    (*result_node).plan.plan_rows = 1.0;
-    (*result_node).plan.plan_width = 32;
-    (*result_node).plan.parallel_aware = false;
-    (*result_node).plan.parallel_safe = true;
-    (*result_node).plan.async_capable = false;
-    (*result_node).plan.plan_node_id = 0;
-    (*result_node).plan.qual = std::ptr::null_mut();
-    (*result_node).plan.targetlist = target_list;
+    let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
+    result_node.plan.type_ = pg_sys::NodeTag::T_Result;
+    result_node.plan.lefttree = std::ptr::null_mut();
+    result_node.plan.righttree = std::ptr::null_mut();
+    result_node.plan.initPlan = std::ptr::null_mut();
+    result_node.plan.extParam = std::ptr::null_mut();
+    result_node.plan.allParam = std::ptr::null_mut();
+    result_node.plan.startup_cost = 0.0;
+    result_node.plan.total_cost = 1.0;
+    result_node.plan.plan_rows = 1.0;
+    result_node.plan.plan_width = 32;
+    result_node.plan.parallel_aware = false;
+    result_node.plan.parallel_safe = true;
+    result_node.plan.async_capable = false;
+    result_node.plan.plan_node_id = 0;
+    result_node.plan.qual = std::ptr::null_mut();
+    result_node.plan.targetlist = target_list;
 
+    let result_ptr = result_node.into_pg();
     // Return pointer to the plan field
-    Ok(&mut (*result_node).plan as *mut pg_sys::Plan)
+    Ok(&mut (*result_ptr).plan as *mut pg_sys::Plan)
 }
 
 /// Create a Values scan node with specific target list for literal projections
@@ -61,8 +63,8 @@ pub unsafe fn create_values_scan_with_target_list(
     target_list: *mut pg_sys::List,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     // Create a ValuesScan plan node specifically for literal values
-    let values_scan =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::ValuesScan>()) as *mut pg_sys::ValuesScan;
+    let mut values_scan = PgBox::<pg_sys::ValuesScan>::alloc0();
+    let values_scan = values_scan.into_pg();
 
     // Set up the scan portion (for PostgreSQL 15+)
     #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
@@ -146,8 +148,7 @@ unsafe fn create_seqscan_with_postgresql_stats(
     target_list: *mut pg_sys::List,
 ) -> *mut pg_sys::SeqScan {
     // Create the SeqScan node using PostgreSQL's allocation pattern
-    let seqscan_node =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
+    let mut seqscan_node = pgrx::PgBox::<pg_sys::SeqScan>::alloc0();
 
     // Use PostgreSQL's own estimation functions for accurate statistics
     let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
@@ -174,55 +175,55 @@ unsafe fn create_seqscan_with_postgresql_stats(
     #[cfg(any(feature = "pg13", feature = "pg14"))]
     {
         // Set node tag FIRST (critical for ExecInitNode dispatch)
-        (*seqscan_node).plan.type_ = pg_sys::NodeTag::T_SeqScan;
+        seqscan_node.plan.type_ = pg_sys::NodeTag::T_SeqScan;
 
         // Set the critical SeqScan fields
-        (*seqscan_node).plan.targetlist = target_list;
-        (*seqscan_node).plan.qual = std::ptr::null_mut(); // No qualification
-        (*seqscan_node).scanrelid = scanrelid; // Critical: 1-based index into range table
+        seqscan_node.plan.targetlist = target_list;
+        seqscan_node.plan.qual = std::ptr::null_mut(); // No qualification
+        seqscan_node.scanrelid = scanrelid; // Critical: 1-based index into range table
 
         // Initialize base Plan fields with PostgreSQL's estimates
-        (*seqscan_node).plan.lefttree = std::ptr::null_mut();
-        (*seqscan_node).plan.righttree = std::ptr::null_mut();
-        (*seqscan_node).plan.initPlan = std::ptr::null_mut();
-        (*seqscan_node).plan.extParam = std::ptr::null_mut();
-        (*seqscan_node).plan.allParam = std::ptr::null_mut();
-        (*seqscan_node).plan.startup_cost = 0.0;
-        (*seqscan_node).plan.total_cost = 1.0;
-        (*seqscan_node).plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
-        (*seqscan_node).plan.plan_width = plan_width; // Use PostgreSQL's width estimate
-        (*seqscan_node).plan.parallel_aware = false;
-        (*seqscan_node).plan.parallel_safe = true;
-        (*seqscan_node).plan.async_capable = false;
-        (*seqscan_node).plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
+        seqscan_node.plan.lefttree = std::ptr::null_mut();
+        seqscan_node.plan.righttree = std::ptr::null_mut();
+        seqscan_node.plan.initPlan = std::ptr::null_mut();
+        seqscan_node.plan.extParam = std::ptr::null_mut();
+        seqscan_node.plan.allParam = std::ptr::null_mut();
+        seqscan_node.plan.startup_cost = 0.0;
+        seqscan_node.plan.total_cost = 1.0;
+        seqscan_node.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
+        seqscan_node.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
+        seqscan_node.plan.parallel_aware = false;
+        seqscan_node.plan.parallel_safe = true;
+        seqscan_node.plan.async_capable = false;
+        seqscan_node.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
     }
     #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
     {
         // Set node tag FIRST (critical for ExecInitNode dispatch)
-        (*seqscan_node).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+        seqscan_node.scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
 
         // Set the critical SeqScan fields
-        (*seqscan_node).scan.plan.targetlist = target_list;
-        (*seqscan_node).scan.plan.qual = std::ptr::null_mut(); // No qualification
-        (*seqscan_node).scan.scanrelid = scanrelid; // Critical: 1-based index into range table
+        seqscan_node.scan.plan.targetlist = target_list;
+        seqscan_node.scan.plan.qual = std::ptr::null_mut(); // No qualification
+        seqscan_node.scan.scanrelid = scanrelid; // Critical: 1-based index into range table
 
         // Initialize base Plan fields with PostgreSQL's estimates
-        (*seqscan_node).scan.plan.lefttree = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.righttree = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.initPlan = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.extParam = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.allParam = std::ptr::null_mut();
-        (*seqscan_node).scan.plan.startup_cost = 0.0;
-        (*seqscan_node).scan.plan.total_cost = 1.0;
-        (*seqscan_node).scan.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
-        (*seqscan_node).scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
-        (*seqscan_node).scan.plan.parallel_aware = false;
-        (*seqscan_node).scan.plan.parallel_safe = true;
-        (*seqscan_node).scan.plan.async_capable = false;
-        (*seqscan_node).scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
+        seqscan_node.scan.plan.lefttree = std::ptr::null_mut();
+        seqscan_node.scan.plan.righttree = std::ptr::null_mut();
+        seqscan_node.scan.plan.initPlan = std::ptr::null_mut();
+        seqscan_node.scan.plan.extParam = std::ptr::null_mut();
+        seqscan_node.scan.plan.allParam = std::ptr::null_mut();
+        seqscan_node.scan.plan.startup_cost = 0.0;
+        seqscan_node.scan.plan.total_cost = 1.0;
+        seqscan_node.scan.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
+        seqscan_node.scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
+        seqscan_node.scan.plan.parallel_aware = false;
+        seqscan_node.scan.plan.parallel_safe = true;
+        seqscan_node.scan.plan.async_capable = false;
+        seqscan_node.scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
     }
 
-    seqscan_node
+    seqscan_node.into_pg()
 }
 
 /// Create a PostgreSQL SeqScan node for table scans
@@ -309,8 +310,8 @@ unsafe fn lookup_table_oid(
     let table_cstring = create_cstring(table_name);
 
     // Use PostgreSQL's RangeVarGetRelid to look up the table
-    let range_var =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeVar>()) as *mut pg_sys::RangeVar;
+    let mut range_var = PgBox::<pg_sys::RangeVar>::alloc0();
+    let range_var = range_var.into_pg();
     (*range_var).relname = table_cstring;
     (*range_var).inh = true;
     (*range_var).relpersistence = pg_sys::RELPERSISTENCE_PERMANENT as i8;
@@ -346,8 +347,8 @@ unsafe fn create_range_table_entry(
     );
 
     // Create RangeTblEntry
-    let rte =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeTblEntry>()) as *mut pg_sys::RangeTblEntry;
+    let mut rte = PgBox::<pg_sys::RangeTblEntry>::alloc0();
+    let rte = rte.into_pg();
 
     (*rte).type_ = pg_sys::NodeTag::T_RangeTblEntry;
     (*rte).rtekind = pg_sys::RTEKind::RTE_RELATION;
@@ -359,7 +360,8 @@ unsafe fn create_range_table_entry(
     (*rte).inFromCl = true; // This table is in the FROM clause
 
     // Create an alias for the table
-    let alias = pg_sys::palloc0(std::mem::size_of::<pg_sys::Alias>()) as *mut pg_sys::Alias;
+    let mut alias = PgBox::<pg_sys::Alias>::alloc0();
+    let alias = alias.into_pg();
     (*alias).type_ = pg_sys::NodeTag::T_Alias;
     (*alias).aliasname = create_cstring(table_name);
     (*alias).colnames = std::ptr::null_mut(); // Will be filled in by planner if needed
@@ -429,7 +431,7 @@ unsafe fn create_target_list_for_table(
         eprintln!("DEBUG: About to create Var node for column {}", i + 1);
         pgrx::info!("DEBUG: About to create Var node for column {}", i + 1);
 
-        let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
+        let mut var_node = pgrx::PgBox::<pg_sys::Var>::alloc0();
 
         eprintln!(
             "DEBUG: Created Var node, setting fields for column {}",
@@ -440,13 +442,13 @@ unsafe fn create_target_list_for_table(
             i + 1
         );
 
-        (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
-        (*var_node).varno = 1; // Single table scan
-        (*var_node).varattno = (*attr).attnum;
-        (*var_node).vartype = (*attr).atttypid;
-        (*var_node).vartypmod = (*attr).atttypmod;
-        (*var_node).varcollid = (*attr).attcollation;
-        (*var_node).varlevelsup = 0;
+        var_node.xpr.type_ = pg_sys::NodeTag::T_Var;
+        var_node.varno = 1; // Single table scan
+        var_node.varattno = (*attr).attnum;
+        var_node.vartype = (*attr).atttypid;
+        var_node.vartypmod = (*attr).atttypmod;
+        var_node.varcollid = (*attr).attcollation;
+        var_node.varlevelsup = 0;
 
         eprintln!(
             "DEBUG: Column {}: attnum={}, atttypid={}, atttypmod={}, attcollation={}",
@@ -475,11 +477,10 @@ unsafe fn create_target_list_for_table(
         );
 
         // Create target entry
-        let target_entry =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>()) as *mut pg_sys::TargetEntry;
-        (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-        (*target_entry).expr = var_node as *mut pg_sys::Expr;
-        (*target_entry).resno = (*attr).attnum;
+        let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+        target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+        target_entry.expr = var_node.into_pg() as *mut pg_sys::Expr;
+        target_entry.resno = (*attr).attnum;
 
         eprintln!(
             "DEBUG: TargetEntry created, about to access column name for column {}",
@@ -515,19 +516,13 @@ unsafe fn create_target_list_for_table(
             i + 1
         );
 
-        (*target_entry).resname = create_cstring(&attr_name_str);
-        (*target_entry).resjunk = false;
+        target_entry.resname = create_cstring(&attr_name_str);
+        target_entry.resjunk = false;
 
         eprintln!("DEBUG: About to append to target list for column {}", i + 1);
         pgrx::info!("DEBUG: About to append to target list for column {}", i + 1);
 
-        // SAFETY: Add null check before lappend
-        if target_entry.is_null() {
-            eprintln!("ERROR: target_entry is null for column {}", i + 1);
-            pgrx::error!("target_entry is null for column {}", i + 1);
-        }
-
-        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+        target_list = pg_sys::lappend(target_list, target_entry.into_pg() as *mut std::ffi::c_void);
 
         eprintln!("DEBUG: Successfully completed processing column {}", i + 1);
         pgrx::info!("DEBUG: Successfully completed processing column {}", i + 1);
@@ -741,10 +736,12 @@ pub unsafe fn create_sort_node(
         pgrx::info!("DEBUG: nodeToString on input plan returned null");
     }
 
-    // Create a Sort plan node following PostgreSQL's make_sort pattern
-    let sort_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Sort>()) as *mut pg_sys::Sort;
-    eprintln!("DEBUG: Sort node allocated at: {sort_node:p}");
-    pgrx::info!("DEBUG: Sort node allocated at: {:p}", sort_node);
+    // Create a Sort plan node following PostgreSQL's make_sort pattern - safe allocation
+    let mut sort_node = pgrx::PgBox::<pg_sys::Sort>::alloc0();
+    let sort_node_ptr = sort_node.as_ptr();
+    eprintln!("DEBUG: Sort node allocated at: {sort_node_ptr:p}");
+    pgrx::info!("DEBUG: Sort node allocated at: {:p}", sort_node_ptr);
+    let sort_node = sort_node.into_pg();
 
     // Set node tag FIRST (critical for ExecInitNode dispatch)
     (*sort_node).plan.type_ = pg_sys::NodeTag::T_Sort;
@@ -778,30 +775,34 @@ pub unsafe fn create_sort_node(
     eprintln!("DEBUG: Creating Sort arrays with numCols = {num_cols}");
     pgrx::info!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
 
-    // sortColIdx array - which columns to sort by (1-based target list indices)
-    let sort_col_array =
-        pg_sys::palloc((num_cols as usize) * std::mem::size_of::<pg_sys::AttrNumber>())
-            as *mut pg_sys::AttrNumber;
-    *sort_col_array.offset(0) = 1; // Sort by first column in target list
-    (*sort_node).sortColIdx = sort_col_array;
+    // sortColIdx array - which columns to sort by (1-based target list indices) - safe allocation
+    let sort_col_array = unsafe {
+        pgrx::PgMemoryContexts::CurrentMemoryContext
+            .palloc_slice::<pg_sys::AttrNumber>(num_cols as usize)
+    };
+    sort_col_array[0] = 1; // Sort by first column in target list
+    (*sort_node).sortColIdx = sort_col_array.as_mut_ptr();
 
-    // sortOperators array - comparison operators for each sort column
-    let ops_array = pg_sys::palloc((num_cols as usize) * std::mem::size_of::<pg_sys::Oid>())
-        as *mut pg_sys::Oid;
-    *ops_array.offset(0) = 664.into(); // btcharcmp for CHAR columns (typical for l_returnflag)
-    (*sort_node).sortOperators = ops_array;
+    // sortOperators array - comparison operators for each sort column - safe allocation
+    let ops_array = unsafe {
+        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
+    };
+    ops_array[0] = 664.into(); // btcharcmp for CHAR columns (typical for l_returnflag)
+    (*sort_node).sortOperators = ops_array.as_mut_ptr();
 
-    // collations array - collation for each sort column
-    let collations_array = pg_sys::palloc((num_cols as usize) * std::mem::size_of::<pg_sys::Oid>())
-        as *mut pg_sys::Oid;
-    *collations_array.offset(0) = pg_sys::DEFAULT_COLLATION_OID; // Use default collation
-    (*sort_node).collations = collations_array;
+    // collations array - collation for each sort column - safe allocation
+    let collations_array = unsafe {
+        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
+    };
+    collations_array[0] = pg_sys::DEFAULT_COLLATION_OID; // Use default collation
+    (*sort_node).collations = collations_array.as_mut_ptr();
 
-    // nullsFirst array - null ordering for each sort column
-    let nulls_array =
-        pg_sys::palloc((num_cols as usize) * std::mem::size_of::<bool>()) as *mut bool;
-    *nulls_array.offset(0) = false; // Nulls last (PostgreSQL default)
-    (*sort_node).nullsFirst = nulls_array;
+    // nullsFirst array - null ordering for each sort column - safe allocation
+    let nulls_array = unsafe {
+        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<bool>(num_cols as usize)
+    };
+    nulls_array[0] = false; // Nulls last (PostgreSQL default)
+    (*sort_node).nullsFirst = nulls_array.as_mut_ptr();
 
     eprintln!("DEBUG: All Sort arrays created with consistent sizing");
     pgrx::info!("DEBUG: All Sort arrays created with consistent sizing");
@@ -835,9 +836,10 @@ pub unsafe fn create_limit_node_with_expressions(
     offset_expr: Option<*mut pg_sys::Expr>,
     count_expr: Option<*mut pg_sys::Expr>,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // Create a Limit plan node
-    let limit_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Limit>()) as *mut pg_sys::Limit;
-    (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
+    // Create a Limit plan node using safe pgrx allocation
+    let mut limit_node = pgrx::PgBox::<pg_sys::Limit>::alloc0();
+    limit_node.plan.type_ = pg_sys::NodeTag::T_Limit;
+    let limit_node = limit_node.into_pg();
     (*limit_node).plan.lefttree = input_plan;
     (*limit_node).plan.righttree = std::ptr::null_mut();
     (*limit_node).plan.initPlan = std::ptr::null_mut();
@@ -882,32 +884,33 @@ pub unsafe fn create_filter_node(
     // In PostgreSQL, filters are typically implemented as Result nodes with a qual condition
     // For more complex filtering, we might need a custom scan node
 
-    let result_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-    (*result_node).plan.type_ = pg_sys::NodeTag::T_Result;
-    (*result_node).plan.lefttree = input_plan;
-    (*result_node).plan.righttree = std::ptr::null_mut();
-    (*result_node).plan.initPlan = std::ptr::null_mut();
-    (*result_node).plan.extParam = std::ptr::null_mut();
-    (*result_node).plan.allParam = std::ptr::null_mut();
-    (*result_node).plan.startup_cost = 0.0;
-    (*result_node).plan.total_cost = 1000.0;
-    (*result_node).plan.plan_rows = 100.0;
-    (*result_node).plan.plan_width = 32;
-    (*result_node).plan.parallel_aware = false;
-    (*result_node).plan.parallel_safe = true;
-    (*result_node).plan.async_capable = false;
-    (*result_node).plan.plan_node_id = 0;
+    let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
+    result_node.plan.type_ = pg_sys::NodeTag::T_Result;
+    result_node.plan.lefttree = input_plan;
+    result_node.plan.righttree = std::ptr::null_mut();
+    result_node.plan.initPlan = std::ptr::null_mut();
+    result_node.plan.extParam = std::ptr::null_mut();
+    result_node.plan.allParam = std::ptr::null_mut();
+    result_node.plan.startup_cost = 0.0;
+    result_node.plan.total_cost = 1000.0;
+    result_node.plan.plan_rows = 100.0;
+    result_node.plan.plan_width = 32;
+    result_node.plan.parallel_aware = false;
+    result_node.plan.parallel_safe = true;
+    result_node.plan.async_capable = false;
+    result_node.plan.plan_node_id = 0;
 
     // Pass through the target list from input
-    (*result_node).plan.targetlist = (*input_plan).targetlist;
+    result_node.plan.targetlist = (*input_plan).targetlist;
 
     // Set the filter condition as a qualification
     let mut qual_list: *mut pg_sys::List = std::ptr::null_mut();
     qual_list = pg_sys::lappend(qual_list, condition_expr as *mut std::ffi::c_void);
-    (*result_node).plan.qual = qual_list;
+    result_node.plan.qual = qual_list;
 
+    let result_ptr = result_node.into_pg();
     // Return pointer to the plan field
-    Ok(&mut (*result_node).plan as *mut pg_sys::Plan)
+    Ok(&mut (*result_ptr).plan as *mut pg_sys::Plan)
 }
 
 /// Create a PostgreSQL NestLoop plan node for Cross (Cartesian product) join
@@ -915,9 +918,9 @@ pub unsafe fn create_cross_join_node(
     left_plan: *mut pg_sys::Plan,
     right_plan: *mut pg_sys::Plan,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // Create a NestLoop plan node for Cartesian product (cross join)
-    let nestloop_node =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::NestLoop>()) as *mut pg_sys::NestLoop;
+    // Create a NestLoop plan node for Cartesian product (cross join) using safe allocation
+    let mut nestloop_node = pgrx::PgBox::<pg_sys::NestLoop>::alloc0();
+    let nestloop_node = nestloop_node.into_pg();
     (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
     (*nestloop_node).join.plan.lefttree = left_plan;
     (*nestloop_node).join.plan.righttree = right_plan;
@@ -956,9 +959,9 @@ pub unsafe fn create_join_node(
     join_type: u32,
     join_qual: *mut pg_sys::List,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // Create a NestLoop plan node for the join
-    let nestloop_node =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::NestLoop>()) as *mut pg_sys::NestLoop;
+    // Create a NestLoop plan node for the join using safe allocation
+    let mut nestloop_node = pgrx::PgBox::<pg_sys::NestLoop>::alloc0();
+    let nestloop_node = nestloop_node.into_pg();
     (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
     (*nestloop_node).join.plan.lefttree = left_plan;
     (*nestloop_node).join.plan.righttree = right_plan;
@@ -1006,8 +1009,8 @@ unsafe fn create_combined_target_list(
             let target_entry = pg_sys::list_nth(left_list, i as i32) as *mut pg_sys::TargetEntry;
 
             // Create a copy of the target entry with updated resno and varno
-            let new_target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
+            let mut new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
+            let new_target_entry = new_target_entry.into_pg();
             *new_target_entry = *target_entry; // Copy the structure
             (*new_target_entry).resno = resno;
 
@@ -1035,8 +1038,8 @@ unsafe fn create_combined_target_list(
             let target_entry = pg_sys::list_nth(right_list, i as i32) as *mut pg_sys::TargetEntry;
 
             // Create a copy of the target entry with updated resno and varno
-            let new_target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
+            let mut new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
+            let new_target_entry = new_target_entry.into_pg();
             *new_target_entry = *target_entry; // Copy the structure
             (*new_target_entry).resno = resno;
 

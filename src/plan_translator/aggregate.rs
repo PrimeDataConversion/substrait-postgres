@@ -34,7 +34,8 @@ struct AggNodeBuilder {
 
 impl AggNodeBuilder {
     pub unsafe fn new(input_plan: *mut pg_sys::Plan) -> Self {
-        let node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Agg>()) as *mut pg_sys::Agg;
+        let mut node = pgrx::PgBox::<pg_sys::Agg>::alloc0();
+        let node = node.into_pg();
 
         // Set node tag FIRST (critical for ExecInitNode dispatch)
         (*node).plan.type_ = pg_sys::NodeTag::T_Agg;
@@ -261,7 +262,8 @@ fn resolve_agg_oid(
 }
 
 unsafe fn palloc_array<T>(len: i32) -> *mut T {
-    pg_sys::palloc(len as usize * std::mem::size_of::<T>()) as *mut T
+    let slice = pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<T>(len as usize);
+    slice.as_mut_ptr()
 }
 
 /// Get column type information from input plan's target list

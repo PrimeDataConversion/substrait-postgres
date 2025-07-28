@@ -1,5 +1,7 @@
-use pgrx::{pg_extern, pg_guard, pg_sys, Spi};
+use pgrx::iter::TableIterator;
+use pgrx::{name, pg_extern, pg_guard, pg_sys, PgBox, Spi};
 use prost::Message;
+use std::sync::Mutex;
 use substrait::proto::Plan;
 
 mod executor;
@@ -9,11 +11,44 @@ use executor::execute_postgres_plan;
 
 pgrx::pg_module_magic!();
 
+// Static variable to store the previous planner hook
+static PREV_PLANNER_HOOK: Mutex<pg_sys::planner_hook_type> = Mutex::new(None);
+
+/// Custom planner function that intercepts calls to from_substrait functions
+#[no_mangle]
+pub unsafe extern "C-unwind" fn substrait_planner_hook(
+    parse: *mut pg_sys::Query,
+    query_string: *const std::os::raw::c_char,
+    cursor_options: std::os::raw::c_int,
+    bound_params: pg_sys::ParamListInfo,
+) -> *mut pg_sys::PlannedStmt {
+    pgrx::info!("DEBUG: substrait_planner_hook called");
+
+    // For now, just call the previous planner
+    // TODO: Add logic to detect from_substrait function calls and generate custom plans
+    let prev_planner = PREV_PLANNER_HOOK.lock().unwrap();
+    if let Some(prev_hook) = *prev_planner {
+        pgrx::info!("DEBUG: Calling previous planner hook");
+        prev_hook(parse, query_string, cursor_options, bound_params)
+    } else {
+        pgrx::info!("DEBUG: Calling standard planner");
+        pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
+    }
+}
+
 /// Extension initialization function
 #[no_mangle]
 pub extern "C" fn _PG_init() {
-    // Extension initialization - no special setup needed for now
-    pgrx::info!("Substrait PostgreSQL extension loaded");
+    unsafe {
+        // Store the previous planner hook
+        let mut prev_planner = PREV_PLANNER_HOOK.lock().unwrap();
+        *prev_planner = pg_sys::planner_hook;
+
+        // Install our custom planner hook
+        pg_sys::planner_hook = Some(substrait_planner_hook);
+
+        pgrx::info!("Substrait PostgreSQL extension loaded with planner hook");
+    }
 }
 
 /// Debug function to check OID values and test simple expression creation
@@ -253,6 +288,31 @@ pub extern "C" fn pg_finfo_from_substrait_wrapper() -> &'static pg_sys::Pg_finfo
 )]
 fn from_substrait_placeholder() {}
 
+/// Simple safe test that returns a single integer to verify safe approach works
+#[pg_extern]
+fn substrait_simple_test() -> i32 {
+    pgrx::info!("substrait_simple_test: Testing safe approach");
+    42
+}
+
+/// Safe JSON parser that validates the plan but returns success/failure
+#[pg_extern]
+fn substrait_parse_test(
+    json_plan: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pgrx::info!("substrait_parse_test: Testing JSON parsing safety");
+
+    // Parse the JSON plan
+    let plan: substrait::proto::Plan =
+        serde_json::from_str(json_plan).map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+    // If we get here, parsing succeeded - return plan summary
+    Ok(format!(
+        "Parsed plan with {} relations",
+        plan.relations.len()
+    ))
+}
+
 /// JSON version of Substrait execution function
 /// Usage: SELECT * FROM from_substrait_json(json_plan) AS t(col1 type1, col2 type2, ...)
 /// The AS clause column definitions must match the plan's output schema
@@ -377,12 +437,15 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                 "DEBUG: Executing plan with {} columns using standard SRF approach",
                 column_names.len()
             );
-            crate::executor::execute_postgres_plan_as_srf(
+            pgrx::info!("DEBUG: About to call execute_postgres_plan_as_srf");
+            let result = crate::executor::execute_postgres_plan_as_srf(
                 fcinfo,
                 postgres_plan,
                 column_names,
                 range_table as *mut pg_sys::List,
-            )
+            );
+            pgrx::info!("DEBUG: execute_postgres_plan_as_srf completed");
+            result
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -426,8 +489,10 @@ unsafe fn handle_literal_result_properly(
     (*result_info).isDone = pg_sys::ExprDoneCond::ExprSingleResult;
 
     // Extract the actual computed value from the execution result
-    let values = pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>()) as *mut pg_sys::Datum;
-    let nulls = pg_sys::palloc(std::mem::size_of::<bool>()) as *mut bool;
+    // Use pgrx safe memory allocation for Datum and null arrays
+    let values =
+        unsafe { pgrx::PgMemoryContexts::CurrentMemoryContext.palloc0_struct::<pg_sys::Datum>() };
+    let nulls = unsafe { pgrx::PgMemoryContexts::CurrentMemoryContext.palloc0_struct::<bool>() };
 
     if execution_result.rows.is_empty() || execution_result.rows[0].is_empty() {
         // No results - return NULL
@@ -542,12 +607,15 @@ unsafe fn execute_substrait_as_srf_with_function_map(
             pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
             pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
 
-            crate::executor::execute_postgres_plan_as_srf(
+            pgrx::info!("DEBUG: About to call execute_postgres_plan_as_srf");
+            let result = crate::executor::execute_postgres_plan_as_srf(
                 fcinfo,
                 postgres_plan,
                 column_names,
                 range_table as *mut pg_sys::List,
-            )
+            );
+            pgrx::info!("DEBUG: execute_postgres_plan_as_srf completed");
+            result
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -1610,17 +1678,17 @@ mod tests {
             let planned_stmt =
                 pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
 
-            // Create QueryDesc for execution
-            let query_desc =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
-            (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
-            (*query_desc).plannedstmt = planned_stmt;
-            (*query_desc).sourceText = query_string.as_ptr();
-            (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
-            (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
-            (*query_desc).dest = std::ptr::null_mut();
-            (*query_desc).params = std::ptr::null_mut();
-            (*query_desc).queryEnv = std::ptr::null_mut();
+            // Create QueryDesc for execution using safe pgrx allocation
+            let mut query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+            query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+            query_desc.plannedstmt = planned_stmt;
+            query_desc.sourceText = query_string.as_ptr();
+            query_desc.snapshot = pg_sys::GetActiveSnapshot();
+            query_desc.crosscheck_snapshot = std::ptr::null_mut();
+            query_desc.dest = std::ptr::null_mut();
+            query_desc.params = std::ptr::null_mut();
+            query_desc.queryEnv = std::ptr::null_mut();
+            let query_desc = query_desc.into_pg();
             (*query_desc).instrument_options = 0;
 
             pgrx::info!("DIRECT_PG_TEST: About to call ExecutorStart");
@@ -1694,17 +1762,17 @@ mod tests {
             let planned_stmt =
                 pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
 
-            let query_desc =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
-            (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
-            (*query_desc).plannedstmt = planned_stmt;
-            (*query_desc).sourceText = query_string.as_ptr();
-            (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
-            (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
-            (*query_desc).dest = std::ptr::null_mut();
-            (*query_desc).params = std::ptr::null_mut();
-            (*query_desc).queryEnv = std::ptr::null_mut();
-            (*query_desc).instrument_options = 0;
+            let mut query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+            query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+            query_desc.plannedstmt = planned_stmt;
+            query_desc.sourceText = query_string.as_ptr();
+            query_desc.snapshot = pg_sys::GetActiveSnapshot();
+            query_desc.crosscheck_snapshot = std::ptr::null_mut();
+            query_desc.dest = std::ptr::null_mut();
+            query_desc.params = std::ptr::null_mut();
+            query_desc.queryEnv = std::ptr::null_mut();
+            query_desc.instrument_options = 0;
+            let query_desc = query_desc.into_pg();
 
             pg_sys::ExecutorStart(query_desc, 0);
             let plan_state = (*query_desc).planstate;
@@ -1749,13 +1817,13 @@ mod tests {
 
             pgrx::info!("MANUAL_PLAN_TEST: Created Const node for value 99");
 
-            // Create a TargetEntry for the const
-            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
-            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-            (*target_entry).expr = const_node as *mut pg_sys::Expr;
-            (*target_entry).resno = 1;
-            (*target_entry).resname = std::ptr::null_mut(); // Will be set later
+            // Create a TargetEntry for the const using safe pgrx allocation
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = const_node as *mut pg_sys::Expr;
+            target_entry.resno = 1;
+            target_entry.resname = std::ptr::null_mut(); // Will be set later
+            let target_entry = target_entry.into_pg();
             (*target_entry).ressortgroupref = 0;
             (*target_entry).resorigtbl = pg_sys::InvalidOid;
             (*target_entry).resorigcol = 0;
@@ -1767,15 +1835,15 @@ mod tests {
             let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
             target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
 
-            // Create Result plan node
-            let result_plan =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-            (*result_plan).plan.type_ = pg_sys::NodeTag::T_Result;
-            (*result_plan).plan.targetlist = target_list;
-            (*result_plan).plan.qual = std::ptr::null_mut();
-            (*result_plan).plan.lefttree = std::ptr::null_mut();
-            (*result_plan).plan.righttree = std::ptr::null_mut();
-            (*result_plan).plan.plan_node_id = 1;
+            // Create Result plan node using safe pgrx allocation
+            let mut result_plan = pgrx::PgBox::<pg_sys::Result>::alloc0();
+            result_plan.plan.type_ = pg_sys::NodeTag::T_Result;
+            result_plan.plan.targetlist = target_list;
+            result_plan.plan.qual = std::ptr::null_mut();
+            result_plan.plan.lefttree = std::ptr::null_mut();
+            result_plan.plan.righttree = std::ptr::null_mut();
+            result_plan.plan.plan_node_id = 1;
+            let result_plan = result_plan.into_pg();
             (*result_plan).plan.plan_width = 4; // int4 width
             (*result_plan).resconstantqual = std::ptr::null_mut();
 
@@ -1788,26 +1856,26 @@ mod tests {
                 pg_sys::pfree(plan_str as *mut std::ffi::c_void);
             }
 
-            // Create PlannedStmt wrapper for execution
-            let planned_stmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>())
-                as *mut pg_sys::PlannedStmt;
-            (*planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
-            (*planned_stmt).planTree = result_plan as *mut pg_sys::Plan;
-            (*planned_stmt).rtable = std::ptr::null_mut(); // No tables needed for Result node
-            (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+            // Create PlannedStmt wrapper for execution using safe pgrx allocation
+            let mut planned_stmt = pgrx::PgBox::<pg_sys::PlannedStmt>::alloc0();
+            planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
+            planned_stmt.planTree = result_plan as *mut pg_sys::Plan;
+            planned_stmt.rtable = std::ptr::null_mut(); // No tables needed for Result node
+            planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+            let planned_stmt = planned_stmt.into_pg();
 
-            // Test execution using our direct execution approach
-            let query_desc =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
-            (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
-            (*query_desc).plannedstmt = planned_stmt;
-            (*query_desc).sourceText = std::ptr::null_mut();
-            (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
-            (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
-            (*query_desc).dest = std::ptr::null_mut();
-            (*query_desc).params = std::ptr::null_mut();
-            (*query_desc).queryEnv = std::ptr::null_mut();
-            (*query_desc).instrument_options = 0;
+            // Test execution using our direct execution approach with safe pgrx allocation
+            let mut query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+            query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+            query_desc.plannedstmt = planned_stmt;
+            query_desc.sourceText = std::ptr::null_mut();
+            query_desc.snapshot = pg_sys::GetActiveSnapshot();
+            query_desc.crosscheck_snapshot = std::ptr::null_mut();
+            query_desc.dest = std::ptr::null_mut();
+            query_desc.params = std::ptr::null_mut();
+            query_desc.queryEnv = std::ptr::null_mut();
+            query_desc.instrument_options = 0;
+            let query_desc = query_desc.into_pg();
 
             pgrx::info!("MANUAL_PLAN_TEST: About to execute manual plan");
 
@@ -1906,16 +1974,16 @@ mod tests {
             let parsed_planned_stmt =
                 pg_sys::planner(query, std::ptr::null_mut(), 0, std::ptr::null_mut());
 
-            // Execute parsed plan
-            let parsed_query_desc =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
-            (*parsed_query_desc).operation = pg_sys::CmdType::CMD_SELECT;
-            (*parsed_query_desc).plannedstmt = parsed_planned_stmt;
-            (*parsed_query_desc).sourceText = query_string.as_ptr();
-            (*parsed_query_desc).snapshot = pg_sys::GetActiveSnapshot();
-            (*parsed_query_desc).crosscheck_snapshot = std::ptr::null_mut();
-            (*parsed_query_desc).dest = std::ptr::null_mut();
-            (*parsed_query_desc).params = std::ptr::null_mut();
+            // Execute parsed plan using safe pgrx allocation
+            let mut parsed_query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+            parsed_query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+            parsed_query_desc.plannedstmt = parsed_planned_stmt;
+            parsed_query_desc.sourceText = query_string.as_ptr();
+            parsed_query_desc.snapshot = pg_sys::GetActiveSnapshot();
+            parsed_query_desc.crosscheck_snapshot = std::ptr::null_mut();
+            parsed_query_desc.dest = std::ptr::null_mut();
+            parsed_query_desc.params = std::ptr::null_mut();
+            let parsed_query_desc = parsed_query_desc.into_pg();
             (*parsed_query_desc).queryEnv = std::ptr::null_mut();
             (*parsed_query_desc).instrument_options = 0;
 
@@ -1933,14 +2001,14 @@ mod tests {
             let manual_const = crate::plan_translator::expressions::create_int4_const(123)
                 .expect("Should create const");
 
-            let manual_target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
-            (*manual_target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-            (*manual_target_entry).expr = manual_const as *mut pg_sys::Expr;
-            (*manual_target_entry).resno = 1;
-            (*manual_target_entry).resname = std::ptr::null_mut();
-            (*manual_target_entry).ressortgroupref = 0;
-            (*manual_target_entry).resorigtbl = pg_sys::InvalidOid;
+            let mut manual_target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            manual_target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            manual_target_entry.expr = manual_const as *mut pg_sys::Expr;
+            manual_target_entry.resno = 1;
+            manual_target_entry.resname = std::ptr::null_mut();
+            manual_target_entry.ressortgroupref = 0;
+            manual_target_entry.resorigtbl = pg_sys::InvalidOid;
+            let manual_target_entry = manual_target_entry.into_pg();
             (*manual_target_entry).resorigcol = 0;
             (*manual_target_entry).resjunk = false;
 
@@ -1950,36 +2018,36 @@ mod tests {
                 manual_target_entry as *mut std::ffi::c_void,
             );
 
-            let manual_result_plan =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::Result>()) as *mut pg_sys::Result;
-            (*manual_result_plan).plan.type_ = pg_sys::NodeTag::T_Result;
-            (*manual_result_plan).plan.targetlist = manual_target_list;
-            (*manual_result_plan).plan.qual = std::ptr::null_mut();
-            (*manual_result_plan).plan.lefttree = std::ptr::null_mut();
-            (*manual_result_plan).plan.righttree = std::ptr::null_mut();
+            let mut manual_result_plan = pgrx::PgBox::<pg_sys::Result>::alloc0();
+            manual_result_plan.plan.type_ = pg_sys::NodeTag::T_Result;
+            manual_result_plan.plan.targetlist = manual_target_list;
+            manual_result_plan.plan.qual = std::ptr::null_mut();
+            manual_result_plan.plan.lefttree = std::ptr::null_mut();
+            manual_result_plan.plan.righttree = std::ptr::null_mut();
+            let manual_result_plan = manual_result_plan.into_pg();
             (*manual_result_plan).plan.plan_node_id = 1;
             (*manual_result_plan).plan.plan_width = 4;
             (*manual_result_plan).resconstantqual = std::ptr::null_mut();
 
-            let manual_planned_stmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>())
-                as *mut pg_sys::PlannedStmt;
-            (*manual_planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
-            (*manual_planned_stmt).planTree = manual_result_plan as *mut pg_sys::Plan;
-            (*manual_planned_stmt).rtable = std::ptr::null_mut();
-            (*manual_planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
+            let mut manual_planned_stmt = pgrx::PgBox::<pg_sys::PlannedStmt>::alloc0();
+            manual_planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
+            manual_planned_stmt.planTree = manual_result_plan as *mut pg_sys::Plan;
+            manual_planned_stmt.rtable = std::ptr::null_mut();
+            manual_planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+            let manual_planned_stmt = manual_planned_stmt.into_pg();
 
-            // Execute manual plan
-            let manual_query_desc =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
-            (*manual_query_desc).operation = pg_sys::CmdType::CMD_SELECT;
-            (*manual_query_desc).plannedstmt = manual_planned_stmt;
-            (*manual_query_desc).sourceText = std::ptr::null_mut();
-            (*manual_query_desc).snapshot = pg_sys::GetActiveSnapshot();
-            (*manual_query_desc).crosscheck_snapshot = std::ptr::null_mut();
-            (*manual_query_desc).dest = std::ptr::null_mut();
-            (*manual_query_desc).params = std::ptr::null_mut();
-            (*manual_query_desc).queryEnv = std::ptr::null_mut();
-            (*manual_query_desc).instrument_options = 0;
+            // Execute manual plan using safe pgrx allocation
+            let mut manual_query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+            manual_query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+            manual_query_desc.plannedstmt = manual_planned_stmt;
+            manual_query_desc.sourceText = std::ptr::null_mut();
+            manual_query_desc.snapshot = pg_sys::GetActiveSnapshot();
+            manual_query_desc.crosscheck_snapshot = std::ptr::null_mut();
+            manual_query_desc.dest = std::ptr::null_mut();
+            manual_query_desc.params = std::ptr::null_mut();
+            manual_query_desc.queryEnv = std::ptr::null_mut();
+            manual_query_desc.instrument_options = 0;
+            let manual_query_desc = manual_query_desc.into_pg();
 
             pg_sys::ExecutorStart(manual_query_desc, 0);
             let manual_slot = pg_sys::ExecProcNode((*manual_query_desc).planstate);
@@ -2291,10 +2359,10 @@ mod tests {
                 );
             }
 
-            // Manually construct a SeqScan plan node
-            let seqscan =
-                pg_sys::palloc0(std::mem::size_of::<pg_sys::SeqScan>()) as *mut pg_sys::SeqScan;
-            (*seqscan).scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+            // Manually construct a SeqScan plan node using safe pgrx allocation
+            let mut seqscan = pgrx::PgBox::<pg_sys::SeqScan>::alloc0();
+            seqscan.scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+            let seqscan = seqscan.into_pg();
 
             // Use PostgreSQL's own estimation functions
             // First, open the relation to get statistics
@@ -2382,8 +2450,8 @@ mod tests {
             scan.plan.targetlist = target_list;
 
             // Create range table entry for the table
-            let rte = pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeTblEntry>())
-                as *mut pg_sys::RangeTblEntry;
+            let mut rte = PgBox::<pg_sys::RangeTblEntry>::alloc0();
+            let rte = rte.into_pg();
             (*rte).rtekind = pg_sys::RTEKind::RTE_RELATION;
             (*rte).relid = table_oid;
             (*rte).relkind = pg_sys::RELKIND_RELATION as i8;
@@ -2395,8 +2463,8 @@ mod tests {
             let range_table = pg_sys::lcons(rte as *mut std::ffi::c_void, std::ptr::null_mut());
 
             // Create PlannedStmt
-            let planned_stmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>())
-                as *mut pg_sys::PlannedStmt;
+            let mut planned_stmt = PgBox::<pg_sys::PlannedStmt>::alloc0();
+            let planned_stmt = planned_stmt.into_pg();
             (*planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
             (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
             (*planned_stmt).planTree = seqscan as *mut pg_sys::Plan;
@@ -2842,9 +2910,17 @@ unsafe fn convert_execution_result_to_tuplestore(
         let row_nulls = &execution_result.nulls[row_idx];
 
         // Create arrays for this row's data
-        let values = pg_sys::palloc(std::mem::size_of::<pg_sys::Datum>() * row_data.len())
-            as *mut pg_sys::Datum;
-        let nulls = pg_sys::palloc(std::mem::size_of::<bool>() * row_data.len()) as *mut bool;
+        // Use pgrx safe memory allocation for row arrays
+        let values = unsafe {
+            pgrx::PgMemoryContexts::CurrentMemoryContext
+                .palloc0_slice::<pg_sys::Datum>(row_data.len())
+                .as_mut_ptr()
+        };
+        let nulls = unsafe {
+            pgrx::PgMemoryContexts::CurrentMemoryContext
+                .palloc0_slice::<bool>(row_data.len())
+                .as_mut_ptr()
+        };
 
         // Copy the data and null flags
         for (col_idx, &datum) in row_data.iter().enumerate() {

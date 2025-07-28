@@ -78,6 +78,20 @@ pub unsafe fn execute_plan_directly_raw(
         return Err("Failed to create tuple descriptor from plan".into());
     }
 
+    // Debug the tuple descriptor attributes to see what type OIDs were created
+    let natts = (*tupdesc).natts;
+    pgrx::info!("DEBUG: Tuple descriptor has {} attributes", natts);
+    for i in 0..natts as usize {
+        let attr = (*tupdesc).attrs.as_ptr().add(i);
+        pgrx::info!(
+            "DEBUG: Attribute {}: typid={}, typmod={}, attlen={}",
+            i,
+            (*attr).atttypid.to_u32(),
+            (*attr).atttypmod,
+            (*attr).attlen
+        );
+    }
+
     // Update column names in the tuple descriptor
     let natts = (*tupdesc).natts;
     for i in 0..natts as usize {
@@ -108,43 +122,43 @@ pub unsafe fn execute_plan_directly_raw(
     }
 
     // Create a minimal QueryDesc that PostgreSQL's executor expects
-    let query_desc =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::QueryDesc>()) as *mut pg_sys::QueryDesc;
-    pgrx::info!("DEBUG: QueryDesc allocated: {:p}", query_desc);
+    let query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+    let query_desc_ptr = query_desc.into_pg();
+    pgrx::info!("DEBUG: QueryDesc allocated: {:p}", query_desc_ptr);
 
     // Create a minimal PlannedStmt wrapper
-    let planned_stmt =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>()) as *mut pg_sys::PlannedStmt;
-    (*planned_stmt).type_ = pg_sys::NodeTag::T_PlannedStmt;
-    (*planned_stmt).planTree = plan_tree;
-    (*planned_stmt).rtable = range_table as *mut pg_sys::List;
-    (*planned_stmt).commandType = pg_sys::CmdType::CMD_SELECT;
-    pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt);
+    let mut planned_stmt = pgrx::PgBox::<pg_sys::PlannedStmt>::alloc0();
+    planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
+    planned_stmt.planTree = plan_tree;
+    planned_stmt.rtable = range_table as *mut pg_sys::List;
+    planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+    let planned_stmt_ptr = planned_stmt.into_pg();
+    pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt_ptr);
 
-    // Set up the QueryDesc
-    (*query_desc).operation = pg_sys::CmdType::CMD_SELECT;
-    (*query_desc).plannedstmt = planned_stmt;
-    (*query_desc).sourceText = std::ptr::null_mut();
-    (*query_desc).snapshot = pg_sys::GetActiveSnapshot();
-    (*query_desc).crosscheck_snapshot = std::ptr::null_mut();
-    (*query_desc).dest = std::ptr::null_mut();
-    (*query_desc).params = std::ptr::null_mut();
-    (*query_desc).queryEnv = std::ptr::null_mut();
-    (*query_desc).instrument_options = 0;
+    // Set up the QueryDesc using the raw pointer
+    (*query_desc_ptr).operation = pg_sys::CmdType::CMD_SELECT;
+    (*query_desc_ptr).plannedstmt = planned_stmt_ptr;
+    (*query_desc_ptr).sourceText = std::ptr::null_mut();
+    (*query_desc_ptr).snapshot = pg_sys::GetActiveSnapshot();
+    (*query_desc_ptr).crosscheck_snapshot = std::ptr::null_mut();
+    (*query_desc_ptr).dest = std::ptr::null_mut();
+    (*query_desc_ptr).params = std::ptr::null_mut();
+    (*query_desc_ptr).queryEnv = std::ptr::null_mut();
+    (*query_desc_ptr).instrument_options = 0;
     pgrx::info!("DEBUG: QueryDesc setup complete");
 
     pgrx::info!("DEBUG: Calling ExecutorStart");
 
     // Call PostgreSQL's standard ExecutorStart function instead of manual setup
-    pg_sys::ExecutorStart(query_desc, 0);
+    pg_sys::ExecutorStart(query_desc_ptr, 0);
 
     pgrx::info!("DEBUG: ExecutorStart succeeded!");
 
     // Get the plan state - ExecutorStart already called ExecInitNode for us!
-    let plan_state = (*query_desc).planstate;
+    let plan_state = (*query_desc_ptr).planstate;
     if plan_state.is_null() {
-        pg_sys::ExecutorFinish(query_desc);
-        pg_sys::ExecutorEnd(query_desc);
+        pg_sys::ExecutorFinish(query_desc_ptr);
+        pg_sys::ExecutorEnd(query_desc_ptr);
         return Err("ExecutorStart failed to create plan state".into());
     }
 
@@ -170,8 +184,8 @@ pub unsafe fn execute_plan_directly_raw(
         if tuple_count > 1000000 {
             pgrx::warning!("Query returned too many rows (> 1M), execution aborted");
             // Clean up using PostgreSQL's proper sequence
-            pg_sys::ExecutorFinish(query_desc);
-            pg_sys::ExecutorEnd(query_desc);
+            pg_sys::ExecutorFinish(query_desc_ptr);
+            pg_sys::ExecutorEnd(query_desc_ptr);
             return Err("Query returned too many rows (> 1M), execution aborted".into());
         }
     }
@@ -182,8 +196,8 @@ pub unsafe fn execute_plan_directly_raw(
 
     // Clean up using PostgreSQL's proper ExecutorFinish and ExecutorEnd sequence
     pgrx::info!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
-    pg_sys::ExecutorFinish(query_desc);
-    pg_sys::ExecutorEnd(query_desc);
+    pg_sys::ExecutorFinish(query_desc_ptr);
+    pg_sys::ExecutorEnd(query_desc_ptr);
     pgrx::info!("DEBUG: ExecutorFinish and ExecutorEnd completed");
 
     Ok((tupdesc, tuplestore))
@@ -213,6 +227,20 @@ pub unsafe fn execute_plan_directly(
     eprintln!("DEBUG: ExecTypeFromTL returned tupdesc: {tupdesc:p}");
     if tupdesc.is_null() {
         return Err("Failed to create tuple descriptor from plan".into());
+    }
+
+    // Debug the tuple descriptor attributes to see what type OIDs were created
+    let natts = (*tupdesc).natts;
+    eprintln!("DEBUG: Tuple descriptor has {} attributes", natts);
+    for i in 0..natts as usize {
+        let attr = (*tupdesc).attrs.as_ptr().add(i);
+        eprintln!(
+            "DEBUG: Attribute {}: typid={}, typmod={}, attlen={}",
+            i,
+            (*attr).atttypid.to_u32(),
+            (*attr).atttypmod,
+            (*attr).attlen
+        );
     }
 
     // Update column names in the tuple descriptor
@@ -531,11 +559,14 @@ pub unsafe fn execute_postgres_plan_as_srf(
         };
 
         // Execute the plan and get tuplestore
+        eprintln!("DEBUG: About to call execute_plan_directly");
         let (_, tuplestore) = execute_plan_directly(&*plan_tree, column_names, range_table)
             .unwrap_or_else(|e| {
                 pg_sys::MemoryContextSwitchTo(old_ctx);
+                eprintln!("ERROR: Plan execution failed: {}", e);
                 pgrx::error!("Plan execution failed: {}", e);
             });
+        eprintln!("DEBUG: execute_plan_directly succeeded");
 
         // Use the expected tuple descriptor from the AS clause
         let blessed_tupdesc = pg_sys::BlessTupleDesc(expected_tupdesc);
@@ -605,43 +636,45 @@ unsafe fn create_range_table_entry_from_oid(
 
     pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
 
-    // Create RangeTblEntry
-    let rte =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::RangeTblEntry>()) as *mut pg_sys::RangeTblEntry;
+    // Create RangeTblEntry using safe pgrx allocation
+    let mut rte = pgrx::PgBox::<pg_sys::RangeTblEntry>::alloc0();
 
-    (*rte).type_ = pg_sys::NodeTag::T_RangeTblEntry;
-    (*rte).rtekind = pg_sys::RTEKind::RTE_RELATION;
-    (*rte).relid = table_oid;
-    (*rte).relkind = pg_sys::RELKIND_RELATION as i8;
-    (*rte).rellockmode = pg_sys::AccessShareLock as i32;
-    (*rte).lateral = false;
-    (*rte).inh = true; // Include inheritance
-    (*rte).inFromCl = true; // This table is in the FROM clause
+    rte.type_ = pg_sys::NodeTag::T_RangeTblEntry;
+    rte.rtekind = pg_sys::RTEKind::RTE_RELATION;
+    rte.relid = table_oid;
+    rte.relkind = pg_sys::RELKIND_RELATION as i8;
+    rte.rellockmode = pg_sys::AccessShareLock as i32;
+    rte.lateral = false;
+    rte.inh = true; // Include inheritance
+    rte.inFromCl = true; // This table is in the FROM clause
 
-    // Create an alias for the table
-    let alias = pg_sys::palloc0(std::mem::size_of::<pg_sys::Alias>()) as *mut pg_sys::Alias;
-    (*alias).type_ = pg_sys::NodeTag::T_Alias;
-    (*alias).aliasname = pg_sys::palloc(rel_name.len() + 1) as *mut std::os::raw::c_char;
-    std::ptr::copy_nonoverlapping(
-        rel_name.as_ptr(),
-        (*alias).aliasname as *mut u8,
-        rel_name.len(),
-    );
-    *((*alias).aliasname.add(rel_name.len())) = 0; // null terminate
-    (*alias).colnames = std::ptr::null_mut(); // Will be filled in by planner if needed
-    (*rte).eref = alias;
-    (*rte).alias = std::ptr::null_mut(); // No explicit alias
+    // Create an alias for the table using safe pgrx allocation
+    let mut alias = pgrx::PgBox::<pg_sys::Alias>::alloc0();
+    alias.type_ = pg_sys::NodeTag::T_Alias;
+    let aliasname = unsafe {
+        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<u8>(rel_name.len() + 1)
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(rel_name.as_ptr(), aliasname.as_mut_ptr(), rel_name.len());
+        *aliasname.as_mut_ptr().add(rel_name.len()) = 0; // null terminate
+    }
+    alias.aliasname = aliasname.as_mut_ptr() as *mut std::os::raw::c_char;
+    alias.colnames = std::ptr::null_mut(); // Will be filled in by planner if needed
+    let alias_ptr = alias.into_pg();
+    rte.eref = alias_ptr;
+    rte.alias = std::ptr::null_mut(); // No explicit alias
 
     // Initialize other fields
-    (*rte).selectedCols = std::ptr::null_mut();
-    (*rte).insertedCols = std::ptr::null_mut();
-    (*rte).updatedCols = std::ptr::null_mut();
-    (*rte).extraUpdatedCols = std::ptr::null_mut();
-    (*rte).securityQuals = std::ptr::null_mut();
+    rte.selectedCols = std::ptr::null_mut();
+    rte.insertedCols = std::ptr::null_mut();
+    rte.updatedCols = std::ptr::null_mut();
+    rte.extraUpdatedCols = std::ptr::null_mut();
+    rte.securityQuals = std::ptr::null_mut();
 
     eprintln!("DEBUG: Range table entry created successfully for table: {rel_name}");
 
-    Ok(rte)
+    let final_rte_ptr = rte.into_pg();
+    Ok(final_rte_ptr)
 }
 
 /// Create a range table from plan tree by finding SeqScan nodes - raw pointer version

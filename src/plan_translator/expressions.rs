@@ -6,7 +6,7 @@ use substrait::proto::Expression;
 use super::constants::get_expression_type_name;
 use super::relations::convert_rel_to_plan_tree_with_context;
 
-use pgrx::{AnyNumeric, IntoDatum};
+use pgrx::{AnyNumeric, IntoDatum, PgBox};
 use std::str::FromStr;
 use substrait::proto::{r#type::Kind, Type};
 
@@ -124,40 +124,51 @@ pub unsafe fn create_date_const(
         return Err(format!("Invalid DATEOID: {type_oid}").into());
     }
 
-    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
-    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = type_oid;
-    (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*const_node).constlen = 4;
-    (*const_node).constvalue = pg_sys::Datum::from(value - PG_DATE_EPOCH_OFFSET);
-    (*const_node).constisnull = false;
-    (*const_node).constbyval = true;
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = type_oid;
+    const_node.consttypmod = -1;
+    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constlen = 4;
+    const_node.constvalue = pg_sys::Datum::from(value - PG_DATE_EPOCH_OFFSET);
+    const_node.constisnull = false;
+    const_node.constbyval = true;
 
-    Ok(const_node as *mut pg_sys::Expr)
+    Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
-/// Create a PostgreSQL int4 constant node
+/// Create a PostgreSQL int4 constant node with proper catalog decoration
+/// Following pg_cuckoo's approach of querying PostgreSQL's catalog for accurate type info
 pub unsafe fn create_int4_const(
     value: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    // Use the PostgreSQL built-in constant, but validate it first
+    // Use PostgreSQL's own type resolution following pg_cuckoo's plan decoration approach
     let type_oid = pg_sys::INT4OID;
-
-    // Debug: Always print what INT4OID actually is
 
     // Validate that the OID is reasonable (should not be 0 or InvalidOid)
     if type_oid == pg_sys::InvalidOid || type_oid == 0.into() {
         return Err(format!("Invalid INT4OID: {type_oid}").into());
     }
 
-    // Check if type_oid is suspiciously 124 (pg_type OID)
-    if type_oid.to_u32() == 124 {
-        eprintln!("ERROR: INT4OID is returning pg_type OID 124 instead of actual int4 type!");
-        return Err("INT4OID corrupted to pg_type OID (124)".into());
+    // pg_cuckoo lesson: Query PostgreSQL's catalog for accurate type information
+    // This ensures our plan nodes "perfectly mimic regular plans"
+    let type_tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::TYPEOID as i32,
+        pg_sys::Datum::from(type_oid),
+    );
+
+    if type_tuple.is_null() {
+        return Err(format!("Type OID {type_oid} not found in pg_type catalog").into());
     }
 
-    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
+    let type_form = pg_sys::GETSTRUCT(type_tuple) as *mut pg_sys::FormData_pg_type;
+    let type_len = (*type_form).typlen as i32;
+    let type_by_val = (*type_form).typbyval;
+
+    // Release the cache tuple
+    pg_sys::ReleaseSysCache(type_tuple);
+
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
 
     // Debug: Check what T_Const actually evaluates to
     let t_const_value = pg_sys::NodeTag::T_Const as u32;
@@ -167,11 +178,18 @@ pub unsafe fn create_int4_const(
         return Err("T_Const NodeTag has wrong value 124".into());
     }
 
-    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = type_oid;
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = type_oid;
+    const_node.consttypmod = -1;
+    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    // Use catalog-derived type information instead of hardcoded values
+    const_node.constlen = type_len;
+    const_node.constvalue = pg_sys::Datum::from(value);
+    const_node.constisnull = false;
+    const_node.constbyval = type_by_val;
 
     // Debug: Check for NodeTag corruption right after setting it
-    if (*const_node).xpr.type_ as u32 == 124 {
+    if const_node.xpr.type_ as u32 == 124 {
         eprintln!(
             "ERROR: Int4Const node type corrupted to 124 after setting! consttype = {}",
             type_oid.to_u32()
@@ -179,14 +197,7 @@ pub unsafe fn create_int4_const(
         return Err("Int4Const node type corrupted to pg_type OID (124)".into());
     }
 
-    (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*const_node).constlen = 4;
-    (*const_node).constvalue = pg_sys::Datum::from(value);
-    (*const_node).constisnull = false;
-    (*const_node).constbyval = true;
-
-    Ok(const_node as *mut pg_sys::Expr)
+    Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL int8 constant node
@@ -201,17 +212,17 @@ pub unsafe fn create_int8_const(
         return Err(format!("Invalid INT8OID: {type_oid}").into());
     }
 
-    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
-    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = type_oid;
-    (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*const_node).constlen = 8;
-    (*const_node).constvalue = pg_sys::Datum::from(value);
-    (*const_node).constisnull = false;
-    (*const_node).constbyval = true;
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = type_oid;
+    const_node.consttypmod = -1;
+    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constlen = 8;
+    const_node.constvalue = pg_sys::Datum::from(value);
+    const_node.constisnull = false;
+    const_node.constbyval = true;
 
-    Ok(const_node as *mut pg_sys::Expr)
+    Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL boolean constant node
@@ -225,17 +236,17 @@ pub unsafe fn create_bool_const(
         return Err(format!("Invalid BOOLOID: {type_oid}").into());
     }
 
-    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
-    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = type_oid;
-    (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*const_node).constlen = 1; // Boolean is 1 byte
-    (*const_node).constvalue = pg_sys::Datum::from(value);
-    (*const_node).constisnull = false;
-    (*const_node).constbyval = true;
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = type_oid;
+    const_node.consttypmod = -1;
+    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constlen = 1; // Boolean is 1 byte
+    const_node.constvalue = pg_sys::Datum::from(value);
+    const_node.constisnull = false;
+    const_node.constbyval = true;
 
-    Ok(const_node as *mut pg_sys::Expr)
+    Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL text constant node
@@ -253,17 +264,17 @@ pub unsafe fn create_text_const(
     let text_datum =
         pg_sys::cstring_to_text_with_len(value.as_ptr() as *const i8, value.len() as i32);
 
-    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
-    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = type_oid;
-    (*const_node).consttypmod = -1;
-    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*const_node).constlen = -1;
-    (*const_node).constvalue = pg_sys::Datum::from(text_datum as *mut std::ffi::c_void);
-    (*const_node).constisnull = false;
-    (*const_node).constbyval = false;
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = type_oid;
+    const_node.consttypmod = -1;
+    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constlen = -1;
+    const_node.constvalue = pg_sys::Datum::from(text_datum as *mut std::ffi::c_void);
+    const_node.constisnull = false;
+    const_node.constbyval = false;
 
-    Ok(const_node as *mut pg_sys::Expr)
+    Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL numeric constant node
@@ -304,17 +315,17 @@ pub unsafe fn create_numeric_const(
 
     let numeric_value: AnyNumeric = AnyNumeric::from_str(&numeric_string)
         .map_err(|e| format!("Failed to parse numeric value from string: {e}"))?;
-    let const_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Const>()) as *mut pg_sys::Const;
-    (*const_node).xpr.type_ = pg_sys::NodeTag::T_Const;
-    (*const_node).consttype = type_oid;
-    (*const_node).consttypmod = -1; // Let PostgreSQL determine typmod from value
-    (*const_node).constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*const_node).constlen = -1; // Variable length
-    (*const_node).constvalue = numeric_value.into_datum().unwrap();
-    (*const_node).constisnull = false;
-    (*const_node).constbyval = false; // Numeric is not pass-by-value
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = type_oid;
+    const_node.consttypmod = -1; // Let PostgreSQL determine typmod from value
+    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constlen = -1; // Variable length
+    const_node.constvalue = numeric_value.into_datum().unwrap();
+    const_node.constisnull = false;
+    const_node.constbyval = false; // Numeric is not pass-by-value
 
-    Ok(const_node as *mut pg_sys::Expr)
+    Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Resolve actual column type information from table OID and attribute number
@@ -359,25 +370,25 @@ unsafe fn resolve_column_type_info(
 pub unsafe fn create_var_node(
     attr_number: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
-    (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
-    (*var_node).varno = 1; // Single table reference for now
-    (*var_node).varattno = attr_number as pg_sys::AttrNumber;
-    (*var_node).vartype = pg_sys::TEXTOID; // Use TEXT as default, will be resolved during planning
-    (*var_node).vartypmod = -1;
-    (*var_node).varcollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*var_node).varlevelsup = 0;
+    let mut var_node = pgrx::PgBox::<pg_sys::Var>::alloc0();
+    var_node.xpr.type_ = pg_sys::NodeTag::T_Var;
+    var_node.varno = 1; // Single table reference for now
+    var_node.varattno = attr_number as pg_sys::AttrNumber;
+    var_node.vartype = pg_sys::TEXTOID; // Use TEXT as default, will be resolved during planning
+    var_node.vartypmod = -1;
+    var_node.varcollid = pg_sys::DEFAULT_COLLATION_OID;
+    var_node.varlevelsup = 0;
 
     // Debug: Check for corruption right after creation
-    if (*var_node).xpr.type_ as u32 == 124 {
+    if var_node.xpr.type_ as u32 == 124 {
         eprintln!(
             "ERROR: Var node corruption detected at creation! type_ = 124, vartype = {}",
-            (*var_node).vartype.to_u32()
+            var_node.vartype.to_u32()
         );
         return Err("Var node type corrupted to pg_type OID (124)".into());
     }
 
-    Ok(var_node as *mut pg_sys::Expr)
+    Ok(var_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL Var node with proper type resolution from table schema
@@ -385,20 +396,20 @@ pub unsafe fn create_var_node_with_table_schema(
     attr_number: i32,
     table_oid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
-    (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
-    (*var_node).varno = 1;
-    (*var_node).varattno = attr_number as pg_sys::AttrNumber;
+    let mut var_node = pgrx::PgBox::<pg_sys::Var>::alloc0();
+    var_node.xpr.type_ = pg_sys::NodeTag::T_Var;
+    var_node.varno = 1;
+    var_node.varattno = attr_number as pg_sys::AttrNumber;
 
     // Resolve actual column type instead of hardcoding
     let (vartype, vartypmod, varcollid) =
         resolve_column_type_info(table_oid, attr_number as pg_sys::AttrNumber)?;
-    (*var_node).vartype = vartype;
-    (*var_node).vartypmod = vartypmod;
-    (*var_node).varcollid = varcollid;
-    (*var_node).varlevelsup = 0;
+    var_node.vartype = vartype;
+    var_node.vartypmod = vartypmod;
+    var_node.varcollid = varcollid;
+    var_node.varlevelsup = 0;
 
-    Ok(var_node as *mut pg_sys::Expr)
+    Ok(var_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL Var node with proper type information
@@ -408,16 +419,16 @@ pub unsafe fn create_var_node_with_type(
     vartypmod: i32,
     varcollid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let var_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Var>()) as *mut pg_sys::Var;
-    (*var_node).xpr.type_ = pg_sys::NodeTag::T_Var;
-    (*var_node).varno = 1; // Single table reference for now
-    (*var_node).varattno = attr_number as pg_sys::AttrNumber;
-    (*var_node).vartype = vartype; // Use actual column type
-    (*var_node).vartypmod = vartypmod;
-    (*var_node).varcollid = varcollid;
-    (*var_node).varlevelsup = 0;
+    let mut var_node = pgrx::PgBox::<pg_sys::Var>::alloc0();
+    var_node.xpr.type_ = pg_sys::NodeTag::T_Var;
+    var_node.varno = 1; // Single table reference for now
+    var_node.varattno = attr_number as pg_sys::AttrNumber;
+    var_node.vartype = vartype; // Use actual column type
+    var_node.vartypmod = vartypmod;
+    var_node.varcollid = varcollid;
+    var_node.varlevelsup = 0;
 
-    Ok(var_node as *mut pg_sys::Expr)
+    Ok(var_node.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Create a PostgreSQL type cast expression
@@ -467,7 +478,8 @@ pub unsafe fn create_binary_op_expr(
     operator_oid: pg_sys::Oid,
     result_type: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let op_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::OpExpr>()) as *mut pg_sys::OpExpr;
+    let mut op_expr = PgBox::<pg_sys::OpExpr>::alloc0();
+    let op_expr = op_expr.into_pg();
     (*op_expr).xpr.type_ = pg_sys::NodeTag::T_OpExpr;
     (*op_expr).opno = operator_oid;
     // Look up the function OID for this operator
@@ -516,8 +528,8 @@ pub unsafe fn create_function_call_expr(
     result_type: pg_sys::Oid,
     arguments: &[*mut pg_sys::Expr],
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let func_expr =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::FuncExpr>()) as *mut pg_sys::FuncExpr;
+    let mut func_expr = PgBox::<pg_sys::FuncExpr>::alloc0();
+    let func_expr = func_expr.into_pg();
     (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
     (*func_expr).funcid = function_oid;
     (*func_expr).funcresulttype = result_type;
@@ -685,8 +697,8 @@ unsafe fn create_scalar_subquery_expr(
     }
 
     if let Some(rel) = &scalar_subquery.input {
-        let sublink =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+        let mut sublink = PgBox::<pg_sys::SubLink>::alloc0();
+        let sublink = sublink.into_pg();
         (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
         (*sublink).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK;
         (*sublink).subLinkId = 0;
@@ -695,15 +707,15 @@ unsafe fn create_scalar_subquery_expr(
 
         let (plan_tree, range_table) =
             convert_rel_to_plan_tree_with_context(rel, function_map, None)?;
-        let query_node =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+        let mut query_node = PgBox::<pg_sys::Query>::alloc0();
+        let query_node = query_node.into_pg();
         (*query_node).type_ = pg_sys::NodeTag::T_Query;
         (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
         (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
         (*query_node).canSetTag = true;
         (*query_node).rtable = range_table;
-        (*query_node).jointree =
-            pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
+        let mut from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
+        (*query_node).jointree = from_expr.into_pg();
         (*(*query_node).jointree).fromlist = range_table;
         (*(*query_node).jointree).quals = std::ptr::null_mut();
         (*query_node).targetList = (*plan_tree).targetlist;
@@ -731,7 +743,8 @@ unsafe fn create_in_predicate_expr(
         return Err("IN predicate missing needles expression".into());
     }
 
-    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+    let mut sublink = PgBox::<pg_sys::SubLink>::alloc0();
+    let sublink = sublink.into_pg();
     (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
     (*sublink).subLinkType = pg_sys::SubLinkType::ANY_SUBLINK; // Use ANY_SUBLINK for IN predicates
     (*sublink).subLinkId = 0;
@@ -742,14 +755,15 @@ unsafe fn create_in_predicate_expr(
     let (plan_tree, range_table) =
         convert_rel_to_plan_tree_with_context(haystack_rel, function_map, None)?;
 
-    let query_node = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+    let mut query_node = PgBox::<pg_sys::Query>::alloc0();
+    let query_node = query_node.into_pg();
     (*query_node).type_ = pg_sys::NodeTag::T_Query;
     (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
     (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
     (*query_node).canSetTag = true;
     (*query_node).rtable = range_table; // Use the rtable from the translated plan_tree
-    (*query_node).jointree =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
+    let mut from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
+    (*query_node).jointree = from_expr.into_pg();
     (*(*query_node).jointree).fromlist = range_table; // Use the rtable from the translated plan_tree
     (*(*query_node).jointree).quals = std::ptr::null_mut();
     (*query_node).targetList = (*plan_tree).targetlist;
@@ -774,7 +788,8 @@ unsafe fn create_set_predicate_expr(
 ) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::subquery::set_predicate::PredicateOp;
 
-    let sublink = pg_sys::palloc0(std::mem::size_of::<pg_sys::SubLink>()) as *mut pg_sys::SubLink;
+    let mut sublink = PgBox::<pg_sys::SubLink>::alloc0();
+    let sublink = sublink.into_pg();
     (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
     (*sublink).subLinkId = 0;
     (*sublink).testexpr = std::ptr::null_mut();
@@ -798,14 +813,15 @@ unsafe fn create_set_predicate_expr(
         .ok_or("SetPredicate missing tuples relation")?;
 
     // Create a placeholder Query node for the subselect
-    let query = pg_sys::palloc0(std::mem::size_of::<pg_sys::Query>()) as *mut pg_sys::Query;
+    let mut query = PgBox::<pg_sys::Query>::alloc0();
+    let query = query.into_pg();
     (*query).type_ = pg_sys::NodeTag::T_Query;
     (*query).commandType = pg_sys::CmdType::CMD_SELECT;
     (*query).querySource = pg_sys::QuerySource::QSRC_PARSER;
     (*query).canSetTag = true;
     (*query).rtable = std::ptr::null_mut();
-    (*query).jointree =
-        pg_sys::palloc0(std::mem::size_of::<pg_sys::FromExpr>()) as *mut pg_sys::FromExpr;
+    let mut from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
+    (*query).jointree = from_expr.into_pg();
     (*(*query).jointree).fromlist = std::ptr::null_mut();
     (*(*query).jointree).quals = std::ptr::null_mut();
     (*query).targetList = std::ptr::null_mut();
@@ -870,13 +886,13 @@ unsafe fn convert_expression_to_target_entry_with_context(
                 };
 
                 // Create TargetEntry
-                let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                    as *mut pg_sys::TargetEntry;
-                (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-                (*target_entry).expr = const_expr;
-                (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
-                (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
-                (*target_entry).resjunk = false;
+                let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+                target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+                target_entry.expr = const_expr;
+                target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+                target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+                target_entry.resjunk = false;
+                let target_entry = target_entry.into_pg();
 
                 // Debug: Validate that TargetEntry and its expression have correct NodeTags
                 if (*target_entry).xpr.type_ as u32 == 124 {
@@ -905,13 +921,13 @@ unsafe fn convert_expression_to_target_entry_with_context(
                 create_scalar_function_expr_with_context(func, function_map, current_table_oid)?;
 
             // Create TargetEntry
-            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
-            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-            (*target_entry).expr = func_expr;
-            (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
-            (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
-            (*target_entry).resjunk = false;
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = func_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
 
             // Debug: Validate NodeTags after creation
             if (*target_entry).xpr.type_ as u32 == 124 {
@@ -938,13 +954,13 @@ unsafe fn convert_expression_to_target_entry_with_context(
             let selection_expr = convert_selection_to_postgres(selection, current_table_oid)?;
 
             // Create TargetEntry
-            let target_entry = pg_sys::palloc0(std::mem::size_of::<pg_sys::TargetEntry>())
-                as *mut pg_sys::TargetEntry;
-            (*target_entry).xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-            (*target_entry).expr = selection_expr;
-            (*target_entry).resno = (index + 1) as pg_sys::AttrNumber;
-            (*target_entry).resname = create_cstring(&format!("column_{}", index + 1));
-            (*target_entry).resjunk = false;
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = selection_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
 
             Ok(target_entry)
         }
@@ -1027,8 +1043,8 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
 
                 // Create a BoolExpr node for variadic AND
-                let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
-                    as *mut pg_sys::BoolExpr;
+                let mut bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::AND_EXPR;
 
@@ -1148,8 +1164,8 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
 
                 // Create a BoolExpr node for variadic OR
-                let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
-                    as *mut pg_sys::BoolExpr;
+                let mut bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::OR_EXPR;
 
@@ -1475,8 +1491,8 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let arg = pg_args[0];
 
                 // Create a BoolExpr node for NOT
-                let bool_expr = pg_sys::palloc0(std::mem::size_of::<pg_sys::BoolExpr>())
-                    as *mut pg_sys::BoolExpr;
+                let mut bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
 
