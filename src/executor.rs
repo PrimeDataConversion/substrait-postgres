@@ -214,10 +214,143 @@ pub unsafe fn execute_plan_directly(
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    // IMMEDIATE ENTRY DEBUG - BEFORE ACCESSING PARAMETERS
+    eprintln!("IMMEDIATE: execute_plan_directly ENTERED SUCCESSFULLY");
+    pgrx::info!("IMMEDIATE: execute_plan_directly ENTERED SUCCESSFULLY");
+
     eprintln!(
         "DEBUG: execute_plan_directly called with plan tree type: {:?}",
         plan_tree.type_
     );
+    pgrx::info!("CRITICAL: execute_plan_directly ENTRY - THIS SHOULD APPEAR IN LOGS");
+
+    eprintln!("DEBUG: About to access plan_tree.targetlist");
+    pgrx::info!("DEBUG: About to access plan_tree.targetlist");
+
+    // DEBUG: Inspect target list BEFORE calling ExecTypeFromTL
+    let targetlist = plan_tree.targetlist;
+
+    eprintln!("DEBUG: targetlist accessed successfully");
+    pgrx::info!("DEBUG: targetlist accessed successfully");
+
+    if targetlist.is_null() {
+        eprintln!("ERROR: targetlist is null!");
+        return Err("Target list is null".into());
+    }
+
+    eprintln!("DEBUG: targetlist pointer: {:p}", targetlist);
+    eprintln!("DEBUG: About to access targetlist.length");
+    pgrx::info!("DEBUG: About to access targetlist.length");
+
+    eprintln!("DEBUG: targetlist length: {}", (*targetlist).length);
+
+    eprintln!("DEBUG: targetlist length accessed successfully");
+    pgrx::info!("DEBUG: targetlist length accessed successfully");
+
+    eprintln!("DEBUG: About to access targetlist.elements array");
+    pgrx::info!("DEBUG: About to access targetlist.elements array");
+
+    let elements_ptr = (*targetlist).elements;
+    eprintln!("DEBUG: elements array pointer: {:p}", elements_ptr);
+    pgrx::info!("DEBUG: elements array pointer: {:p}", elements_ptr);
+
+    if elements_ptr.is_null() {
+        eprintln!("ERROR: elements array is null!");
+        return Err("Target list elements array is null".into());
+    }
+
+    eprintln!("DEBUG: elements array is valid, about to iterate");
+    pgrx::info!("DEBUG: elements array is valid, about to iterate");
+
+    // Use PostgreSQL's list_nth function instead of manual pointer access
+    for i in 0..(*targetlist).length {
+        eprintln!("DEBUG: Starting iteration {}", i);
+        pgrx::info!("DEBUG: Starting iteration {}", i);
+
+        // Use PostgreSQL's safe list access function
+        let target_entry = pg_sys::list_nth(targetlist, i as i32) as *mut pg_sys::TargetEntry;
+
+        eprintln!("DEBUG: Got TargetEntry from list_nth: {:p}", target_entry);
+        pgrx::info!("DEBUG: Got TargetEntry from list_nth: {:p}", target_entry);
+
+        if !target_entry.is_null() {
+            eprintln!("DEBUG: About to access TargetEntry fields");
+            pgrx::info!("DEBUG: About to access TargetEntry fields");
+
+            // Try to access the node type first (should be T_TargetEntry)
+            eprintln!("DEBUG: Checking TargetEntry node type");
+            pgrx::info!("DEBUG: Checking TargetEntry node type");
+
+            let node_type = (*target_entry).xpr.type_;
+            eprintln!("DEBUG: TargetEntry node type: {:?}", node_type);
+            pgrx::info!("DEBUG: TargetEntry node type: {:?}", node_type);
+
+            eprintln!("DEBUG: About to access resno and resname");
+            pgrx::info!("DEBUG: About to access resno and resname");
+
+            eprintln!(
+                "DEBUG: TargetEntry[{}]: resno={}, resname={:p}",
+                i,
+                (*target_entry).resno,
+                (*target_entry).resname
+            );
+            eprintln!(
+                "DEBUG: TargetEntry[{}] node type: {:?}",
+                i,
+                (*target_entry).xpr.type_
+            );
+
+            // Inspect the expression inside the TargetEntry
+            let expr = (*target_entry).expr;
+            if !expr.is_null() {
+                eprintln!(
+                    "DEBUG: TargetEntry[{}] expr node type: {:?}",
+                    i,
+                    (*expr).type_
+                );
+
+                // If it's a Const, check its type
+                if (*expr).type_ == pg_sys::NodeTag::T_Const {
+                    let const_node = expr as *mut pg_sys::Const;
+                    let oid = (*const_node).consttype.to_u32();
+                    eprintln!(
+                        "DEBUG: CONST NODE OID: {} ({})",
+                        oid,
+                        if oid == 65536 {
+                            "*** THIS IS THE PROBLEM OID! ***"
+                        } else {
+                            "ok"
+                        }
+                    );
+                    eprintln!(
+                        "DEBUG: Const details: len={}, byval={}",
+                        (*const_node).constlen,
+                        (*const_node).constbyval
+                    );
+                }
+
+                // Check for Var nodes with potentially corrupt OIDs
+                if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                    let var_node = expr as *mut pg_sys::Var;
+                    let oid = (*var_node).vartype.to_u32();
+                    eprintln!(
+                        "DEBUG: VAR NODE OID: {} ({})",
+                        oid,
+                        if oid == 65536 {
+                            "*** THIS IS THE PROBLEM OID! ***"
+                        } else {
+                            "ok"
+                        }
+                    );
+                }
+            } else {
+                eprintln!("ERROR: TargetEntry[{}] expr is null!", i);
+            }
+        } else {
+            eprintln!("ERROR: TargetEntry[{}] from list_nth is null!", i);
+        }
+    }
+
     eprintln!("DEBUG: About to call ExecTypeFromTL");
 
     // Use PostgreSQL's standard execution path for all node types including SeqScan
@@ -522,9 +655,53 @@ pub unsafe fn execute_postgres_plan_as_srf(
     column_names: Vec<String>,
     range_table: *mut pg_sys::List,
 ) -> pg_sys::Datum {
-    eprintln!("DEBUG: execute_postgres_plan_as_srf ENTRY");
+    // IMMEDIATE DEBUG - FIRST LINE OF FUNCTION EXECUTION
+    eprintln!("IMMEDIATE: execute_postgres_plan_as_srf ENTERED - BEFORE ANY OPERATIONS");
+    pgrx::info!("IMMEDIATE: execute_postgres_plan_as_srf ENTERED - BEFORE ANY OPERATIONS");
+
+    // Use std::panic::catch_unwind to catch any panics that might be preventing execution
+    let result = std::panic::catch_unwind(|| {
+        eprintln!("DEBUG: execute_postgres_plan_as_srf ENTRY - INSIDE PANIC HANDLER");
+        pgrx::info!("DEBUG: execute_postgres_plan_as_srf ENTRY - INSIDE PANIC HANDLER");
+
+        execute_postgres_plan_as_srf_inner(fcinfo, plan_tree, column_names, range_table)
+    });
+
+    match result {
+        Ok(datum) => {
+            eprintln!("DEBUG: SRF executed successfully");
+            datum
+        }
+        Err(panic_info) => {
+            eprintln!(
+                "PANIC: execute_postgres_plan_as_srf panicked: {:?}",
+                panic_info
+            );
+            pgrx::error!("Function panicked during execution");
+        }
+    }
+}
+
+unsafe fn execute_postgres_plan_as_srf_inner(
+    fcinfo: pg_sys::FunctionCallInfo,
+    plan_tree: *mut pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *mut pg_sys::List,
+) -> pg_sys::Datum {
+    eprintln!("DEBUG: execute_postgres_plan_as_srf_inner ENTRY");
+    pgrx::info!("DEBUG: execute_postgres_plan_as_srf_inner ENTRY");
+
+    eprintln!("DEBUG: About to call init_MultiFuncCall");
+    pgrx::info!("DEBUG: About to call init_MultiFuncCall");
     let func_ctx = pg_sys::init_MultiFuncCall(fcinfo);
-    eprintln!("DEBUG: init_MultiFuncCall completed");
+    eprintln!(
+        "DEBUG: init_MultiFuncCall completed, func_ctx: {:p}",
+        func_ctx
+    );
+    pgrx::info!(
+        "DEBUG: init_MultiFuncCall completed, func_ctx: {:p}",
+        func_ctx
+    );
 
     if (*func_ctx).call_cntr == 0 {
         // First call - set up the SRF
@@ -532,15 +709,26 @@ pub unsafe fn execute_postgres_plan_as_srf(
         let old_ctx = pg_sys::MemoryContextSwitchTo(memory_ctx);
 
         // Get the expected tuple descriptor from the AS clause
+        eprintln!("DEBUG: About to process AS clause descriptor");
+        pgrx::info!("DEBUG: About to process AS clause descriptor");
+
         let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
+        eprintln!("DEBUG: result_info pointer: {:p}", result_info);
+
         let expected_tupdesc = if !result_info.is_null() && !(*result_info).expectedDesc.is_null() {
             let tupdesc = (*result_info).expectedDesc;
+            eprintln!("DEBUG: AS clause tupdesc pointer: {:p}", tupdesc);
 
             // Debug the AS clause descriptor
             eprintln!(
                 "DEBUG: AS clause descriptor has {} attributes",
                 (*tupdesc).natts
             );
+            pgrx::info!(
+                "DEBUG: AS clause descriptor has {} attributes",
+                (*tupdesc).natts
+            );
+
             for i in 0..(*tupdesc).natts {
                 let attr = (*tupdesc).attrs.as_ptr().add(i as usize);
                 eprintln!(
@@ -550,8 +738,17 @@ pub unsafe fn execute_postgres_plan_as_srf(
                     (*attr).atttypmod,
                     std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy()
                 );
+                pgrx::info!(
+                    "DEBUG: AS attr {}: typid={}, typmod={}, name={:?}",
+                    i,
+                    (*attr).atttypid.to_u32(),
+                    (*attr).atttypmod,
+                    std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy()
+                );
             }
 
+            eprintln!("DEBUG: AS clause processing completed");
+            pgrx::info!("DEBUG: AS clause processing completed");
             tupdesc
         } else {
             pg_sys::MemoryContextSwitchTo(old_ctx);
@@ -560,12 +757,21 @@ pub unsafe fn execute_postgres_plan_as_srf(
 
         // Execute the plan and get tuplestore
         eprintln!("DEBUG: About to call execute_plan_directly");
-        let (_, tuplestore) = execute_plan_directly(&*plan_tree, column_names, range_table)
-            .unwrap_or_else(|e| {
-                pg_sys::MemoryContextSwitchTo(old_ctx);
-                eprintln!("ERROR: Plan execution failed: {}", e);
-                pgrx::error!("Plan execution failed: {}", e);
-            });
+        pgrx::info!("DEBUG: About to call execute_plan_directly");
+
+        eprintln!("DEBUG: Plan tree pointer before execution: {:p}", plan_tree);
+        eprintln!("DEBUG: Column names: {:?}", column_names);
+        eprintln!("DEBUG: Range table pointer: {:p}", range_table);
+
+        pgrx::info!("DEBUG: Starting plan execution with execute_plan_directly");
+        let execution_result = execute_plan_directly(&*plan_tree, column_names, range_table);
+        pgrx::info!("DEBUG: execute_plan_directly call completed");
+
+        let (_, tuplestore) = execution_result.unwrap_or_else(|e| {
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            eprintln!("ERROR: Plan execution failed: {}", e);
+            pgrx::error!("Plan execution failed: {}", e);
+        });
         eprintln!("DEBUG: execute_plan_directly succeeded");
 
         // Use the expected tuple descriptor from the AS clause

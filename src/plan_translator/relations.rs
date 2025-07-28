@@ -184,11 +184,24 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 let (input_plan, input_range_table) =
                     convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?;
 
-                // Convert expressions to PostgreSQL target entries
+                // For Project relations, we need to extract the table OID from the input plan
+                // so that Selection expressions can resolve column types correctly
+                let input_table_oid = extract_table_oid_from_plan(input_plan)?;
+
+                eprintln!(
+                    "DEBUG: Project relation extracted table OID: {:?} from input plan",
+                    input_table_oid
+                );
+                pgrx::info!(
+                    "DEBUG: Project relation extracted table OID: {:?} from input plan",
+                    input_table_oid
+                );
+
+                // Convert expressions to PostgreSQL target entries using the extracted table OID
                 let target_list = convert_expressions_to_target_list_with_context(
                     &project.expressions,
                     function_map,
-                    current_table_oid,
+                    input_table_oid,
                 )?;
 
                 // Create a Result plan node using PostgreSQL's memory allocator

@@ -438,14 +438,115 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                 column_names.len()
             );
             pgrx::info!("DEBUG: About to call execute_postgres_plan_as_srf");
-            let result = crate::executor::execute_postgres_plan_as_srf(
-                fcinfo,
-                postgres_plan,
-                column_names,
-                range_table as *mut pg_sys::List,
+            eprintln!(
+                "DEBUG: Calling execute_postgres_plan_as_srf with fcinfo={:p}, postgres_plan={:p}",
+                fcinfo, postgres_plan
             );
-            pgrx::info!("DEBUG: execute_postgres_plan_as_srf completed");
-            result
+
+            // CRITICAL DEBUG: Examine the plan structure before PostgreSQL SRF setup
+            eprintln!("DEBUG: DETAILED PLAN INSPECTION BEFORE SRF CALL");
+            eprintln!("DEBUG: postgres_plan type: {:?}", (*postgres_plan).type_);
+            eprintln!(
+                "DEBUG: postgres_plan targetlist: {:p}",
+                (*postgres_plan).targetlist
+            );
+
+            if !(*postgres_plan).targetlist.is_null() {
+                let targetlist = (*postgres_plan).targetlist;
+                eprintln!("DEBUG: targetlist length: {}", (*targetlist).length);
+
+                // Examine each target entry to find OID 65536 source
+                for i in 0..(*targetlist).length {
+                    let element = (*targetlist).elements.offset(i as isize);
+                    if !element.is_null() {
+                        let target_entry = (*element).ptr_value as *mut pg_sys::TargetEntry;
+                        if !target_entry.is_null() {
+                            eprintln!("DEBUG: TargetEntry[{}]: resno={}", i, (*target_entry).resno);
+
+                            let expr = (*target_entry).expr;
+                            if !expr.is_null() {
+                                eprintln!(
+                                    "DEBUG: TargetEntry[{}] expr type: {:?}",
+                                    i,
+                                    (*expr).type_
+                                );
+
+                                // Check for Const nodes with potentially corrupt OIDs
+                                if (*expr).type_ == pg_sys::NodeTag::T_Const {
+                                    let const_node = expr as *mut pg_sys::Const;
+                                    let oid = (*const_node).consttype.to_u32();
+                                    eprintln!(
+                                        "DEBUG: CONST NODE OID: {} ({})",
+                                        oid,
+                                        if oid == 65536 {
+                                            "*** THIS IS THE PROBLEM OID! ***"
+                                        } else {
+                                            "ok"
+                                        }
+                                    );
+                                    eprintln!(
+                                        "DEBUG: Const details: len={}, byval={}",
+                                        (*const_node).constlen,
+                                        (*const_node).constbyval
+                                    );
+                                }
+
+                                // Check for Var nodes with potentially corrupt OIDs
+                                if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                                    let var_node = expr as *mut pg_sys::Var;
+                                    let oid = (*var_node).vartype.to_u32();
+                                    eprintln!(
+                                        "DEBUG: VAR NODE OID: {} ({})",
+                                        oid,
+                                        if oid == 65536 {
+                                            "*** THIS IS THE PROBLEM OID! ***"
+                                        } else {
+                                            "ok"
+                                        }
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            eprintln!("DEBUG: Column names: {:?}", column_names);
+            eprintln!("DEBUG: Range table: {:p}", range_table);
+
+            // Add panic catching here too in case the panic happens during the call
+            eprintln!("CRITICAL: About to make the function call that triggers OID 65536 error");
+            pgrx::info!("CRITICAL: About to make the function call that triggers OID 65536 error");
+
+            let result = std::panic::catch_unwind(|| {
+                eprintln!(
+                    "CRITICAL: Inside panic handler - about to call execute_postgres_plan_as_srf"
+                );
+                pgrx::info!(
+                    "CRITICAL: Inside panic handler - about to call execute_postgres_plan_as_srf"
+                );
+
+                crate::executor::execute_postgres_plan_as_srf(
+                    fcinfo,
+                    postgres_plan,
+                    column_names,
+                    range_table as *mut pg_sys::List,
+                )
+            });
+
+            match result {
+                Ok(datum) => {
+                    pgrx::info!("DEBUG: execute_postgres_plan_as_srf returned successfully");
+                    datum
+                }
+                Err(panic_info) => {
+                    eprintln!(
+                        "PANIC: Call to execute_postgres_plan_as_srf panicked: {:?}",
+                        panic_info
+                    );
+                    pgrx::error!("SRF call panicked");
+                }
+            }
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
