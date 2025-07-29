@@ -5,6 +5,7 @@ use substrait::proto::Expression;
 
 use super::constants::get_expression_type_name;
 use super::relations::convert_rel_to_plan_tree_with_context;
+use super::schema::{ColumnInfo, RelationSchema};
 
 use pgrx::{AnyNumeric, IntoDatum, PgBox};
 use std::str::FromStr;
@@ -329,7 +330,7 @@ pub unsafe fn create_numeric_const(
 }
 
 /// Resolve actual column type information from table OID and attribute number
-unsafe fn resolve_column_type_info(
+pub unsafe fn resolve_column_type_info(
     table_oid: pg_sys::Oid,
     attnum: pg_sys::AttrNumber,
 ) -> Result<(pg_sys::Oid, i32, pg_sys::Oid), Box<dyn std::error::Error + Send + Sync>> {
@@ -705,7 +706,7 @@ unsafe fn create_scalar_subquery_expr(
         (*sublink).testexpr = std::ptr::null_mut();
         (*sublink).operName = std::ptr::null_mut();
 
-        let (plan_tree, range_table) =
+        let (plan_tree, range_table, _schema) =
             convert_rel_to_plan_tree_with_context(rel, function_map, None)?;
         let mut query_node = PgBox::<pg_sys::Query>::alloc0();
         let query_node = query_node.into_pg();
@@ -752,7 +753,7 @@ unsafe fn create_in_predicate_expr(
 
     // Translate the haystack (subquery relation)
     let haystack_rel = in_predicate.haystack.as_ref().unwrap();
-    let (plan_tree, range_table) =
+    let (plan_tree, range_table, _schema) =
         convert_rel_to_plan_tree_with_context(haystack_rel, function_map, None)?;
 
     let mut query_node = PgBox::<pg_sys::Query>::alloc0();
@@ -1570,5 +1571,198 @@ pub unsafe fn create_scalar_function_expr_with_context(
             "Unsupported scalar function: {function_name} with {argument_count} arguments"
         )
         .into()),
+    }
+}
+
+/// Convert expressions to target list with schema-based type resolution
+/// Returns both the target list and the output schema for the projection
+pub unsafe fn convert_expressions_to_target_list_with_schema(
+    expressions: &[Expression],
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<(*mut pg_sys::List, RelationSchema), Box<dyn std::error::Error + Send + Sync>> {
+    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+    let mut output_columns = Vec::new();
+
+    for (i, expr) in expressions.iter().enumerate() {
+        let (target_entry, column_info) =
+            convert_expression_to_target_entry_with_schema(expr, i, function_map, input_schema)?;
+        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+        output_columns.push(column_info);
+    }
+
+    let output_schema = RelationSchema::with_columns(output_columns);
+    Ok((target_list, output_schema))
+}
+
+/// Convert expression to target entry with schema-based type resolution
+unsafe fn convert_expression_to_target_entry_with_schema(
+    expr: &Expression,
+    index: usize,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<(*mut pg_sys::TargetEntry, ColumnInfo), Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Selection(selection)) => {
+            // Handle column references with proper schema-based type resolution
+            let selection_expr =
+                convert_selection_to_postgres_with_schema(selection, input_schema)?;
+
+            // Extract type information from the resolved column
+            let column_info = extract_column_info_from_selection(selection, input_schema)?;
+
+            // Create TargetEntry
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = selection_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
+        Some(RexType::Literal(literal)) => {
+            // Handle literal values
+            if let Some(literal_type) = &literal.literal_type {
+                let (const_expr, type_oid) = match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        (create_int4_const(*val)?, pg_sys::INT4OID)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        (create_int8_const(*val)?, pg_sys::INT8OID)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        (create_text_const(val)?, pg_sys::TEXTOID)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        (create_date_const(*val)?, pg_sys::DATEOID)
+                    }
+                    _ => {
+                        return Err(
+                            format!("Unsupported literal type for expression {index}").into()
+                        )
+                    }
+                };
+
+                let column_info = ColumnInfo::with_type(type_oid);
+
+                // Create TargetEntry
+                let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+                target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+                target_entry.expr = const_expr;
+                target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+                target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+                target_entry.resjunk = false;
+                let target_entry = target_entry.into_pg();
+
+                Ok((target_entry, column_info))
+            } else {
+                Err(format!("Literal expression {index} missing literal type").into())
+            }
+        }
+        _ => {
+            // For other expression types, fall back to the existing context-based approach
+            // TODO: Implement schema-based resolution for scalar functions, casts, etc.
+            let target_entry = convert_expression_to_target_entry_with_context(
+                expr,
+                index,
+                function_map,
+                None, // No table OID since we're using schema
+            )?;
+
+            // Create a placeholder column info with TEXT type for now
+            let column_info = ColumnInfo::with_type(pg_sys::TEXTOID);
+
+            Ok((target_entry, column_info))
+        }
+    }
+}
+
+/// Convert selection expression to PostgreSQL with schema-based type resolution
+pub unsafe fn convert_selection_to_postgres_with_schema(
+    selection: &substrait::proto::expression::FieldReference,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ref_type) = &selection.reference_type {
+        match ref_type {
+            substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                direct_ref,
+            ) => {
+                if let Some(struct_field) = &direct_ref.reference_type {
+                    match struct_field {
+                        substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
+                            let field_index = field.field as usize;
+
+                            // Look up column information from the input schema
+                            if let Some(column_info) = input_schema.get_column(field_index) {
+                                eprintln!(
+                                    "DEBUG: Schema-based Selection field {} resolves to type OID {}",
+                                    field_index, column_info.type_oid
+                                );
+
+                                create_var_node_with_type(
+                                    (field.field + 1) as i32, // 1-based indexing
+                                    column_info.type_oid,
+                                    column_info.typmod,
+                                    column_info.collid,
+                                )
+                            } else {
+                                Err(format!(
+                                    "Field index {} out of bounds for schema with {} columns",
+                                    field_index, input_schema.column_count()
+                                ).into())
+                            }
+                        }
+                        _ => Err("Unsupported reference type in selection".into()),
+                    }
+                } else {
+                    Err("Missing reference type in direct reference".into())
+                }
+            }
+            _ => Err("Unsupported field reference type in selection".into()),
+        }
+    } else {
+        Err("Missing reference type in selection".into())
+    }
+}
+
+/// Extract column information from a selection expression using schema
+fn extract_column_info_from_selection(
+    selection: &substrait::proto::expression::FieldReference,
+    input_schema: &RelationSchema,
+) -> Result<ColumnInfo, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ref_type) = &selection.reference_type {
+        match ref_type {
+            substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                direct_ref,
+            ) => {
+                if let Some(struct_field) = &direct_ref.reference_type {
+                    match struct_field {
+                        substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
+                            let field_index = field.field as usize;
+
+                            // Look up column information from the input schema
+                            if let Some(column_info) = input_schema.get_column(field_index) {
+                                Ok(column_info.clone())
+                            } else {
+                                Err(format!(
+                                    "Field index {} out of bounds for schema with {} columns",
+                                    field_index, input_schema.column_count()
+                                ).into())
+                            }
+                        }
+                        _ => Err("Unsupported reference type in selection".into()),
+                    }
+                } else {
+                    Err("Missing reference type in direct reference".into())
+                }
+            }
+            _ => Err("Unsupported field reference type in selection".into()),
+        }
+    } else {
+        Err("Missing reference type in selection".into())
     }
 }

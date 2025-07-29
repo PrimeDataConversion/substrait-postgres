@@ -267,16 +267,8 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     let rte = create_range_table_entry(table_oid, table_name)?;
 
     // Set critical executor fields following PostgreSQL's RTE patterns
-    (*rte).requiredPerms = pg_sys::ACL_SELECT; // Require SELECT permission
-    (*rte).checkAsUser = pg_sys::InvalidOid; // Use current user for permission checks
     (*rte).securityQuals = std::ptr::null_mut();
     (*rte).tablesample = std::ptr::null_mut();
-
-    // Initialize column permission bitmaps (critical for executor)
-    (*rte).selectedCols = std::ptr::null_mut();
-    (*rte).insertedCols = std::ptr::null_mut();
-    (*rte).updatedCols = std::ptr::null_mut();
-    (*rte).extraUpdatedCols = std::ptr::null_mut();
 
     // Set join-related fields to safe defaults
     (*rte).joinaliasvars = std::ptr::null_mut();
@@ -287,8 +279,18 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     (*rte).functions = std::ptr::null_mut();
     (*rte).funcordinality = false;
 
-    pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
-        (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+    {
+        (*rte).requiredPerms = pg_sys::ACL_SELECT;
+        (*rte).checkAsUser = pg_sys::InvalidOid;
+        pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
+            (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
+    }
+    #[cfg(any(feature = "pg16", feature = "pg17"))]
+    {
+        pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern (permission fields in RTEPermissionInfo), rtekind={:?}",
+            (*rte).rtekind);
+    }
 
     // Return the correct Plan pointer based on PostgreSQL version
     #[cfg(any(feature = "pg13", feature = "pg14"))]
@@ -368,11 +370,15 @@ unsafe fn create_range_table_entry(
     (*rte).eref = alias;
     (*rte).alias = std::ptr::null_mut(); // No explicit alias
 
-    // Initialize other fields
-    (*rte).selectedCols = std::ptr::null_mut();
-    (*rte).insertedCols = std::ptr::null_mut();
-    (*rte).updatedCols = std::ptr::null_mut();
-    (*rte).extraUpdatedCols = std::ptr::null_mut();
+    // Initialize other fields - version dependent
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+    {
+        (*rte).selectedCols = std::ptr::null_mut();
+        (*rte).insertedCols = std::ptr::null_mut();
+        (*rte).updatedCols = std::ptr::null_mut();
+        (*rte).extraUpdatedCols = std::ptr::null_mut();
+    }
+    // For pg16+, these fields are in RTEPermissionInfo which is managed separately
     (*rte).securityQuals = std::ptr::null_mut();
 
     eprintln!("DEBUG: Range table entry created successfully");

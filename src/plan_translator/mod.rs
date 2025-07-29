@@ -4,6 +4,9 @@ pub mod constants;
 pub mod expressions;
 pub mod plan_nodes;
 pub mod relations;
+pub mod schema;
+#[cfg(test)]
+mod schema_tests;
 pub mod translator;
 pub mod types;
 

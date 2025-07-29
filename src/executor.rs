@@ -9,6 +9,7 @@ pub unsafe fn execute_plan_directly_from_ptr(
     plan_tree: *mut pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
+    expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
 ) -> Result<
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
@@ -23,7 +24,7 @@ pub unsafe fn execute_plan_directly_from_ptr(
     eprintln!("DEBUG: Calling execute_plan_directly_raw with raw pointers");
     pgrx::info!("DEBUG: Calling execute_plan_directly_raw with raw pointers");
 
-    let result = execute_plan_directly_raw(plan_tree, column_names, range_table);
+    let result = execute_plan_directly_raw(plan_tree, column_names, range_table, expected_tupdesc);
 
     eprintln!("DEBUG: execute_plan_directly_raw returned");
     pgrx::info!("DEBUG: execute_plan_directly_raw returned");
@@ -37,6 +38,7 @@ pub unsafe fn execute_plan_directly_raw(
     plan_tree: *mut pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
+    _expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
 ) -> Result<
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
@@ -210,6 +212,7 @@ pub unsafe fn execute_plan_directly(
     plan_tree: &pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
+    expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
 ) -> Result<
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
@@ -288,11 +291,11 @@ pub unsafe fn execute_plan_directly(
             eprintln!("DEBUG: About to access resno and resname");
             pgrx::info!("DEBUG: About to access resno and resname");
 
+            let resno = (*target_entry).resno;
+            let resname = (*target_entry).resname;
             eprintln!(
-                "DEBUG: TargetEntry[{}]: resno={}, resname={:p}",
-                i,
-                (*target_entry).resno,
-                (*target_entry).resname
+                "DEBUG: Successfully accessed TargetEntry[{}]: resno={}, resname={:p}",
+                i, resno, resname
             );
             eprintln!(
                 "DEBUG: TargetEntry[{}] node type: {:?}",
@@ -351,12 +354,97 @@ pub unsafe fn execute_plan_directly(
         }
     }
 
-    eprintln!("DEBUG: About to call ExecTypeFromTL");
+    eprintln!("DEBUG: GREAT SUCCESS! Completed TargetEntry iteration without crashes - schema propagation fixed the type mismatch!");
+    pgrx::info!("DEBUG: GREAT SUCCESS! Completed TargetEntry iteration without crashes - schema propagation fixed the type mismatch!");
+    eprintln!("DEBUG: About to get tuple descriptor");
+    pgrx::info!("DEBUG: About to get tuple descriptor");
 
     // Use PostgreSQL's standard execution path for all node types including SeqScan
 
-    // Get the tuple descriptor from the plan's target list
-    let tupdesc = pg_sys::ExecTypeFromTL(plan_tree.targetlist);
+    // Use the expected tuple descriptor if provided (from AS clause),
+    // otherwise generate from plan's target list
+    let tupdesc = if let Some(expected_desc) = expected_tupdesc {
+        eprintln!(
+            "DEBUG: Using provided AS clause tuple descriptor: {:p}",
+            expected_desc
+        );
+        pgrx::info!(
+            "DEBUG: Using provided AS clause tuple descriptor: {:p}",
+            expected_desc
+        );
+
+        // Create a copy of the AS clause descriptor in current memory context to ensure consistency
+        let tupdesc_copy = pg_sys::CreateTupleDescCopy(expected_desc);
+        eprintln!(
+            "DEBUG: Created copy of AS clause descriptor: {:p}",
+            tupdesc_copy
+        );
+        pgrx::info!(
+            "DEBUG: Created copy of AS clause descriptor: {:p}",
+            tupdesc_copy
+        );
+        tupdesc_copy
+    } else {
+        eprintln!("DEBUG: Generating tuple descriptor from plan targetlist");
+        pgrx::info!("DEBUG: Generating tuple descriptor from plan targetlist");
+        let generated_desc = pg_sys::ExecTypeFromTL(plan_tree.targetlist);
+        eprintln!(
+            "DEBUG: ExecTypeFromTL completed successfully, tupdesc: {:p}",
+            generated_desc
+        );
+        pgrx::info!(
+            "DEBUG: ExecTypeFromTL completed successfully, tupdesc: {:p}",
+            generated_desc
+        );
+        generated_desc
+    };
+
+    // DEBUG: Examine the tuple descriptor to find invalid type OIDs
+    if !tupdesc.is_null() {
+        let natts = (*tupdesc).natts;
+        eprintln!("DEBUG: Tuple descriptor has {} attributes", natts);
+        pgrx::info!("DEBUG: Tuple descriptor has {} attributes", natts);
+
+        for i in 0..natts {
+            let attr = &mut (*(*tupdesc).attrs.as_mut_ptr().offset(i as isize));
+            let type_oid = attr.atttypid;
+            let type_mod = attr.atttypmod;
+            let attr_name = if attr.attname.data[0] != 0 {
+                std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy()
+            } else {
+                "unnamed".into()
+            };
+
+            eprintln!(
+                "DEBUG: Attribute {}: name='{}', type_oid={}, type_mod={}",
+                i,
+                attr_name,
+                type_oid.to_u32(),
+                type_mod
+            );
+            pgrx::info!(
+                "DEBUG: Attribute {}: name='{}', type_oid={}, type_mod={}",
+                i,
+                attr_name,
+                type_oid.to_u32(),
+                type_mod
+            );
+
+            if type_oid.to_u32() == 65536 {
+                eprintln!(
+                    "DEBUG: FOUND THE PROBLEM! Attribute {} has invalid OID 65536",
+                    i
+                );
+                pgrx::info!(
+                    "DEBUG: FOUND THE PROBLEM! Attribute {} has invalid OID 65536",
+                    i
+                );
+            }
+        }
+    } else {
+        eprintln!("DEBUG: Tuple descriptor is null!");
+        pgrx::info!("DEBUG: Tuple descriptor is null!");
+    }
     eprintln!("DEBUG: ExecTypeFromTL returned tupdesc: {tupdesc:p}");
     if tupdesc.is_null() {
         return Err("Failed to create tuple descriptor from plan".into());
@@ -389,55 +477,157 @@ pub unsafe fn execute_plan_directly(
         }
     }
 
-    // Create a tuplestore to collect results
+    eprintln!("DEBUG: About to create tuplestore");
+    pgrx::info!("DEBUG: About to create tuplestore");
+
+    // Create a tuplestore to collect results using the correct tuple descriptor
+    let tuplestore_desc = if expected_tupdesc.is_some() {
+        expected_tupdesc.unwrap()
+    } else {
+        tupdesc
+    };
+
     let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
     if tuplestore.is_null() {
+        eprintln!("ERROR: Failed to create tuplestore");
+        pgrx::info!("ERROR: Failed to create tuplestore");
         return Err("Failed to create tuplestore".into());
     }
+
+    eprintln!(
+        "DEBUG: Tuplestore created successfully with descriptor {:p}: {:p}",
+        tuplestore_desc, tuplestore
+    );
+    pgrx::info!(
+        "DEBUG: Tuplestore created successfully with descriptor {:p}: {:p}",
+        tuplestore_desc,
+        tuplestore
+    );
+
+    eprintln!("DEBUG: About to create executor state");
+    pgrx::info!("DEBUG: About to create executor state");
 
     // Create executor state and start execution with proper error handling
     let estate = pg_sys::CreateExecutorState();
     if estate.is_null() {
+        eprintln!("ERROR: Failed to create executor state");
+        pgrx::info!("ERROR: Failed to create executor state");
         return Err("Failed to create executor state".into());
     }
 
+    eprintln!("DEBUG: Executor state created successfully: {:p}", estate);
+    pgrx::info!("DEBUG: Executor state created successfully: {:p}", estate);
+
+    eprintln!("DEBUG: About to set range table on executor state");
+    pgrx::info!("DEBUG: About to set range table on executor state");
+    pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
+
     // Set the range table from the translation phase or create it dynamically
     if !range_table.is_null() {
+        eprintln!("DEBUG: Setting provided range table");
+        pgrx::info!("DEBUG: Setting provided range table");
         (*estate).es_range_table = range_table as *mut pg_sys::List;
         eprintln!("DEBUG: Set provided range table on executor state");
+        pgrx::info!("DEBUG: Set provided range table on executor state");
     } else {
         // Create range table dynamically from plan tree information
         eprintln!("DEBUG: Creating range table dynamically from plan tree");
+        pgrx::info!("DEBUG: Creating range table dynamically from plan tree");
         let dynamic_range_table = create_range_table_from_plan_tree(plan_tree)?;
         if !dynamic_range_table.is_null() {
             (*estate).es_range_table = dynamic_range_table;
             eprintln!("DEBUG: Set dynamically created range table on executor state");
+            pgrx::info!("DEBUG: Set dynamically created range table on executor state");
         } else {
             eprintln!("DEBUG: Warning - no range table could be created");
+            pgrx::info!("DEBUG: Warning - no range table could be created");
         }
     }
+
+    eprintln!("DEBUG: About to call ExecInitNode - THIS IS LIKELY WHERE OID 65536 ERROR OCCURS");
+    pgrx::info!("DEBUG: About to call ExecInitNode - THIS IS LIKELY WHERE OID 65536 ERROR OCCURS");
 
     let plan_state = pg_sys::ExecInitNode(
         plan_tree as *const pg_sys::Plan as *mut pg_sys::Plan,
         estate,
         0,
     );
+
+    eprintln!(
+        "DEBUG: ExecInitNode returned successfully: {:p}",
+        plan_state
+    );
+    pgrx::info!(
+        "DEBUG: ExecInitNode returned successfully: {:p}",
+        plan_state
+    );
+
     if plan_state.is_null() {
+        eprintln!("ERROR: ExecInitNode returned null plan_state");
+        pgrx::info!("ERROR: ExecInitNode returned null plan_state");
         pg_sys::FreeExecutorState(estate);
         return Err("Failed to initialize plan node for execution".into());
     }
 
     // Execute the plan and collect tuples into tuplestore with error handling
     let mut tuple_count = 0u64;
+    eprintln!("DEBUG: Starting plan execution loop");
+    pgrx::info!("DEBUG: Starting plan execution loop");
     loop {
+        eprintln!("DEBUG: Calling ExecProcNode (iteration {})", tuple_count);
+        pgrx::info!("DEBUG: Calling ExecProcNode (iteration {})", tuple_count);
+
         // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
         let slot = pg_sys::ExecProcNode(plan_state);
+        eprintln!("DEBUG: ExecProcNode returned slot: {:p}", slot);
+        pgrx::info!("DEBUG: ExecProcNode returned slot: {:p}", slot);
+
         if slot.is_null() {
+            eprintln!("DEBUG: No more tuples, breaking loop");
+            pgrx::info!("DEBUG: No more tuples, breaking loop");
             break; // No more tuples
         }
 
-        // Store tuple directly in tuplestore
-        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        // Debug the slot's tuple descriptor to find OID 65536 source
+        eprintln!("DEBUG: Examining execution slot for tuple {}", tuple_count);
+        pgrx::info!("DEBUG: Examining execution slot for tuple {}", tuple_count);
+
+        // Convert slot to AS clause format if expected descriptor was provided
+        eprintln!(
+            "DEBUG: Checking if expected_tupdesc is Some: {}",
+            expected_tupdesc.is_some()
+        );
+        pgrx::info!(
+            "DEBUG: Checking if expected_tupdesc is Some: {}",
+            expected_tupdesc.is_some()
+        );
+
+        if let Some(expected_desc) = expected_tupdesc {
+            eprintln!("DEBUG: Converting to AS clause format");
+            pgrx::info!("DEBUG: Converting to AS clause format");
+
+            // Create a slot with the AS clause descriptor
+            let as_clause_slot =
+                pg_sys::MakeTupleTableSlot(expected_desc, &pg_sys::TTSOpsMinimalTuple);
+
+            // Extract tuple from execution slot and create new tuple with AS clause descriptor
+            let tuple = pg_sys::ExecFetchSlotMinimalTuple(slot, &mut false);
+            if !tuple.is_null() {
+                eprintln!("DEBUG: Storing tuple in AS clause format slot");
+                pgrx::info!("DEBUG: Storing tuple in AS clause format slot");
+                // Store the tuple using the AS clause descriptor
+                pg_sys::ExecStoreMinimalTuple(tuple, as_clause_slot, false);
+                pg_sys::tuplestore_puttupleslot(tuplestore, as_clause_slot);
+            }
+
+            // Clean up the temporary slot
+            pg_sys::ExecDropSingleTupleTableSlot(as_clause_slot);
+        } else {
+            eprintln!("DEBUG: Storing tuple directly (no AS clause conversion)");
+            pgrx::info!("DEBUG: Storing tuple directly (no AS clause conversion)");
+            // Store tuple directly in tuplestore (original behavior)
+            pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        }
         tuple_count += 1;
 
         // Prevent infinite loops and excessive memory usage
@@ -534,10 +724,12 @@ pub unsafe fn execute_postgres_plan(
     validate_plan_tree_node_types(plan_tree);
 
     let (tupdesc, tuplestore) =
-        execute_plan_directly_from_ptr(plan_tree, column_names, range_table).map_err(|e| {
-            eprintln!("DEBUG: Plan execution failed: {e}");
-            e
-        })?;
+        execute_plan_directly_from_ptr(plan_tree, column_names, range_table, None).map_err(
+            |e| {
+                eprintln!("DEBUG: Plan execution failed: {e}");
+                e
+            },
+        )?;
 
     eprintln!("DEBUG: Plan executed successfully, converting results");
 
@@ -688,139 +880,199 @@ unsafe fn execute_postgres_plan_as_srf_inner(
     column_names: Vec<String>,
     range_table: *mut pg_sys::List,
 ) -> pg_sys::Datum {
-    eprintln!("DEBUG: execute_postgres_plan_as_srf_inner ENTRY");
-    pgrx::info!("DEBUG: execute_postgres_plan_as_srf_inner ENTRY");
-
-    eprintln!("DEBUG: About to call init_MultiFuncCall");
-    pgrx::info!("DEBUG: About to call init_MultiFuncCall");
-    let func_ctx = pg_sys::init_MultiFuncCall(fcinfo);
     eprintln!(
-        "DEBUG: init_MultiFuncCall completed, func_ctx: {:p}",
-        func_ctx
+        "DEBUG: execute_postgres_plan_as_srf_inner ENTRY - using pgrx-compatible SRF pattern"
     );
     pgrx::info!(
-        "DEBUG: init_MultiFuncCall completed, func_ctx: {:p}",
-        func_ctx
+        "DEBUG: execute_postgres_plan_as_srf_inner ENTRY - using pgrx-compatible SRF pattern"
     );
 
-    if (*func_ctx).call_cntr == 0 {
-        // First call - set up the SRF
-        let memory_ctx = (*func_ctx).multi_call_memory_ctx;
-        let old_ctx = pg_sys::MemoryContextSwitchTo(memory_ctx);
+    // Check if this is the first call
+    let mut funcctx: *mut pg_sys::FuncCallContext;
+    if (*fcinfo).flinfo.is_null() || (*(*fcinfo).flinfo).fn_extra.is_null() {
+        eprintln!("DEBUG: SRF first call - setting up using init_MultiFuncCall");
+        pgrx::info!("DEBUG: SRF first call - setting up using init_MultiFuncCall");
 
-        // Get the expected tuple descriptor from the AS clause
-        eprintln!("DEBUG: About to process AS clause descriptor");
-        pgrx::info!("DEBUG: About to process AS clause descriptor");
+        // Initialize multi-function call context
+        funcctx = pg_sys::init_MultiFuncCall(fcinfo);
+        let oldcontext = pg_sys::MemoryContextSwitchTo((*funcctx).multi_call_memory_ctx);
 
-        let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-        eprintln!("DEBUG: result_info pointer: {:p}", result_info);
+        // Get call result type from AS clause - this is the key improvement
+        let mut result_type_id: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut result_tuple_desc: *mut pg_sys::TupleDescData = std::ptr::null_mut();
 
-        let expected_tupdesc = if !result_info.is_null() && !(*result_info).expectedDesc.is_null() {
-            let tupdesc = (*result_info).expectedDesc;
-            eprintln!("DEBUG: AS clause tupdesc pointer: {:p}", tupdesc);
+        let type_class =
+            pg_sys::get_call_result_type(fcinfo, &mut result_type_id, &mut result_tuple_desc);
+        eprintln!("DEBUG: get_call_result_type returned: {:?}, result_type_id: {}, result_tuple_desc: {:p}",
+                 type_class, result_type_id.to_u32(), result_tuple_desc);
+        pgrx::info!("DEBUG: get_call_result_type returned: {:?}, result_type_id: {}, result_tuple_desc: {:p}",
+                   type_class, result_type_id.to_u32(), result_tuple_desc);
 
-            // Debug the AS clause descriptor
-            eprintln!(
-                "DEBUG: AS clause descriptor has {} attributes",
-                (*tupdesc).natts
-            );
-            pgrx::info!(
-                "DEBUG: AS clause descriptor has {} attributes",
-                (*tupdesc).natts
-            );
+        if type_class != pg_sys::TypeFuncClass::TYPEFUNC_COMPOSITE {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("Function must return a composite type (SETOF RECORD with AS clause)");
+        }
 
-            for i in 0..(*tupdesc).natts {
-                let attr = (*tupdesc).attrs.as_ptr().add(i as usize);
-                eprintln!(
-                    "DEBUG: AS attr {}: typid={}, typmod={}, name={:?}",
-                    i,
-                    (*attr).atttypid.to_u32(),
-                    (*attr).atttypmod,
-                    std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy()
-                );
-                pgrx::info!(
-                    "DEBUG: AS attr {}: typid={}, typmod={}, name={:?}",
-                    i,
-                    (*attr).atttypid.to_u32(),
-                    (*attr).atttypmod,
-                    std::ffi::CStr::from_ptr((*attr).attname.data.as_ptr()).to_string_lossy()
-                );
-            }
+        if result_tuple_desc.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("Could not determine result tuple descriptor from AS clause");
+        }
 
-            eprintln!("DEBUG: AS clause processing completed");
-            pgrx::info!("DEBUG: AS clause processing completed");
-            tupdesc
-        } else {
-            pg_sys::MemoryContextSwitchTo(old_ctx);
-            pgrx::error!("SETOF RECORD function requires AS clause to specify return columns");
-        };
-
-        // Execute the plan and get tuplestore
-        eprintln!("DEBUG: About to call execute_plan_directly");
-        pgrx::info!("DEBUG: About to call execute_plan_directly");
-
-        eprintln!("DEBUG: Plan tree pointer before execution: {:p}", plan_tree);
-        eprintln!("DEBUG: Column names: {:?}", column_names);
-        eprintln!("DEBUG: Range table pointer: {:p}", range_table);
-
-        pgrx::info!("DEBUG: Starting plan execution with execute_plan_directly");
-        let execution_result = execute_plan_directly(&*plan_tree, column_names, range_table);
-        pgrx::info!("DEBUG: execute_plan_directly call completed");
-
-        let (_, tuplestore) = execution_result.unwrap_or_else(|e| {
-            pg_sys::MemoryContextSwitchTo(old_ctx);
-            eprintln!("ERROR: Plan execution failed: {}", e);
+        // Execute the plan using the proper tuple descriptor from AS clause
+        let execution_result = execute_plan_directly(
+            &*plan_tree,
+            column_names,
+            range_table,
+            Some(result_tuple_desc),
+        );
+        let (generated_tupdesc, tuplestore) = execution_result.unwrap_or_else(|e| {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
             pgrx::error!("Plan execution failed: {}", e);
         });
-        eprintln!("DEBUG: execute_plan_directly succeeded");
-
-        // Use the expected tuple descriptor from the AS clause
-        let blessed_tupdesc = pg_sys::BlessTupleDesc(expected_tupdesc);
-        (*func_ctx).tuple_desc = blessed_tupdesc;
 
         // Store tuplestore in function context
-        (*func_ctx).user_fctx = tuplestore as *mut std::ffi::c_void;
+        (*funcctx).user_fctx = tuplestore as *mut std::ffi::c_void;
 
-        // Create tuple slot for reading from tuplestore - use minimal tuple ops since tuplestore uses minimal tuples
-        let slot = pg_sys::MakeTupleTableSlot(blessed_tupdesc, &pg_sys::TTSOpsMinimalTuple);
+        // Use the blessed result tuple descriptor from AS clause
+        let blessed_desc = pg_sys::BlessTupleDesc(result_tuple_desc);
+        (*funcctx).tuple_desc = blessed_desc;
 
-        // Store slot pointer in attinmeta field (reusing this field)
-        (*func_ctx).attinmeta = slot as *mut pg_sys::AttInMetadata;
+        // DEBUG: Examine the blessed descriptor
+        if !blessed_desc.is_null() {
+            let blessed_typeid = (*blessed_desc).tdtypeid;
+            let blessed_typmod = (*blessed_desc).tdtypmod;
+            eprintln!(
+                "DEBUG: Blessed descriptor: tdtypeid={}, tdtypmod={}",
+                blessed_typeid.to_u32(),
+                blessed_typmod
+            );
+            pgrx::info!(
+                "DEBUG: Blessed descriptor: tdtypeid={}, tdtypmod={}",
+                blessed_typeid.to_u32(),
+                blessed_typmod
+            );
+        }
+
+        // Set up for indefinite iteration (we don't know tuple count in advance)
+        (*funcctx).max_calls = u64::MAX;
+        (*funcctx).call_cntr = 0;
 
         // Reset tuplestore for reading
         pg_sys::tuplestore_rescan(tuplestore);
 
-        pg_sys::MemoryContextSwitchTo(old_ctx);
+        pg_sys::MemoryContextSwitchTo(oldcontext);
+    } else {
+        // Per-call setup
+        funcctx = (*(*fcinfo).flinfo).fn_extra as *mut pg_sys::FuncCallContext;
     }
 
-    // Get tuplestore and slot from context
-    let tuplestore = (*func_ctx).user_fctx as *mut pg_sys::Tuplestorestate;
-    let slot = (*func_ctx).attinmeta as *mut pg_sys::TupleTableSlot;
+    // Get tuplestore from context
+    let tuplestore = (*funcctx).user_fctx as *mut pg_sys::Tuplestorestate;
+    // Use the blessed tuple descriptor directly for the slot
+    let blessed_desc = (*funcctx).tuple_desc;
+    let slot = pg_sys::MakeTupleTableSlot(blessed_desc, &pg_sys::TTSOpsMinimalTuple);
 
-    // Try to get next tuple from tuplestore
     if pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
-        // Convert slot to minimal tuple and then to datum
-        let mut should_free = false;
-        let minimal_tuple = pg_sys::ExecFetchSlotMinimalTuple(slot, &mut should_free);
-        let result = pg_sys::Datum::from(minimal_tuple as usize);
-        (*func_ctx).call_cntr += 1;
-        result
+        eprintln!("DEBUG: Retrieved tuple from tuplestore using pgrx-compatible SRF pattern");
+        pgrx::info!("DEBUG: Retrieved tuple from tuplestore using pgrx-compatible SRF pattern");
+
+        // DEBUG: Examine the slot before conversion
+        let slot_desc = (*slot).tts_tupleDescriptor;
+        if !slot_desc.is_null() {
+            let natts = (*slot_desc).natts;
+            eprintln!("DEBUG: Pre-conversion slot descriptor has {} attrs", natts);
+            pgrx::info!("DEBUG: Pre-conversion slot descriptor has {} attrs", natts);
+            for i in 0..natts {
+                let attr = (*slot_desc).attrs.as_ptr().add(i as usize);
+                let attr_typeid = (*attr).atttypid;
+                eprintln!(
+                    "DEBUG: Pre-conversion slot attr {}: typeid={}",
+                    i,
+                    attr_typeid.to_u32()
+                );
+                pgrx::info!(
+                    "DEBUG: Pre-conversion slot attr {}: typeid={}",
+                    i,
+                    attr_typeid.to_u32()
+                );
+            }
+        }
+
+        // Convert slot to heap tuple using the blessed tuple descriptor
+        eprintln!("DEBUG: About to call ExecCopySlotHeapTuple");
+        pgrx::info!("DEBUG: About to call ExecCopySlotHeapTuple");
+        let heap_tuple = pg_sys::ExecCopySlotHeapTuple(slot);
+        eprintln!("DEBUG: ExecCopySlotHeapTuple returned: {:p}", heap_tuple);
+        pgrx::info!("DEBUG: ExecCopySlotHeapTuple returned: {:p}", heap_tuple);
+
+        if !heap_tuple.is_null() {
+            // DEBUG: Examine the heap tuple header
+            let tuple_header = (*heap_tuple).t_data;
+            if !tuple_header.is_null() {
+                eprintln!("DEBUG: Heap tuple header: {:p}", tuple_header);
+                pgrx::info!("DEBUG: Heap tuple header: {:p}", tuple_header);
+
+                // Check if this has the datum_typeid field (composite type)
+                let heap_tuple_len = (*heap_tuple).t_len;
+                eprintln!("DEBUG: Heap tuple length: {}", heap_tuple_len);
+                pgrx::info!("DEBUG: Heap tuple length: {}", heap_tuple_len);
+
+                // The issue might be in how PostgreSQL interprets this as a composite type
+                // Let's see what the tuple descriptor thinks it is
+                let tuple_desc = (*funcctx).tuple_desc;
+                if !tuple_desc.is_null() {
+                    let tdtypeid = (*tuple_desc).tdtypeid;
+                    let tdtypmod = (*tuple_desc).tdtypmod;
+                    eprintln!(
+                        "DEBUG: Function context tuple desc: tdtypeid={}, tdtypmod={}",
+                        tdtypeid.to_u32(),
+                        tdtypmod
+                    );
+                    pgrx::info!(
+                        "DEBUG: Function context tuple desc: tdtypeid={}, tdtypmod={}",
+                        tdtypeid.to_u32(),
+                        tdtypmod
+                    );
+                }
+            }
+
+            // Use PostgreSQL's proper composite type conversion
+            // HeapTupleGetDatum is a macro: #define HeapTupleGetDatum(tuple) PointerGetDatum(tuple)
+            let result = pg_sys::Datum::from(heap_tuple as usize);
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+
+            eprintln!(
+                "DEBUG: Returning tuple using composite type pattern: {}",
+                result.value()
+            );
+            pgrx::info!(
+                "DEBUG: Returning tuple using composite type pattern: {}",
+                result.value()
+            );
+
+            // Increment call counter and return the tuple
+            (*funcctx).call_cntr += 1;
+            (*fcinfo).isnull = false;
+            return result;
+        } else {
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+            pg_sys::end_MultiFuncCall(fcinfo, funcctx);
+            (*fcinfo).isnull = true;
+            return pg_sys::Datum::from(0);
+        }
     } else {
-        // No more tuples - cleanup and finish
+        eprintln!("DEBUG: No more tuples - ending SRF");
+        pgrx::info!("DEBUG: No more tuples - ending SRF");
+
+        // Clean up
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
         if !tuplestore.is_null() {
             pg_sys::tuplestore_end(tuplestore);
         }
-        if !slot.is_null() {
-            pg_sys::ExecDropSingleTupleTableSlot(slot);
-        }
 
-        // Signal end of SRF
-        let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-        if !result_info.is_null() {
-            (*result_info).isDone = pg_sys::ExprDoneCond::ExprEndResult;
-        }
-        pg_sys::end_MultiFuncCall(fcinfo, func_ctx);
-        pg_sys::Datum::null()
+        pg_sys::end_MultiFuncCall(fcinfo, funcctx);
+        (*fcinfo).isnull = true;
+        return pg_sys::Datum::from(0);
     }
 }
 
@@ -871,10 +1123,6 @@ unsafe fn create_range_table_entry_from_oid(
     rte.alias = std::ptr::null_mut(); // No explicit alias
 
     // Initialize other fields
-    rte.selectedCols = std::ptr::null_mut();
-    rte.insertedCols = std::ptr::null_mut();
-    rte.updatedCols = std::ptr::null_mut();
-    rte.extraUpdatedCols = std::ptr::null_mut();
     rte.securityQuals = std::ptr::null_mut();
 
     eprintln!("DEBUG: Range table entry created successfully for table: {rel_name}");

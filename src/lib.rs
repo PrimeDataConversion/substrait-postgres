@@ -11,6 +11,68 @@ use executor::execute_postgres_plan;
 
 pgrx::pg_module_magic!();
 
+/// Validates that the AS clause types match the plan's output types
+unsafe fn validate_as_clause_against_plan(
+    expected_tupdesc: *mut pg_sys::TupleDescData,
+    plan_targetlist: *mut pg_sys::List,
+) -> Result<(), String> {
+    // Get the plan's output types from its targetlist
+    let plan_tupdesc = pg_sys::ExecTypeFromTL(plan_targetlist);
+    if plan_tupdesc.is_null() {
+        return Err("Failed to get tuple descriptor from plan targetlist".to_string());
+    }
+
+    let expected_natts = (*expected_tupdesc).natts;
+    let plan_natts = (*plan_tupdesc).natts;
+
+    // Check column count
+    if expected_natts != plan_natts {
+        pg_sys::FreeTupleDesc(plan_tupdesc);
+        return Err(format!(
+            "Column count mismatch: AS clause expects {} columns but plan generates {} columns",
+            expected_natts, plan_natts
+        ));
+    }
+
+    // Check each column type
+    for i in 0..expected_natts {
+        let expected_attr = (*expected_tupdesc).attrs.as_ptr().add(i as usize);
+        let plan_attr = (*plan_tupdesc).attrs.as_ptr().add(i as usize);
+
+        let expected_type = (*expected_attr).atttypid;
+        let plan_type = (*plan_attr).atttypid;
+
+        if expected_type != plan_type {
+            // Get type names for error message
+            let expected_name = pg_sys::format_type_be(expected_type);
+            let plan_name = pg_sys::format_type_be(plan_type);
+
+            let expected_str = if !expected_name.is_null() {
+                std::ffi::CStr::from_ptr(expected_name).to_string_lossy()
+            } else {
+                format!("OID {}", expected_type.to_u32()).into()
+            };
+
+            let plan_str = if !plan_name.is_null() {
+                std::ffi::CStr::from_ptr(plan_name).to_string_lossy()
+            } else {
+                format!("OID {}", plan_type.to_u32()).into()
+            };
+
+            pg_sys::FreeTupleDesc(plan_tupdesc);
+            return Err(format!(
+                "Type mismatch at column {}: AS clause expects {} but plan generates {}",
+                i, expected_str, plan_str
+            ));
+        }
+    }
+
+    // Clean up the temporary descriptor before returning
+    pg_sys::FreeTupleDesc(plan_tupdesc);
+
+    Ok(())
+}
+
 // Static variable to store the previous planner hook
 static PREV_PLANNER_HOOK: Mutex<pg_sys::planner_hook_type> = Mutex::new(None);
 
@@ -699,6 +761,26 @@ unsafe fn execute_substrait_as_srf_with_function_map(
                 pgrx::info!("DEBUG: Column {}: {}", i, name);
             }
 
+            // CRITICAL: Validate AS clause types match our plan output BEFORE execution
+            pgrx::info!("DEBUG: Validating AS clause against plan output types");
+
+            // Get the AS clause descriptor
+            let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
+            if !result_info.is_null() && !(*result_info).expectedDesc.is_null() {
+                let expected_tupdesc = (*result_info).expectedDesc;
+
+                // Validate that AS clause matches plan output
+                match validate_as_clause_against_plan(expected_tupdesc, (*postgres_plan).targetlist)
+                {
+                    Ok(()) => {
+                        pgrx::info!("DEBUG: AS clause validation passed - all types match!");
+                    }
+                    Err(err) => {
+                        pgrx::error!("{}", err);
+                    }
+                }
+            }
+
             // Execute plan using proper SRF mechanism
             pgrx::info!(
                 "DEBUG: Executing plan with {} columns: {:?}",
@@ -1070,6 +1152,191 @@ mod tests {
             result.err()
         );
     }
+    #[pg_test]
+    fn test_minimal_read_relation() {
+        // Create a test table first
+        let _ = Spi::run("DROP TABLE IF EXISTS test_minimal_table");
+        let _ = Spi::run("CREATE TABLE test_minimal_table (id INT)");
+        let _ = Spi::run("INSERT INTO test_minimal_table VALUES (42)");
+
+        // Test with minimal Read relation - single table, single column
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["id"],
+                    "input": {
+                        "read": {
+                            "baseSchema": {
+                                "names": ["id"],
+                                "struct": {
+                                    "types": [{
+                                        "i32": {
+                                            "nullability": "NULLABILITY_NULLABLE"
+                                        }
+                                    }]
+                                }
+                            },
+                            "namedTable": {
+                                "names": ["test_minimal_table"]
+                            }
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+        let query = format!("SELECT * FROM from_substrait_json('{escaped_plan}') AS t(id int)");
+
+        // This exercises the full pipeline: plan parsing, Read relation translation,
+        // table lookup, plan tree creation, SRF execution, and result processing
+        let result = Spi::get_one::<i32>(&query);
+
+        // This should work or give a meaningful error, not OID 65536
+        match result {
+            Ok(val) => {
+                println!("Success! Got value: {:?}", val);
+                assert_eq!(val, Some(42), "Should return the inserted value");
+            }
+            Err(e) => {
+                println!("Error: {:?}", e);
+                // If we get OID 65536, it means the corruption is in our execution pipeline
+                assert!(
+                    !e.to_string().contains("65536"),
+                    "Got OID 65536 error - indicates corruption in execution pipeline: {}",
+                    e
+                );
+            }
+        }
+
+        // Cleanup
+        let _ = Spi::run("DROP TABLE test_minimal_table");
+    }
+
+    #[pg_test]
+    fn test_simple_result_node_bypass_seqscan() {
+        // Test with a pure Result node (no table access) to isolate the ExecInitNode issue
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["test_value"],
+                    "input": {
+                        "project": {
+                            "expressions": [{
+                                "literal": {
+                                    "i32": 42
+                                }
+                            }]
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+        let query =
+            format!("SELECT * FROM from_substrait_json('{escaped_plan}') AS t(test_value int)");
+
+        // This should work since it's just a Result node with a literal, no table access
+        let result = Spi::get_one::<i32>(&query);
+
+        match result {
+            Ok(val) => {
+                println!("Success! Got value: {:?}", val);
+                assert_eq!(val, Some(42), "Should return the literal value 42");
+            }
+            Err(e) => {
+                println!("Error: {:?}", e);
+                // If this fails with OID 65536, the issue is not SeqScan-specific
+                // If this succeeds, the issue is specifically with SeqScan initialization
+                println!(
+                    "Result node test failed - issue affects all plan types: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_literal_schema_propagation() {
+        // Test that literal expressions create correct schema types
+        use plan_translator::schema::RelationSchema;
+        use std::collections::HashMap;
+        use substrait::proto::{
+            expression::{literal::LiteralType, Literal, RexType},
+            Expression,
+        };
+
+        let input_schema = RelationSchema::new(); // Empty input for literals
+
+        // Create literal expressions
+        let expressions = vec![
+            Expression {
+                rex_type: Some(RexType::Literal(Literal {
+                    literal_type: Some(LiteralType::I32(42)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Expression {
+                rex_type: Some(RexType::Literal(Literal {
+                    literal_type: Some(LiteralType::String("test".to_string())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Expression {
+                rex_type: Some(RexType::Literal(Literal {
+                    literal_type: Some(LiteralType::I64(123)),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+
+        let function_map = HashMap::new();
+
+        // Test schema propagation through literal expression conversion
+        unsafe {
+            let result =
+                plan_translator::expressions::convert_expressions_to_target_list_with_schema(
+                    &expressions,
+                    &function_map,
+                    &input_schema,
+                );
+
+            match result {
+                Ok((_target_list, output_schema)) => {
+                    assert_eq!(
+                        output_schema.column_count(),
+                        3,
+                        "Should have 3 columns from 3 literals"
+                    );
+                    assert_eq!(
+                        output_schema.get_column(0).unwrap().type_oid,
+                        pg_sys::INT4OID,
+                        "First column should be INT4 from i32 literal"
+                    );
+                    assert_eq!(
+                        output_schema.get_column(1).unwrap().type_oid,
+                        pg_sys::TEXTOID,
+                        "Second column should be TEXT from string literal"
+                    );
+                    assert_eq!(
+                        output_schema.get_column(2).unwrap().type_oid,
+                        pg_sys::INT8OID,
+                        "Third column should be INT8 from i64 literal"
+                    );
+                }
+                Err(e) => {
+                    panic!("Literal schema propagation failed: {}", e);
+                }
+            }
+        }
+    }
+
     #[pg_test]
     fn test_from_substrait_json_simple() {
         // Test with a minimal valid Substrait plan that has schema names
@@ -3124,4 +3391,658 @@ unsafe fn extract_table_oid_from_plan_tree(
             .into())
         }
     }
+}
+
+/// Dummy function to register the SQL for the test function
+#[pg_extern(sql = r#"
+CREATE OR REPLACE FUNCTION test_minimal_srf()
+RETURNS SETOF RECORD
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'test_minimal_srf_direct';
+"#)]
+fn register_test_minimal_srf() {}
+
+/// Register the SeqScan test function
+#[pg_extern(sql = r#"
+CREATE OR REPLACE FUNCTION test_seqscan_srf()
+RETURNS SETOF RECORD
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'test_seqscan_srf_direct';
+"#)]
+fn register_test_seqscan_srf() {}
+
+/// Test SRF with hardcoded minimal plan - bypasses all Substrait translation
+#[no_mangle]
+pub unsafe extern "C" fn test_minimal_srf_direct(
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> pg_sys::Datum {
+    pgrx::info!("DEBUG: test_minimal_srf_direct ENTRY - testing PostgreSQL's complete initialization sequence");
+
+    // Use PostgreSQL's complete PlannedStmt/QueryDesc initialization sequence
+    execute_plan_with_proper_initialization(fcinfo)
+}
+
+// Add PG_FUNCTION_INFO_V1 for the C function
+#[no_mangle]
+pub extern "C" fn pg_finfo_test_minimal_srf_direct() -> &'static pg_sys::Pg_finfo_record {
+    const INFO: pg_sys::Pg_finfo_record = pg_sys::Pg_finfo_record { api_version: 1 };
+    &INFO
+}
+
+/// Create a complete PostgreSQL execution environment with PlannedStmt wrapper
+/// This follows PostgreSQL's ExecutorStart() initialization sequence
+unsafe fn create_minimal_literal_plan() -> *mut pg_sys::Plan {
+    pgrx::info!(
+        "DEBUG: create_minimal_literal_plan ENTRY - creating complete PlannedStmt environment"
+    );
+
+    // Create a Result node using PostgreSQL's pattern (equivalent to SELECT 42)
+    let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
+
+    // Initialize Plan base structure completely (matching make_result() in createplan.c)
+    result_node.plan.type_ = pg_sys::NodeTag::T_Result;
+    result_node.plan.startup_cost = 0.0;
+    result_node.plan.total_cost = 0.01;
+    result_node.plan.plan_rows = 1.0;
+    result_node.plan.plan_width = 4; // sizeof(int32)
+    result_node.plan.parallel_aware = false;
+    result_node.plan.parallel_safe = true;
+    result_node.plan.plan_node_id = 1;
+    result_node.plan.lefttree = std::ptr::null_mut();
+    result_node.plan.righttree = std::ptr::null_mut();
+    result_node.plan.initPlan = std::ptr::null_mut();
+    result_node.plan.extParam = std::ptr::null_mut();
+    result_node.plan.allParam = std::ptr::null_mut();
+    result_node.plan.qual = std::ptr::null_mut(); // No qualification needed
+
+    // Create a properly formed TargetEntry (following ExecBuildProjectionInfo requirements)
+    let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+    target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+    target_entry.resno = 1; // First (and only) result column
+    target_entry.resjunk = false; // This is a real result column, not junk
+    target_entry.ressortgroupref = 0; // No sorting/grouping
+
+    // Create a literal constant node (following Const node pattern)
+    let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
+    const_node.consttype = pg_sys::INT4OID; // Type OID for int4
+    const_node.consttypmod = -1; // Standard typmod for int4
+    const_node.constcollid = pg_sys::InvalidOid; // No collation for integers
+    const_node.constlen = 4; // sizeof(int32)
+    const_node.constvalue = pg_sys::Datum::from(42i32);
+    const_node.constisnull = false;
+    const_node.constbyval = true; // int4 is passed by value
+
+    // Connect the constant to the target entry
+    target_entry.expr = const_node.into_pg() as *mut pg_sys::Expr;
+    target_entry.resname = create_c_string("result");
+
+    // Create target list (this becomes plan->targetlist)
+    let target_list = pg_sys::lappend(
+        std::ptr::null_mut(),
+        target_entry.into_pg() as *mut std::ffi::c_void,
+    );
+    result_node.plan.targetlist = target_list;
+
+    // Result-specific fields (following Result node pattern)
+    result_node.resconstantqual = std::ptr::null_mut(); // No constant qualification
+
+    pgrx::info!("DEBUG: Created PostgreSQL-compatible Result plan following planner patterns");
+
+    result_node.into_pg() as *mut pg_sys::Plan
+}
+
+/// Execute a plan using PostgreSQL's complete initialization sequence
+/// This follows ExecutorStart() patterns with PlannedStmt and QueryDesc
+unsafe fn execute_plan_with_proper_initialization(
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> pg_sys::Datum {
+    pgrx::info!("DEBUG: execute_plan_with_proper_initialization ENTRY");
+
+    // Check if this is the first call
+    let mut funcctx: *mut pg_sys::FuncCallContext;
+    if (*fcinfo).flinfo.is_null() || (*(*fcinfo).flinfo).fn_extra.is_null() {
+        pgrx::info!("DEBUG: SRF first call - using PostgreSQL's complete initialization sequence");
+
+        // Initialize multi-function call context
+        funcctx = pg_sys::init_MultiFuncCall(fcinfo);
+        let oldcontext = pg_sys::MemoryContextSwitchTo((*funcctx).multi_call_memory_ctx);
+
+        // Get call result type from AS clause
+        let mut result_type_id: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut result_tuple_desc: *mut pg_sys::TupleDescData = std::ptr::null_mut();
+
+        let type_class =
+            pg_sys::get_call_result_type(fcinfo, &mut result_type_id, &mut result_tuple_desc);
+        if type_class != pg_sys::TypeFuncClass::TYPEFUNC_COMPOSITE || result_tuple_desc.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("Function must return a composite type (SETOF RECORD with AS clause)");
+        }
+
+        // Create the plan tree
+        let plan_tree = create_minimal_literal_plan();
+        if plan_tree.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("Failed to create plan tree");
+        }
+
+        // Create PlannedStmt wrapper (required by ExecutorStart)
+        let mut planned_stmt = pgrx::PgBox::<pg_sys::PlannedStmt>::alloc0();
+        planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
+        planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+        planned_stmt.canSetTag = false;
+        planned_stmt.utilityStmt = std::ptr::null_mut();
+        planned_stmt.planTree = plan_tree;
+        planned_stmt.rtable = std::ptr::null_mut(); // Empty range table for literals
+        planned_stmt.resultRelations = std::ptr::null_mut();
+        planned_stmt.subplans = std::ptr::null_mut();
+        planned_stmt.rewindPlanIDs = std::ptr::null_mut();
+        planned_stmt.rowMarks = std::ptr::null_mut();
+        planned_stmt.relationOids = std::ptr::null_mut();
+        planned_stmt.invalItems = std::ptr::null_mut();
+        planned_stmt.paramExecTypes = std::ptr::null_mut();
+        planned_stmt.hasReturning = false;
+        planned_stmt.hasModifyingCTE = false;
+        // hasRowSecurity not available in PostgreSQL 15
+        planned_stmt.parallelModeNeeded = false;
+
+        // Create QueryDesc (required by ExecutorStart)
+        let mut query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+        query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+        query_desc.plannedstmt = planned_stmt.into_pg();
+        query_desc.sourceText = create_c_string("SELECT 42");
+        query_desc.snapshot = pg_sys::GetActiveSnapshot();
+        query_desc.crosscheck_snapshot = std::ptr::null_mut();
+        query_desc.dest = std::ptr::null_mut(); // We'll handle output ourselves
+        query_desc.params = std::ptr::null_mut();
+        query_desc.queryEnv = std::ptr::null_mut();
+        query_desc.instrument_options = 0;
+        query_desc.tupDesc = std::ptr::null_mut();
+        query_desc.estate = std::ptr::null_mut();
+        query_desc.planstate = std::ptr::null_mut();
+        query_desc.already_executed = false;
+        query_desc.totaltime = std::ptr::null_mut();
+
+        pgrx::info!("DEBUG: Created PlannedStmt and QueryDesc, calling ExecutorStart");
+
+        // Use PostgreSQL's standard ExecutorStart
+        pg_sys::ExecutorStart(query_desc.as_ptr(), 0);
+
+        // Get the estate and plan state from the initialized query
+        let estate = (*query_desc).estate;
+        let plan_state = (*query_desc).planstate;
+
+        if estate.is_null() || plan_state.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("ExecutorStart failed to initialize estate or planstate");
+        }
+
+        pgrx::info!(
+            "DEBUG: ExecutorStart succeeded, estate: {:p}, planstate: {:p}",
+            estate,
+            plan_state
+        );
+
+        // Execute the plan to get results
+        let mut tuplestore = pg_sys::tuplestore_begin_heap(false, false, pg_sys::work_mem as i32);
+
+        pgrx::info!("DEBUG: About to execute plan nodes directly");
+
+        // Don't call ExecutorRun for SRF - it expects a destination
+        // Instead, directly execute the plan node
+
+        // Get results from the plan state directly
+        // The plan state was initialized by ExecutorStart
+        loop {
+            pgrx::info!(
+                "DEBUG: About to call ExecProcNode on planstate: {:p}",
+                plan_state
+            );
+            let slot = pg_sys::ExecProcNode(plan_state);
+
+            if slot.is_null() {
+                pgrx::info!("DEBUG: ExecProcNode returned null slot");
+                break;
+            }
+
+            // Check if slot is empty using the flags
+            if ((*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16) != 0 {
+                pgrx::info!("DEBUG: Slot is empty (TTS_FLAG_EMPTY set)");
+                break;
+            }
+
+            pgrx::info!("DEBUG: Got valid slot from ExecProcNode, storing in tuplestore");
+
+            // Store the tuple in our tuplestore
+            pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        }
+
+        // Clean up executor
+        pg_sys::ExecutorFinish(query_desc.as_ptr());
+        pg_sys::ExecutorEnd(query_desc.as_ptr());
+
+        // Store tuplestore in function context
+        (*funcctx).user_fctx = tuplestore as *mut std::ffi::c_void;
+
+        // Use the blessed result tuple descriptor from AS clause
+        let blessed_desc = pg_sys::BlessTupleDesc(result_tuple_desc);
+        (*funcctx).tuple_desc = blessed_desc;
+
+        // Set up for iteration
+        (*funcctx).max_calls = u64::MAX;
+        (*funcctx).call_cntr = 0;
+
+        // Reset tuplestore for reading
+        pg_sys::tuplestore_rescan(tuplestore);
+
+        pg_sys::MemoryContextSwitchTo(oldcontext);
+    } else {
+        // Per-call setup
+        funcctx = (*(*fcinfo).flinfo).fn_extra as *mut pg_sys::FuncCallContext;
+    }
+
+    // Get tuplestore from context
+    let tuplestore = (*funcctx).user_fctx as *mut pg_sys::Tuplestorestate;
+    let blessed_desc = (*funcctx).tuple_desc;
+    let slot = pg_sys::MakeTupleTableSlot(blessed_desc, &pg_sys::TTSOpsMinimalTuple);
+
+    if pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
+        pgrx::info!(
+            "DEBUG: Retrieved tuple from tuplestore using PostgreSQL's proper initialization"
+        );
+
+        // Debug the blessed descriptor before conversion
+        if !blessed_desc.is_null() {
+            pgrx::info!(
+                "DEBUG: Blessed desc tdtypeid: {}, tdtypmod: {}",
+                (*blessed_desc).tdtypeid.to_u32(),
+                (*blessed_desc).tdtypmod
+            );
+        }
+
+        // For SETOF RECORD, we need to return the tuple values directly
+        // Build a composite datum from the slot
+        let mut values: Vec<pg_sys::Datum> = Vec::new();
+        let mut nulls: Vec<bool> = Vec::new();
+
+        // Extract values from the slot
+        let natts = (*blessed_desc).natts as usize;
+        pgrx::info!("DEBUG: Extracting {} attributes from slot", natts);
+
+        for i in 0..natts {
+            let mut isnull = false;
+            let datum = pg_sys::slot_getattr(slot, (i + 1) as i32, &mut isnull);
+            values.push(datum);
+            nulls.push(isnull);
+            pgrx::info!(
+                "DEBUG: Attribute {}: datum={}, isnull={}",
+                i,
+                datum.value(),
+                isnull
+            );
+        }
+
+        // Build composite datum using HeapTupleHeaderData
+        let heap_tuple = pg_sys::heap_form_tuple(
+            blessed_desc,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr() as *mut bool,
+        );
+
+        if !heap_tuple.is_null() {
+            pgrx::info!(
+                "DEBUG: Created heap tuple at {:p} using heap_form_tuple",
+                heap_tuple
+            );
+
+            // For SETOF RECORD, we need to return HeapTupleHeaderData, not the full tuple
+            // This matches what PostgreSQL expects for composite type returns
+            let tuple_header = (*heap_tuple).t_data;
+            if !tuple_header.is_null() {
+                // HeapTupleHeaderGetDatum is: #define HeapTupleHeaderGetDatum(tup) PointerGetDatum(tup)
+                let result = pg_sys::Datum::from(tuple_header as usize);
+
+                pgrx::info!(
+                    "DEBUG: Returning composite datum from header: {}",
+                    result.value()
+                );
+
+                pg_sys::ExecDropSingleTupleTableSlot(slot);
+                (*funcctx).call_cntr += 1;
+                (*fcinfo).isnull = false;
+                return result;
+            }
+        }
+    }
+
+    // End of results
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+    pg_sys::end_MultiFuncCall(fcinfo, funcctx);
+    (*fcinfo).isnull = true;
+    pg_sys::Datum::from(0)
+}
+
+/// Create a SeqScan plan that scans an actual table
+unsafe fn create_seqscan_plan(table_oid: pg_sys::Oid) -> (*mut pg_sys::Plan, *mut pg_sys::List) {
+    pgrx::info!(
+        "DEBUG: create_seqscan_plan ENTRY - creating SeqScan for table OID {}",
+        table_oid
+    );
+
+    // Create RangeTblEntry for the table
+    let mut rte = pgrx::PgBox::<pg_sys::RangeTblEntry>::alloc0();
+    rte.type_ = pg_sys::NodeTag::T_RangeTblEntry;
+    rte.rtekind = pg_sys::RTEKind::RTE_RELATION;
+    rte.relid = table_oid;
+    rte.relkind = 'r' as std::os::raw::c_char; // ordinary table
+    rte.lateral = false;
+    rte.inh = true; // include inheritance
+    rte.inFromCl = true;
+    rte.requiredPerms = pg_sys::ACL_SELECT;
+
+    // Create range table list
+    let range_table = pg_sys::lappend(std::ptr::null_mut(), rte.into_pg() as *mut std::ffi::c_void);
+
+    // Create SeqScan node
+    let mut seqscan = pgrx::PgBox::<pg_sys::SeqScan>::alloc0();
+    seqscan.scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+    seqscan.scan.scanrelid = 1; // Index into range table (1-based)
+
+    // Get table info to set up costs
+    let rel = pg_sys::table_open(table_oid, pg_sys::AccessShareLock as i32);
+    if !rel.is_null() {
+        seqscan.scan.plan.startup_cost = 0.0;
+        seqscan.scan.plan.total_cost = (*(*rel).rd_rel).relpages as f64 * pg_sys::seq_page_cost;
+        seqscan.scan.plan.plan_rows = (*(*rel).rd_rel).reltuples as f64;
+        seqscan.scan.plan.plan_width = 4; // Assume int4 for now
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
+    }
+
+    seqscan.scan.plan.parallel_aware = false;
+    seqscan.scan.plan.parallel_safe = true;
+    seqscan.scan.plan.plan_node_id = 1;
+    seqscan.scan.plan.qual = std::ptr::null_mut();
+
+    // Create target list - just return the first column for simplicity
+    let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+    target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+    target_entry.resno = 1;
+    target_entry.resjunk = false;
+
+    // Create a Var node to reference the first column (relname of pg_class)
+    let mut var_node = pgrx::PgBox::<pg_sys::Var>::alloc0();
+    var_node.xpr.type_ = pg_sys::NodeTag::T_Var;
+    var_node.varno = 1; // Reference to first RTE
+    var_node.varattno = 2; // Second column (relname) - 1 is OID
+    var_node.vartype = pg_sys::NAMEOID; // 'name' type for relname column
+    var_node.vartypmod = -1;
+    var_node.varcollid = pg_sys::InvalidOid;
+    var_node.varlevelsup = 0;
+    var_node.varnosyn = 1;
+    var_node.varattnosyn = 1;
+
+    target_entry.expr = var_node.into_pg() as *mut pg_sys::Expr;
+    target_entry.resname = create_c_string("col1");
+
+    let target_list = pg_sys::lappend(
+        std::ptr::null_mut(),
+        target_entry.into_pg() as *mut std::ffi::c_void,
+    );
+    seqscan.scan.plan.targetlist = target_list;
+
+    // Set basic cost estimates (required for plan execution)
+    seqscan.scan.plan.startup_cost = 0.0;
+    seqscan.scan.plan.total_cost = 100.0;
+    seqscan.scan.plan.plan_rows = 100.0;
+    seqscan.scan.plan.plan_width = 64; // name type width
+
+    pgrx::info!("DEBUG: Created SeqScan plan for table OID {}", table_oid);
+
+    (seqscan.into_pg() as *mut pg_sys::Plan, range_table)
+}
+
+/// Test SRF with SeqScan plan - scans an actual table
+#[no_mangle]
+pub unsafe extern "C" fn test_seqscan_srf_direct(
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> pg_sys::Datum {
+    pgrx::info!(
+        "DEBUG: test_seqscan_srf_direct ENTRY - testing SeqScan with PostgreSQL's initialization"
+    );
+
+    // Use a test table OID - we'll need to create this table first
+    // For now, let's check if pg_class exists (OID 1259)
+    let table_oid = pg_sys::Oid::from(1259u32); // pg_class
+
+    // Create a wrapper that uses SeqScan
+    execute_seqscan_with_proper_initialization(fcinfo, table_oid)
+}
+
+// Add PG_FUNCTION_INFO_V1 for the C function
+#[no_mangle]
+pub extern "C" fn pg_finfo_test_seqscan_srf_direct() -> &'static pg_sys::Pg_finfo_record {
+    const INFO: pg_sys::Pg_finfo_record = pg_sys::Pg_finfo_record { api_version: 1 };
+    &INFO
+}
+
+/// Execute a SeqScan plan using PostgreSQL's complete initialization
+unsafe fn execute_seqscan_with_proper_initialization(
+    fcinfo: pg_sys::FunctionCallInfo,
+    table_oid: pg_sys::Oid,
+) -> pg_sys::Datum {
+    pgrx::info!(
+        "DEBUG: execute_seqscan_with_proper_initialization ENTRY for table {}",
+        table_oid
+    );
+
+    // Check if this is the first call
+    let mut funcctx: *mut pg_sys::FuncCallContext;
+    if (*fcinfo).flinfo.is_null() || (*(*fcinfo).flinfo).fn_extra.is_null() {
+        pgrx::info!("DEBUG: SRF first call - setting up SeqScan");
+
+        // Initialize multi-function call context
+        funcctx = pg_sys::init_MultiFuncCall(fcinfo);
+        let oldcontext = pg_sys::MemoryContextSwitchTo((*funcctx).multi_call_memory_ctx);
+
+        // Get call result type from AS clause
+        let mut result_type_id: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut result_tuple_desc: *mut pg_sys::TupleDescData = std::ptr::null_mut();
+
+        let type_class =
+            pg_sys::get_call_result_type(fcinfo, &mut result_type_id, &mut result_tuple_desc);
+        if type_class != pg_sys::TypeFuncClass::TYPEFUNC_COMPOSITE || result_tuple_desc.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("Function must return a composite type (SETOF RECORD with AS clause)");
+        }
+
+        // Create the SeqScan plan
+        let (plan_tree, range_table) = create_seqscan_plan(table_oid);
+        if plan_tree.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("Failed to create SeqScan plan");
+        }
+
+        // Create PlannedStmt wrapper
+        let mut planned_stmt = pgrx::PgBox::<pg_sys::PlannedStmt>::alloc0();
+        planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
+        planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+        planned_stmt.canSetTag = false;
+        planned_stmt.utilityStmt = std::ptr::null_mut();
+        planned_stmt.planTree = plan_tree;
+        planned_stmt.rtable = range_table;
+        planned_stmt.resultRelations = std::ptr::null_mut();
+        planned_stmt.subplans = std::ptr::null_mut();
+        planned_stmt.rewindPlanIDs = std::ptr::null_mut();
+        planned_stmt.rowMarks = std::ptr::null_mut();
+        // relationOids expects a list of OID values
+        let oid_datum = pg_sys::Datum::from(table_oid.to_u32());
+        planned_stmt.relationOids = pg_sys::lappend_oid(std::ptr::null_mut(), table_oid);
+        planned_stmt.invalItems = std::ptr::null_mut();
+        planned_stmt.paramExecTypes = std::ptr::null_mut();
+        planned_stmt.hasReturning = false;
+        planned_stmt.hasModifyingCTE = false;
+        planned_stmt.parallelModeNeeded = false;
+
+        // Create QueryDesc
+        let mut query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+        query_desc.operation = pg_sys::CmdType::CMD_SELECT;
+        query_desc.plannedstmt = planned_stmt.into_pg();
+        query_desc.sourceText = create_c_string("SELECT col1 FROM test_table");
+        query_desc.snapshot = pg_sys::GetActiveSnapshot();
+        query_desc.crosscheck_snapshot = std::ptr::null_mut();
+        query_desc.dest = std::ptr::null_mut();
+        query_desc.params = std::ptr::null_mut();
+        query_desc.queryEnv = std::ptr::null_mut();
+        query_desc.instrument_options = 0;
+        query_desc.tupDesc = std::ptr::null_mut();
+        query_desc.estate = std::ptr::null_mut();
+        query_desc.planstate = std::ptr::null_mut();
+        query_desc.already_executed = false;
+        query_desc.totaltime = std::ptr::null_mut();
+
+        pgrx::info!("DEBUG: Created PlannedStmt and QueryDesc for SeqScan, calling ExecutorStart");
+
+        // Use PostgreSQL's standard ExecutorStart
+        pg_sys::ExecutorStart(query_desc.as_ptr(), 0);
+
+        // Get the estate and plan state
+        let estate = (*query_desc).estate;
+        let plan_state = (*query_desc).planstate;
+
+        if estate.is_null() || plan_state.is_null() {
+            pg_sys::MemoryContextSwitchTo(oldcontext);
+            pgrx::error!("ExecutorStart failed to initialize estate or planstate");
+        }
+
+        pgrx::info!("DEBUG: ExecutorStart succeeded for SeqScan");
+
+        // Execute the plan to get results
+        let mut tuplestore = pg_sys::tuplestore_begin_heap(false, false, pg_sys::work_mem as i32);
+
+        // Get results from the plan state directly
+        let mut count = 0;
+        loop {
+            let slot = pg_sys::ExecProcNode(plan_state);
+            if slot.is_null() || ((*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16) != 0 {
+                break;
+            }
+
+            pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+            count += 1;
+
+            // Limit to 10 rows for testing
+            if count >= 10 {
+                break;
+            }
+        }
+
+        pgrx::info!("DEBUG: SeqScan collected {} tuples", count);
+
+        // Clean up executor
+        pg_sys::ExecutorFinish(query_desc.as_ptr());
+        pg_sys::ExecutorEnd(query_desc.as_ptr());
+
+        // Store tuplestore in function context
+        (*funcctx).user_fctx = tuplestore as *mut std::ffi::c_void;
+
+        // Use the blessed result tuple descriptor from AS clause
+        let blessed_desc = pg_sys::BlessTupleDesc(result_tuple_desc);
+        (*funcctx).tuple_desc = blessed_desc;
+
+        // Set up for iteration
+        (*funcctx).max_calls = u64::MAX;
+        (*funcctx).call_cntr = 0;
+
+        // Reset tuplestore for reading
+        pg_sys::tuplestore_rescan(tuplestore);
+
+        pg_sys::MemoryContextSwitchTo(oldcontext);
+    } else {
+        // Per-call setup
+        funcctx = (*(*fcinfo).flinfo).fn_extra as *mut pg_sys::FuncCallContext;
+    }
+
+    // Get tuplestore from context and return tuples (same pattern as the working function)
+    let tuplestore = (*funcctx).user_fctx as *mut pg_sys::Tuplestorestate;
+    let blessed_desc = (*funcctx).tuple_desc;
+    let slot = pg_sys::MakeTupleTableSlot(blessed_desc, &pg_sys::TTSOpsMinimalTuple);
+
+    if pg_sys::tuplestore_gettupleslot(tuplestore, true, false, slot) {
+        pgrx::info!("DEBUG: Retrieved tuple from SeqScan tuplestore");
+
+        // Debug the blessed descriptor before conversion
+        if !blessed_desc.is_null() {
+            pgrx::info!(
+                "DEBUG: SeqScan blessed desc tdtypeid: {}, tdtypmod: {}",
+                (*blessed_desc).tdtypeid.to_u32(),
+                (*blessed_desc).tdtypmod
+            );
+        }
+
+        // For SETOF RECORD, extract values and build composite datum
+        let mut values: Vec<pg_sys::Datum> = Vec::new();
+        let mut nulls: Vec<bool> = Vec::new();
+
+        // Extract values from the slot
+        let natts = (*blessed_desc).natts as usize;
+        pgrx::info!("DEBUG: SeqScan extracting {} attributes from slot", natts);
+
+        for i in 0..natts {
+            let mut isnull = false;
+            let datum = pg_sys::slot_getattr(slot, (i + 1) as i32, &mut isnull);
+            values.push(datum);
+            nulls.push(isnull);
+            pgrx::info!(
+                "DEBUG: SeqScan attribute {}: datum={}, isnull={}",
+                i,
+                datum.value(),
+                isnull
+            );
+        }
+
+        // Build composite datum using HeapTupleHeaderData
+        let heap_tuple = pg_sys::heap_form_tuple(
+            blessed_desc,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr() as *mut bool,
+        );
+
+        if !heap_tuple.is_null() {
+            pgrx::info!(
+                "DEBUG: SeqScan created heap tuple at {:p} using heap_form_tuple",
+                heap_tuple
+            );
+
+            // For SETOF RECORD, return HeapTupleHeaderData
+            let tuple_header = (*heap_tuple).t_data;
+            if !tuple_header.is_null() {
+                let result = pg_sys::Datum::from(tuple_header as usize);
+
+                pgrx::info!(
+                    "DEBUG: SeqScan returning composite datum from header: {}",
+                    result.value()
+                );
+
+                pg_sys::ExecDropSingleTupleTableSlot(slot);
+                (*funcctx).call_cntr += 1;
+                (*fcinfo).isnull = false;
+                return result;
+            }
+        }
+    }
+
+    // End of results
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+    pg_sys::end_MultiFuncCall(fcinfo, funcctx);
+    (*fcinfo).isnull = true;
+    pg_sys::Datum::from(0)
+}
+
+/// Helper to create a null-terminated C string
+unsafe fn create_c_string(s: &str) -> *mut std::os::raw::c_char {
+    let len = s.len();
+    let c_str = pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<u8>(len + 1);
+    std::ptr::copy_nonoverlapping(s.as_ptr(), c_str.as_mut_ptr(), len);
+    *c_str.as_mut_ptr().add(len) = 0; // null terminate
+    c_str.as_mut_ptr() as *mut std::os::raw::c_char
 }
