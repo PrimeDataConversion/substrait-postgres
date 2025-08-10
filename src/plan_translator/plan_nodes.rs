@@ -20,7 +20,6 @@ pub unsafe fn create_values_scan_node(
     result_node.plan.plan_width = 32;
     result_node.plan.parallel_aware = false;
     result_node.plan.parallel_safe = true;
-    result_node.plan.async_capable = false;
     result_node.plan.plan_node_id = 0;
     result_node.plan.qual = std::ptr::null_mut();
     result_node.plan.targetlist = std::ptr::null_mut();
@@ -48,7 +47,6 @@ pub unsafe fn create_result_node_with_target_list(
     result_node.plan.plan_width = 32;
     result_node.plan.parallel_aware = false;
     result_node.plan.parallel_safe = true;
-    result_node.plan.async_capable = false;
     result_node.plan.plan_node_id = 0;
     result_node.plan.qual = std::ptr::null_mut();
     result_node.plan.targetlist = target_list;
@@ -66,49 +64,23 @@ pub unsafe fn create_values_scan_with_target_list(
     let values_scan = PgBox::<pg_sys::ValuesScan>::alloc0();
     let values_scan = values_scan.into_pg();
 
-    // Set up the scan portion (for PostgreSQL 15+)
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-    {
-        (*values_scan).scan.plan.type_ = pg_sys::NodeTag::T_ValuesScan;
-        (*values_scan).scan.plan.lefttree = std::ptr::null_mut();
-        (*values_scan).scan.plan.righttree = std::ptr::null_mut();
-        (*values_scan).scan.plan.initPlan = std::ptr::null_mut();
-        (*values_scan).scan.plan.extParam = std::ptr::null_mut();
-        (*values_scan).scan.plan.allParam = std::ptr::null_mut();
-        (*values_scan).scan.plan.startup_cost = 0.0;
-        (*values_scan).scan.plan.total_cost = 1.0;
-        (*values_scan).scan.plan.plan_rows = 1.0;
-        (*values_scan).scan.plan.plan_width = 32;
-        (*values_scan).scan.plan.parallel_aware = false;
-        (*values_scan).scan.plan.parallel_safe = true;
-        (*values_scan).scan.plan.async_capable = false;
-        (*values_scan).scan.plan.plan_node_id = 0;
-        (*values_scan).scan.plan.qual = std::ptr::null_mut();
-        (*values_scan).scan.plan.targetlist = target_list;
-        (*values_scan).scan.scanrelid = 0; // No base relation
-    }
-
-    // For PostgreSQL 13/14 (different structure)
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    {
-        (*values_scan).plan.type_ = pg_sys::NodeTag::T_ValuesScan;
-        (*values_scan).plan.lefttree = std::ptr::null_mut();
-        (*values_scan).plan.righttree = std::ptr::null_mut();
-        (*values_scan).plan.initPlan = std::ptr::null_mut();
-        (*values_scan).plan.extParam = std::ptr::null_mut();
-        (*values_scan).plan.allParam = std::ptr::null_mut();
-        (*values_scan).plan.startup_cost = 0.0;
-        (*values_scan).plan.total_cost = 1.0;
-        (*values_scan).plan.plan_rows = 1.0;
-        (*values_scan).plan.plan_width = 32;
-        (*values_scan).plan.parallel_aware = false;
-        (*values_scan).plan.parallel_safe = true;
-        (*values_scan).plan.async_capable = false;
-        (*values_scan).plan.plan_node_id = 0;
-        (*values_scan).plan.qual = std::ptr::null_mut();
-        (*values_scan).plan.targetlist = target_list;
-        (*values_scan).scanrelid = 0; // No base relation
-    }
+    // Set up the scan portion
+    (*values_scan).scan.plan.type_ = pg_sys::NodeTag::T_ValuesScan;
+    (*values_scan).scan.plan.lefttree = std::ptr::null_mut();
+    (*values_scan).scan.plan.righttree = std::ptr::null_mut();
+    (*values_scan).scan.plan.initPlan = std::ptr::null_mut();
+    (*values_scan).scan.plan.extParam = std::ptr::null_mut();
+    (*values_scan).scan.plan.allParam = std::ptr::null_mut();
+    (*values_scan).scan.plan.startup_cost = 0.0;
+    (*values_scan).scan.plan.total_cost = 1.0;
+    (*values_scan).scan.plan.plan_rows = 1.0;
+    (*values_scan).scan.plan.plan_width = 32;
+    (*values_scan).scan.plan.parallel_aware = false;
+    (*values_scan).scan.plan.parallel_safe = true;
+    (*values_scan).scan.plan.plan_node_id = 0;
+    (*values_scan).scan.plan.qual = std::ptr::null_mut();
+    (*values_scan).scan.plan.targetlist = target_list;
+    (*values_scan).scan.scanrelid = 0; // No base relation
 
     // Create a values list from the target entries
     let mut values_lists: *mut pg_sys::List = std::ptr::null_mut();
@@ -131,10 +103,7 @@ pub unsafe fn create_values_scan_with_target_list(
     values_lists = pg_sys::lappend(values_lists, row_values as *mut std::ffi::c_void);
     (*values_scan).values_lists = values_lists;
 
-    // Return the correct Plan pointer based on PostgreSQL version
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    let plan_ptr = &mut (*values_scan).plan as *mut pg_sys::Plan;
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    // Return the Plan pointer
     let plan_ptr = &mut (*values_scan).scan.plan as *mut pg_sys::Plan;
 
     Ok(plan_ptr)
@@ -171,57 +140,28 @@ unsafe fn create_seqscan_with_postgresql_stats(
     // Close the relation
     pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
 
-    // Set up the SeqScan node with PostgreSQL version compatibility
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    {
-        // Set node tag FIRST (critical for ExecInitNode dispatch)
-        seqscan_node.plan.type_ = pg_sys::NodeTag::T_SeqScan;
+    // Set up the SeqScan node
+    // Set node tag FIRST (critical for ExecInitNode dispatch)
+    seqscan_node.scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
 
-        // Set the critical SeqScan fields
-        seqscan_node.plan.targetlist = target_list;
-        seqscan_node.plan.qual = std::ptr::null_mut(); // No qualification
-        seqscan_node.scanrelid = scanrelid; // Critical: 1-based index into range table
+    // Set the critical SeqScan fields
+    seqscan_node.scan.plan.targetlist = target_list;
+    seqscan_node.scan.plan.qual = std::ptr::null_mut(); // No qualification
+    seqscan_node.scan.scanrelid = scanrelid; // Critical: 1-based index into range table
 
-        // Initialize base Plan fields with PostgreSQL's estimates
-        seqscan_node.plan.lefttree = std::ptr::null_mut();
-        seqscan_node.plan.righttree = std::ptr::null_mut();
-        seqscan_node.plan.initPlan = std::ptr::null_mut();
-        seqscan_node.plan.extParam = std::ptr::null_mut();
-        seqscan_node.plan.allParam = std::ptr::null_mut();
-        seqscan_node.plan.startup_cost = 0.0;
-        seqscan_node.plan.total_cost = 1.0;
-        seqscan_node.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
-        seqscan_node.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
-        seqscan_node.plan.parallel_aware = false;
-        seqscan_node.plan.parallel_safe = true;
-        seqscan_node.plan.async_capable = false;
-        seqscan_node.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
-    }
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-    {
-        // Set node tag FIRST (critical for ExecInitNode dispatch)
-        seqscan_node.scan.plan.type_ = pg_sys::NodeTag::T_SeqScan;
-
-        // Set the critical SeqScan fields
-        seqscan_node.scan.plan.targetlist = target_list;
-        seqscan_node.scan.plan.qual = std::ptr::null_mut(); // No qualification
-        seqscan_node.scan.scanrelid = scanrelid; // Critical: 1-based index into range table
-
-        // Initialize base Plan fields with PostgreSQL's estimates
-        seqscan_node.scan.plan.lefttree = std::ptr::null_mut();
-        seqscan_node.scan.plan.righttree = std::ptr::null_mut();
-        seqscan_node.scan.plan.initPlan = std::ptr::null_mut();
-        seqscan_node.scan.plan.extParam = std::ptr::null_mut();
-        seqscan_node.scan.plan.allParam = std::ptr::null_mut();
-        seqscan_node.scan.plan.startup_cost = 0.0;
-        seqscan_node.scan.plan.total_cost = 1.0;
-        seqscan_node.scan.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
-        seqscan_node.scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
-        seqscan_node.scan.plan.parallel_aware = false;
-        seqscan_node.scan.plan.parallel_safe = true;
-        seqscan_node.scan.plan.async_capable = false;
-        seqscan_node.scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
-    }
+    // Initialize base Plan fields with PostgreSQL's estimates
+    seqscan_node.scan.plan.lefttree = std::ptr::null_mut();
+    seqscan_node.scan.plan.righttree = std::ptr::null_mut();
+    seqscan_node.scan.plan.initPlan = std::ptr::null_mut();
+    seqscan_node.scan.plan.extParam = std::ptr::null_mut();
+    seqscan_node.scan.plan.allParam = std::ptr::null_mut();
+    seqscan_node.scan.plan.startup_cost = 0.0;
+    seqscan_node.scan.plan.total_cost = 1.0;
+    seqscan_node.scan.plan.plan_rows = tuples; // Use PostgreSQL's cardinality estimate
+    seqscan_node.scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
+    seqscan_node.scan.plan.parallel_aware = false;
+    seqscan_node.scan.plan.parallel_safe = true;
+    seqscan_node.scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
 
     seqscan_node.into_pg()
 }
@@ -279,35 +219,10 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
     (*rte).functions = std::ptr::null_mut();
     (*rte).funcordinality = false;
 
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        // Set permissions fields for older PostgreSQL versions (< 16)
-        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-        {
-            (*rte).requiredPerms = pg_sys::ACL_SELECT;
-            (*rte).checkAsUser = pg_sys::InvalidOid;
-            pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
-                (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
-        }
-        #[cfg(not(any(feature = "pg13", feature = "pg14", feature = "pg15")))]
-        {
-            // PostgreSQL 16+ handles permissions differently
-            pgrx::info!(
-                "DEBUG: RTE configured following PostgreSQL 16+ pattern with rtekind={:?}",
-                (*rte).rtekind
-            );
-        }
-    }
-    #[cfg(any(feature = "pg16", feature = "pg17"))]
-    {
-        pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern (permission fields in RTEPermissionInfo), rtekind={:?}",
-            (*rte).rtekind);
-    }
+    pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern (permission fields in RTEPermissionInfo), rtekind={:?}",
+        (*rte).rtekind);
 
-    // Return the correct Plan pointer based on PostgreSQL version
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    let plan_ptr = &mut (*seqscan_node).plan as *mut pg_sys::Plan;
-    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    // Return the Plan pointer
     let plan_ptr = &mut (*seqscan_node).scan.plan as *mut pg_sys::Plan;
 
     Ok((plan_ptr, rte))
@@ -372,13 +287,7 @@ unsafe fn create_range_table_entry(
     (*rte).lateral = false;
     (*rte).inh = true; // Include inheritance
     (*rte).inFromCl = true; // This table is in the FROM clause
-                            // Set permissions fields for older PostgreSQL versions (< 16)
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        (*rte).requiredPerms = pg_sys::ACL_SELECT;
-        (*rte).checkAsUser = pg_sys::InvalidOid; // Use current user
-    }
-    // PostgreSQL 16+ handles permissions differently
+                            // PostgreSQL 16+ handles permissions differently (through RTEPermissionInfo)
 
     // Create an alias for the table
     let alias = PgBox::<pg_sys::Alias>::alloc0();
@@ -389,19 +298,6 @@ unsafe fn create_range_table_entry(
     (*rte).eref = alias;
     (*rte).alias = std::ptr::null_mut(); // No explicit alias
 
-    // Initialize other fields - version dependent
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        // Set column-level permission fields for older PostgreSQL versions (< 16)
-        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-        {
-            (*rte).selectedCols = std::ptr::null_mut();
-            (*rte).insertedCols = std::ptr::null_mut();
-            (*rte).updatedCols = std::ptr::null_mut();
-            (*rte).extraUpdatedCols = std::ptr::null_mut();
-        }
-        // PostgreSQL 16+ handles column permissions differently
-    }
     // For pg16+, these fields are in RTEPermissionInfo which is managed separately
     (*rte).securityQuals = std::ptr::null_mut();
 
@@ -790,7 +686,6 @@ pub unsafe fn create_sort_node(
     (*sort_node).plan.plan_width = (*input_plan).plan_width;
     (*sort_node).plan.parallel_aware = (*input_plan).parallel_aware;
     (*sort_node).plan.parallel_safe = (*input_plan).parallel_safe;
-    (*sort_node).plan.async_capable = (*input_plan).async_capable;
     (*sort_node).plan.plan_node_id = 0;
 
     eprintln!("DEBUG: Basic Sort plan fields set");
@@ -881,7 +776,6 @@ pub unsafe fn create_limit_node_with_expressions(
     (*limit_node).plan.plan_width = 32;
     (*limit_node).plan.parallel_aware = false;
     (*limit_node).plan.parallel_safe = true;
-    (*limit_node).plan.async_capable = false;
     (*limit_node).plan.plan_node_id = 0;
     (*limit_node).plan.qual = std::ptr::null_mut();
 
@@ -927,7 +821,6 @@ pub unsafe fn create_filter_node(
     result_node.plan.plan_width = 32;
     result_node.plan.parallel_aware = false;
     result_node.plan.parallel_safe = true;
-    result_node.plan.async_capable = false;
     result_node.plan.plan_node_id = 0;
 
     // Pass through the target list from input
@@ -963,7 +856,6 @@ pub unsafe fn create_cross_join_node(
     (*nestloop_node).join.plan.plan_width = 64;
     (*nestloop_node).join.plan.parallel_aware = false;
     (*nestloop_node).join.plan.parallel_safe = true;
-    (*nestloop_node).join.plan.async_capable = false;
     (*nestloop_node).join.plan.plan_node_id = 0;
     (*nestloop_node).join.plan.qual = std::ptr::null_mut();
 
@@ -1004,7 +896,6 @@ pub unsafe fn create_join_node(
     (*nestloop_node).join.plan.plan_width = 64;
     (*nestloop_node).join.plan.parallel_aware = false;
     (*nestloop_node).join.plan.parallel_safe = true;
-    (*nestloop_node).join.plan.async_capable = false;
     (*nestloop_node).join.plan.plan_node_id = 0;
     (*nestloop_node).join.plan.qual = std::ptr::null_mut();
 

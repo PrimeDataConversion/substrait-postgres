@@ -188,11 +188,7 @@ pub unsafe fn execute_plan_directly_raw(
     (*estate).es_instrument = 0;
     (*estate).es_top_eflags = 0;
     (*estate).es_processed = 0;
-    // es_lastoid only exists in older PostgreSQL versions
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        (*estate).es_lastoid = pg_sys::InvalidOid;
-    }
+    // es_lastoid doesn't exist in PostgreSQL 17
 
     (*query_desc_ptr).estate = estate;
 
@@ -659,11 +655,7 @@ pub unsafe fn execute_plan_directly(
     (*estate).es_instrument = 0;
     (*estate).es_top_eflags = 0;
     (*estate).es_processed = 0;
-    // es_lastoid only exists in older PostgreSQL versions
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        (*estate).es_lastoid = pg_sys::InvalidOid;
-    }
+    // es_lastoid doesn't exist in PostgreSQL 17
 
     (*query_desc_ptr).estate = estate;
 

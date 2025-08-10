@@ -250,15 +250,7 @@ unsafe fn collect_seqscan_nodes_recursive(
 
             // Update the SeqScan node to use the correct scanrelid
             let seqscan = plan as *mut pg_sys::SeqScan;
-
-            #[cfg(any(feature = "pg13", feature = "pg14"))]
-            {
-                (*seqscan).scanrelid = *current_scanrelid;
-            }
-            #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-            {
-                (*seqscan).scan.scanrelid = *current_scanrelid;
-            }
+            (*seqscan).scan.scanrelid = *current_scanrelid;
 
             eprintln!(
                 "DEBUG: Updated SeqScan scanrelid to {} for table OID {}",

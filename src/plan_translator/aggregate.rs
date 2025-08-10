@@ -52,7 +52,6 @@ impl AggNodeBuilder {
         (*node).plan.plan_width = 64; // Aggregate results are typically wider
         (*node).plan.parallel_aware = (*input_plan).parallel_aware;
         (*node).plan.parallel_safe = (*input_plan).parallel_safe;
-        (*node).plan.async_capable = (*input_plan).async_capable;
         (*node).plan.plan_node_id = 0;
         (*node).plan.qual = std::ptr::null_mut(); // Aggregates don't have quals
         (*node).plan.targetlist = std::ptr::null_mut();

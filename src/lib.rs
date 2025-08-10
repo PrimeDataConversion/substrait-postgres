@@ -3445,18 +3445,7 @@ unsafe fn create_seqscan_with_project_plan() -> (*mut pg_sys::Plan, *mut pg_sys:
     );
     rte.relkind = pg_sys::RELKIND_RELATION as ::std::os::raw::c_char;
     rte.rellockmode = pg_sys::AccessShareLock as i32;
-    // Set permissions fields for older PostgreSQL versions (< 16)
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        rte.requiredPerms = pg_sys::ACL_SELECT;
-        rte.checkAsUser = pg_sys::InvalidOid;
-        rte.selectedCols = std::ptr::null_mut();
-        rte.insertedCols = std::ptr::null_mut();
-        rte.updatedCols = std::ptr::null_mut();
-        rte.extraUpdatedCols = std::ptr::null_mut();
-        rte.securityQuals = std::ptr::null_mut();
-    }
-    // PostgreSQL 16+ handles permissions differently
+    // PostgreSQL 17 handles permissions differently - these fields don't exist
     rte.alias = std::ptr::null_mut();
     rte.eref = std::ptr::null_mut();
     rte.lateral = false;
@@ -3870,13 +3859,7 @@ unsafe fn create_seqscan_plan(table_oid: pg_sys::Oid) -> (*mut pg_sys::Plan, *mu
     rte.lateral = false;
     rte.inh = true; // include inheritance
     rte.inFromCl = true;
-    // Set permissions fields for older PostgreSQL versions (< 16)
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        rte.requiredPerms = pg_sys::ACL_SELECT;
-        rte.checkAsUser = pg_sys::InvalidOid; // Use current user
-    }
-    // PostgreSQL 16+ handles permissions differently
+    // PostgreSQL 17 handles permissions differently
 
     // Create an alias for the table (like working translation code)
     let mut alias = pgrx::PgBox::<pg_sys::Alias>::alloc0();
@@ -3887,16 +3870,7 @@ unsafe fn create_seqscan_plan(table_oid: pg_sys::Oid) -> (*mut pg_sys::Plan, *mu
     rte.alias = std::ptr::null_mut();
 
     // Initialize additional fields like working translation code
-    // Set column-level permission fields for older PostgreSQL versions (< 16)
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        rte.selectedCols = std::ptr::null_mut();
-        rte.insertedCols = std::ptr::null_mut();
-        rte.updatedCols = std::ptr::null_mut();
-        rte.extraUpdatedCols = std::ptr::null_mut();
-    }
-    // PostgreSQL 16+ handles column permissions differently
-    rte.securityQuals = std::ptr::null_mut();
+    // PostgreSQL 17 handles column permissions differently - no securityQuals field
 
     // Create range table list
     let range_table = pg_sys::lappend(std::ptr::null_mut(), rte.into_pg() as *mut std::ffi::c_void);
@@ -4333,13 +4307,7 @@ unsafe fn create_range_table_for_oid(table_oid: pg_sys::Oid) -> *mut pg_sys::Lis
     rte.lateral = false;
     rte.inh = true; // include inheritance
     rte.inFromCl = true;
-    // Set permissions fields for older PostgreSQL versions (< 16)
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        rte.requiredPerms = pg_sys::ACL_SELECT;
-        rte.checkAsUser = pg_sys::InvalidOid; // Use current user
-    }
-    // PostgreSQL 16+ handles permissions differently
+    // PostgreSQL 17 handles permissions differently
 
     // Create an alias for the table
     let mut alias = pgrx::PgBox::<pg_sys::Alias>::alloc0();
@@ -4350,16 +4318,7 @@ unsafe fn create_range_table_for_oid(table_oid: pg_sys::Oid) -> *mut pg_sys::Lis
     rte.alias = std::ptr::null_mut();
 
     // Initialize additional fields like working version
-    // Set column-level permission fields for older PostgreSQL versions (< 16)
-    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
-    {
-        rte.selectedCols = std::ptr::null_mut();
-        rte.insertedCols = std::ptr::null_mut();
-        rte.updatedCols = std::ptr::null_mut();
-        rte.extraUpdatedCols = std::ptr::null_mut();
-    }
-    // PostgreSQL 16+ handles column permissions differently
-    rte.securityQuals = std::ptr::null_mut();
+    // PostgreSQL 17 handles column permissions differently - no securityQuals field
 
     // Create range table list
     let range_table = pg_sys::lappend(std::ptr::null_mut(), rte.into_pg() as *mut std::ffi::c_void);

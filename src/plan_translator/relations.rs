@@ -227,7 +227,6 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 result_node.plan.plan_width = 32;
                 result_node.plan.parallel_aware = false;
                 result_node.plan.parallel_safe = true;
-                result_node.plan.async_capable = false;
                 result_node.plan.plan_node_id = 0;
                 result_node.plan.qual = std::ptr::null_mut();
 
