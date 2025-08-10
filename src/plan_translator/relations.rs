@@ -3,7 +3,7 @@ use super::expressions::{
     convert_expression_to_postgres_with_context, convert_expressions_to_target_list_with_schema,
 };
 use super::plan_nodes::*;
-use super::schema::{ColumnInfo, RelationSchema};
+use super::schema::RelationSchema;
 use crate::plan_translator::aggregate::create_aggregate_node;
 use anyhow::Result;
 use pgrx::pg_sys;
@@ -111,7 +111,7 @@ pub fn extract_table_name_from_named_table(
         .ok_or("NamedTable names list is empty")?
         .clone();
 
-    eprintln!("DEBUG: Extracted table name: {}", table_name);
+    eprintln!("DEBUG: Extracted table name: {table_name}");
     pgrx::info!("DEBUG: Extracted table name: {}", table_name);
 
     Ok(table_name)

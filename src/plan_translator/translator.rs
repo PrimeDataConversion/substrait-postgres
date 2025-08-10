@@ -195,10 +195,7 @@ unsafe fn collect_range_table_from_plan_tree(
     let mut range_table = std::ptr::null_mut::<pg_sys::List>();
     let mut current_scanrelid = 1u32;
 
-    eprintln!(
-        "DEBUG: collect_range_table_from_plan_tree starting with plan_tree: {:p}",
-        plan_tree
-    );
+    eprintln!("DEBUG: collect_range_table_from_plan_tree starting with plan_tree: {plan_tree:p}");
     pgrx::info!(
         "DEBUG: collect_range_table_from_plan_tree starting with plan_tree: {:p}",
         plan_tree
@@ -207,10 +204,7 @@ unsafe fn collect_range_table_from_plan_tree(
     // Traverse the plan tree and collect all SeqScan nodes with error handling
     collect_seqscan_nodes_recursive(plan_tree, &mut range_table, &mut current_scanrelid)?;
 
-    eprintln!(
-        "DEBUG: collect_range_table_from_plan_tree finished, range_table: {:p}",
-        range_table
-    );
+    eprintln!("DEBUG: collect_range_table_from_plan_tree finished, range_table: {range_table:p}");
     pgrx::info!(
         "DEBUG: collect_range_table_from_plan_tree finished, range_table: {:p}",
         range_table
@@ -232,10 +226,7 @@ unsafe fn collect_seqscan_nodes_recursive(
     }
 
     let node_type = (*plan).type_;
-    eprintln!(
-        "DEBUG: collect_seqscan_nodes_recursive - found node type: {:?}",
-        node_type
-    );
+    eprintln!("DEBUG: collect_seqscan_nodes_recursive - found node type: {node_type:?}");
     pgrx::info!(
         "DEBUG: collect_seqscan_nodes_recursive - found node type: {:?}",
         node_type
@@ -283,7 +274,7 @@ unsafe fn collect_seqscan_nodes_recursive(
         }
         _ => {
             // For other node types, recurse into child nodes
-            eprintln!("DEBUG: Node type {:?} - checking child nodes", node_type);
+            eprintln!("DEBUG: Node type {node_type:?} - checking child nodes");
             pgrx::info!("DEBUG: Node type {:?} - checking child nodes", node_type);
 
             if !(*plan).lefttree.is_null() {

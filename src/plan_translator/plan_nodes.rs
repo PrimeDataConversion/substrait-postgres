@@ -63,7 +63,7 @@ pub unsafe fn create_values_scan_with_target_list(
     target_list: *mut pg_sys::List,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     // Create a ValuesScan plan node specifically for literal values
-    let mut values_scan = PgBox::<pg_sys::ValuesScan>::alloc0();
+    let values_scan = PgBox::<pg_sys::ValuesScan>::alloc0();
     let values_scan = values_scan.into_pg();
 
     // Set up the scan portion (for PostgreSQL 15+)
@@ -281,10 +281,22 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
 
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
     {
-        (*rte).requiredPerms = pg_sys::ACL_SELECT;
-        (*rte).checkAsUser = pg_sys::InvalidOid;
-        pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
-            (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
+        // Set permissions fields for older PostgreSQL versions (< 16)
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+        {
+            (*rte).requiredPerms = pg_sys::ACL_SELECT;
+            (*rte).checkAsUser = pg_sys::InvalidOid;
+            pgrx::info!("DEBUG: RTE configured following PostgreSQL pattern with requiredPerms={}, checkAsUser={}, rtekind={:?}",
+                (*rte).requiredPerms, (*rte).checkAsUser, (*rte).rtekind);
+        }
+        #[cfg(not(any(feature = "pg13", feature = "pg14", feature = "pg15")))]
+        {
+            // PostgreSQL 16+ handles permissions differently
+            pgrx::info!(
+                "DEBUG: RTE configured following PostgreSQL 16+ pattern with rtekind={:?}",
+                (*rte).rtekind
+            );
+        }
     }
     #[cfg(any(feature = "pg16", feature = "pg17"))]
     {
@@ -312,7 +324,7 @@ unsafe fn lookup_table_oid(
     let table_cstring = create_cstring(table_name);
 
     // Use PostgreSQL's RangeVarGetRelid to look up the table
-    let mut range_var = PgBox::<pg_sys::RangeVar>::alloc0();
+    let range_var = PgBox::<pg_sys::RangeVar>::alloc0();
     let range_var = range_var.into_pg();
     (*range_var).relname = table_cstring;
     (*range_var).inh = true;
@@ -349,7 +361,7 @@ unsafe fn create_range_table_entry(
     );
 
     // Create RangeTblEntry
-    let mut rte = PgBox::<pg_sys::RangeTblEntry>::alloc0();
+    let rte = PgBox::<pg_sys::RangeTblEntry>::alloc0();
     let rte = rte.into_pg();
 
     (*rte).type_ = pg_sys::NodeTag::T_RangeTblEntry;
@@ -360,9 +372,16 @@ unsafe fn create_range_table_entry(
     (*rte).lateral = false;
     (*rte).inh = true; // Include inheritance
     (*rte).inFromCl = true; // This table is in the FROM clause
+                            // Set permissions fields for older PostgreSQL versions (< 16)
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+    {
+        (*rte).requiredPerms = pg_sys::ACL_SELECT;
+        (*rte).checkAsUser = pg_sys::InvalidOid; // Use current user
+    }
+    // PostgreSQL 16+ handles permissions differently
 
     // Create an alias for the table
-    let mut alias = PgBox::<pg_sys::Alias>::alloc0();
+    let alias = PgBox::<pg_sys::Alias>::alloc0();
     let alias = alias.into_pg();
     (*alias).type_ = pg_sys::NodeTag::T_Alias;
     (*alias).aliasname = create_cstring(table_name);
@@ -373,10 +392,15 @@ unsafe fn create_range_table_entry(
     // Initialize other fields - version dependent
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
     {
-        (*rte).selectedCols = std::ptr::null_mut();
-        (*rte).insertedCols = std::ptr::null_mut();
-        (*rte).updatedCols = std::ptr::null_mut();
-        (*rte).extraUpdatedCols = std::ptr::null_mut();
+        // Set column-level permission fields for older PostgreSQL versions (< 16)
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+        {
+            (*rte).selectedCols = std::ptr::null_mut();
+            (*rte).insertedCols = std::ptr::null_mut();
+            (*rte).updatedCols = std::ptr::null_mut();
+            (*rte).extraUpdatedCols = std::ptr::null_mut();
+        }
+        // PostgreSQL 16+ handles column permissions differently
     }
     // For pg16+, these fields are in RTEPermissionInfo which is managed separately
     (*rte).securityQuals = std::ptr::null_mut();
@@ -743,7 +767,7 @@ pub unsafe fn create_sort_node(
     }
 
     // Create a Sort plan node following PostgreSQL's make_sort pattern - safe allocation
-    let mut sort_node = pgrx::PgBox::<pg_sys::Sort>::alloc0();
+    let sort_node = pgrx::PgBox::<pg_sys::Sort>::alloc0();
     let sort_node_ptr = sort_node.as_ptr();
     eprintln!("DEBUG: Sort node allocated at: {sort_node_ptr:p}");
     pgrx::info!("DEBUG: Sort node allocated at: {:p}", sort_node_ptr);
@@ -925,7 +949,7 @@ pub unsafe fn create_cross_join_node(
     right_plan: *mut pg_sys::Plan,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     // Create a NestLoop plan node for Cartesian product (cross join) using safe allocation
-    let mut nestloop_node = pgrx::PgBox::<pg_sys::NestLoop>::alloc0();
+    let nestloop_node = pgrx::PgBox::<pg_sys::NestLoop>::alloc0();
     let nestloop_node = nestloop_node.into_pg();
     (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
     (*nestloop_node).join.plan.lefttree = left_plan;
@@ -966,7 +990,7 @@ pub unsafe fn create_join_node(
     join_qual: *mut pg_sys::List,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
     // Create a NestLoop plan node for the join using safe allocation
-    let mut nestloop_node = pgrx::PgBox::<pg_sys::NestLoop>::alloc0();
+    let nestloop_node = pgrx::PgBox::<pg_sys::NestLoop>::alloc0();
     let nestloop_node = nestloop_node.into_pg();
     (*nestloop_node).join.plan.type_ = pg_sys::NodeTag::T_NestLoop;
     (*nestloop_node).join.plan.lefttree = left_plan;
@@ -1015,7 +1039,7 @@ unsafe fn create_combined_target_list(
             let target_entry = pg_sys::list_nth(left_list, i as i32) as *mut pg_sys::TargetEntry;
 
             // Create a copy of the target entry with updated resno and varno
-            let mut new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
+            let new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
             let new_target_entry = new_target_entry.into_pg();
             *new_target_entry = *target_entry; // Copy the structure
             (*new_target_entry).resno = resno;
@@ -1044,7 +1068,7 @@ unsafe fn create_combined_target_list(
             let target_entry = pg_sys::list_nth(right_list, i as i32) as *mut pg_sys::TargetEntry;
 
             // Create a copy of the target entry with updated resno and varno
-            let mut new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
+            let new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
             let new_target_entry = new_target_entry.into_pg();
             *new_target_entry = *target_entry; // Copy the structure
             (*new_target_entry).resno = resno;

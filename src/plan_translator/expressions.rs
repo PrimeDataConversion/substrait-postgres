@@ -479,7 +479,7 @@ pub unsafe fn create_binary_op_expr(
     operator_oid: pg_sys::Oid,
     result_type: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let mut op_expr = PgBox::<pg_sys::OpExpr>::alloc0();
+    let op_expr = PgBox::<pg_sys::OpExpr>::alloc0();
     let op_expr = op_expr.into_pg();
     (*op_expr).xpr.type_ = pg_sys::NodeTag::T_OpExpr;
     (*op_expr).opno = operator_oid;
@@ -529,7 +529,7 @@ pub unsafe fn create_function_call_expr(
     result_type: pg_sys::Oid,
     arguments: &[*mut pg_sys::Expr],
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    let mut func_expr = PgBox::<pg_sys::FuncExpr>::alloc0();
+    let func_expr = PgBox::<pg_sys::FuncExpr>::alloc0();
     let func_expr = func_expr.into_pg();
     (*func_expr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
     (*func_expr).funcid = function_oid;
@@ -698,7 +698,7 @@ unsafe fn create_scalar_subquery_expr(
     }
 
     if let Some(rel) = &scalar_subquery.input {
-        let mut sublink = PgBox::<pg_sys::SubLink>::alloc0();
+        let sublink = PgBox::<pg_sys::SubLink>::alloc0();
         let sublink = sublink.into_pg();
         (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
         (*sublink).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK;
@@ -708,14 +708,14 @@ unsafe fn create_scalar_subquery_expr(
 
         let (plan_tree, range_table, _schema) =
             convert_rel_to_plan_tree_with_context(rel, function_map, None)?;
-        let mut query_node = PgBox::<pg_sys::Query>::alloc0();
+        let query_node = PgBox::<pg_sys::Query>::alloc0();
         let query_node = query_node.into_pg();
         (*query_node).type_ = pg_sys::NodeTag::T_Query;
         (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
         (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
         (*query_node).canSetTag = true;
         (*query_node).rtable = range_table;
-        let mut from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
+        let from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
         (*query_node).jointree = from_expr.into_pg();
         (*(*query_node).jointree).fromlist = range_table;
         (*(*query_node).jointree).quals = std::ptr::null_mut();
@@ -744,7 +744,7 @@ unsafe fn create_in_predicate_expr(
         return Err("IN predicate missing needles expression".into());
     }
 
-    let mut sublink = PgBox::<pg_sys::SubLink>::alloc0();
+    let sublink = PgBox::<pg_sys::SubLink>::alloc0();
     let sublink = sublink.into_pg();
     (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
     (*sublink).subLinkType = pg_sys::SubLinkType::ANY_SUBLINK; // Use ANY_SUBLINK for IN predicates
@@ -756,14 +756,14 @@ unsafe fn create_in_predicate_expr(
     let (plan_tree, range_table, _schema) =
         convert_rel_to_plan_tree_with_context(haystack_rel, function_map, None)?;
 
-    let mut query_node = PgBox::<pg_sys::Query>::alloc0();
+    let query_node = PgBox::<pg_sys::Query>::alloc0();
     let query_node = query_node.into_pg();
     (*query_node).type_ = pg_sys::NodeTag::T_Query;
     (*query_node).commandType = pg_sys::CmdType::CMD_SELECT;
     (*query_node).querySource = pg_sys::QuerySource::QSRC_PARSER;
     (*query_node).canSetTag = true;
     (*query_node).rtable = range_table; // Use the rtable from the translated plan_tree
-    let mut from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
+    let from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
     (*query_node).jointree = from_expr.into_pg();
     (*(*query_node).jointree).fromlist = range_table; // Use the rtable from the translated plan_tree
     (*(*query_node).jointree).quals = std::ptr::null_mut();
@@ -789,7 +789,7 @@ unsafe fn create_set_predicate_expr(
 ) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::subquery::set_predicate::PredicateOp;
 
-    let mut sublink = PgBox::<pg_sys::SubLink>::alloc0();
+    let sublink = PgBox::<pg_sys::SubLink>::alloc0();
     let sublink = sublink.into_pg();
     (*sublink).xpr.type_ = pg_sys::NodeTag::T_SubLink;
     (*sublink).subLinkId = 0;
@@ -814,14 +814,14 @@ unsafe fn create_set_predicate_expr(
         .ok_or("SetPredicate missing tuples relation")?;
 
     // Create a placeholder Query node for the subselect
-    let mut query = PgBox::<pg_sys::Query>::alloc0();
+    let query = PgBox::<pg_sys::Query>::alloc0();
     let query = query.into_pg();
     (*query).type_ = pg_sys::NodeTag::T_Query;
     (*query).commandType = pg_sys::CmdType::CMD_SELECT;
     (*query).querySource = pg_sys::QuerySource::QSRC_PARSER;
     (*query).canSetTag = true;
     (*query).rtable = std::ptr::null_mut();
-    let mut from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
+    let from_expr = PgBox::<pg_sys::FromExpr>::alloc0();
     (*query).jointree = from_expr.into_pg();
     (*(*query).jointree).fromlist = std::ptr::null_mut();
     (*(*query).jointree).quals = std::ptr::null_mut();
@@ -1044,7 +1044,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
 
                 // Create a BoolExpr node for variadic AND
-                let mut bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
                 let bool_expr = bool_expr.into_pg();
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::AND_EXPR;
@@ -1165,7 +1165,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
 
                 // Create a BoolExpr node for variadic OR
-                let mut bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
                 let bool_expr = bool_expr.into_pg();
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::OR_EXPR;
@@ -1492,7 +1492,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let arg = pg_args[0];
 
                 // Create a BoolExpr node for NOT
-                let mut bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
                 let bool_expr = bool_expr.into_pg();
                 (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
                 (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
@@ -1704,7 +1704,7 @@ pub unsafe fn convert_selection_to_postgres_with_schema(
                                 );
 
                                 create_var_node_with_type(
-                                    (field.field + 1) as i32, // 1-based indexing
+                                    field.field + 1, // 1-based indexing
                                     column_info.type_oid,
                                     column_info.typmod,
                                     column_info.collid,

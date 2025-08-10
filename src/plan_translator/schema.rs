@@ -1,5 +1,4 @@
 use pgrx::pg_sys;
-use std::collections::HashMap;
 
 /// Schema information for a relation
 /// Contains column type information that flows bottom-up through the plan tree
@@ -61,7 +60,7 @@ impl RelationSchema {
         // Get the relation descriptor for the table
         let relation = pg_sys::RelationIdGetRelation(table_oid);
         if relation.is_null() {
-            return Err(format!("Table with OID {} not found", table_oid).into());
+            return Err(format!("Table with OID {table_oid} not found").into());
         }
 
         let tuple_desc = (*relation).rd_att;

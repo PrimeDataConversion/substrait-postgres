@@ -74,10 +74,22 @@ pub unsafe fn execute_plan_directly_raw(
     pgrx::info!("DEBUG: About to call ExecTypeFromTL");
 
     // Get the tuple descriptor from the plan's target list
-    let tupdesc = pg_sys::ExecTypeFromTL(targetlist);
-    pgrx::info!("DEBUG: ExecTypeFromTL returned tupdesc: {:p}", tupdesc);
-    if tupdesc.is_null() {
+    let temp_tupdesc = pg_sys::ExecTypeFromTL(targetlist);
+    pgrx::info!("DEBUG: ExecTypeFromTL returned tupdesc: {:p}", temp_tupdesc);
+    if temp_tupdesc.is_null() {
         return Err("Failed to create tuple descriptor from plan".into());
+    }
+
+    // Create a copy of the tuple descriptor to avoid memory corruption
+    let tupdesc = pg_sys::CreateTupleDescCopy(temp_tupdesc);
+    pgrx::info!("DEBUG: Created tuple descriptor copy: {:p}", tupdesc);
+
+    // Free the temporary tuple descriptor to prevent memory leaks
+    pg_sys::FreeTupleDesc(temp_tupdesc);
+    pgrx::info!("DEBUG: Freed temporary tuple descriptor");
+
+    if tupdesc.is_null() {
+        return Err("Failed to copy tuple descriptor".into());
     }
 
     // Debug the tuple descriptor attributes to see what type OIDs were created
@@ -134,6 +146,10 @@ pub unsafe fn execute_plan_directly_raw(
     planned_stmt.planTree = plan_tree;
     planned_stmt.rtable = range_table as *mut pg_sys::List;
     planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+    planned_stmt.canSetTag = true; // Important for SELECT queries
+    planned_stmt.utilityStmt = std::ptr::null_mut();
+    planned_stmt.stmt_location = 0;
+    planned_stmt.stmt_len = 0;
     let planned_stmt_ptr = planned_stmt.into_pg();
     pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt_ptr);
 
@@ -141,7 +157,15 @@ pub unsafe fn execute_plan_directly_raw(
     (*query_desc_ptr).operation = pg_sys::CmdType::CMD_SELECT;
     (*query_desc_ptr).plannedstmt = planned_stmt_ptr;
     (*query_desc_ptr).sourceText = std::ptr::null_mut();
+
+    // Get snapshot - if none exists, get a new one
+    let snapshot = pg_sys::GetActiveSnapshot();
+    if snapshot.is_null() {
+        pgrx::info!("DEBUG: No active snapshot, registering a new one");
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+    }
     (*query_desc_ptr).snapshot = pg_sys::GetActiveSnapshot();
+
     (*query_desc_ptr).crosscheck_snapshot = std::ptr::null_mut();
     (*query_desc_ptr).dest = std::ptr::null_mut();
     (*query_desc_ptr).params = std::ptr::null_mut();
@@ -149,12 +173,47 @@ pub unsafe fn execute_plan_directly_raw(
     (*query_desc_ptr).instrument_options = 0;
     pgrx::info!("DEBUG: QueryDesc setup complete");
 
-    pgrx::info!("DEBUG: Calling ExecutorStart");
+    pgrx::info!("DEBUG: Skipping ExecutorStart, manually initializing instead");
 
-    // Call PostgreSQL's standard ExecutorStart function instead of manual setup
-    pg_sys::ExecutorStart(query_desc_ptr, 0);
+    // Instead of ExecutorStart, manually set up the estate and call ExecInitNode
+    let estate = pg_sys::CreateExecutorState();
+    if estate.is_null() {
+        return Err("Failed to create executor state".into());
+    }
 
-    pgrx::info!("DEBUG: ExecutorStart succeeded!");
+    (*estate).es_range_table = range_table as *mut pg_sys::List;
+    (*estate).es_output_cid = 0;
+    (*estate).es_snapshot = (*query_desc_ptr).snapshot;
+    (*estate).es_crosscheck_snapshot = (*query_desc_ptr).crosscheck_snapshot;
+    (*estate).es_instrument = 0;
+    (*estate).es_top_eflags = 0;
+    (*estate).es_processed = 0;
+    // es_lastoid only exists in older PostgreSQL versions
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+    {
+        (*estate).es_lastoid = pg_sys::InvalidOid;
+    }
+
+    (*query_desc_ptr).estate = estate;
+
+    pgrx::info!(
+        "DEBUG: About to call ExecInitNode with plan_tree={:p}, estate={:p}",
+        plan_tree,
+        estate
+    );
+
+    // Now initialize the plan node
+    let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
+
+    pgrx::info!("DEBUG: ExecInitNode returned: {:p}", plan_state);
+
+    if plan_state.is_null() {
+        return Err("ExecInitNode failed".into());
+    }
+
+    (*query_desc_ptr).planstate = plan_state;
+
+    pgrx::info!("DEBUG: Manual initialization succeeded!");
 
     // Get the plan state - ExecutorStart already called ExecInitNode for us!
     let plan_state = (*query_desc_ptr).planstate;
@@ -209,7 +268,7 @@ pub unsafe fn execute_plan_directly_raw(
 /// and returns the tuple descriptor and tuplestore directly.
 /// This is the simplified approach that minimizes unpacking/packing operations.
 pub unsafe fn execute_plan_directly(
-    plan_tree: &pg_sys::Plan,
+    plan_tree_ref: &pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
     expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
@@ -221,9 +280,12 @@ pub unsafe fn execute_plan_directly(
     eprintln!("IMMEDIATE: execute_plan_directly ENTERED SUCCESSFULLY");
     pgrx::info!("IMMEDIATE: execute_plan_directly ENTERED SUCCESSFULLY");
 
+    // Convert reference to pointer for use throughout the function
+    let plan_tree = plan_tree_ref as *const pg_sys::Plan as *mut pg_sys::Plan;
+
     eprintln!(
         "DEBUG: execute_plan_directly called with plan tree type: {:?}",
-        plan_tree.type_
+        plan_tree_ref.type_
     );
     pgrx::info!("CRITICAL: execute_plan_directly ENTRY - THIS SHOULD APPEAR IN LOGS");
 
@@ -231,7 +293,7 @@ pub unsafe fn execute_plan_directly(
     pgrx::info!("DEBUG: About to access plan_tree.targetlist");
 
     // DEBUG: Inspect target list BEFORE calling ExecTypeFromTL
-    let targetlist = plan_tree.targetlist;
+    let targetlist = plan_tree_ref.targetlist;
 
     eprintln!("DEBUG: targetlist accessed successfully");
     pgrx::info!("DEBUG: targetlist accessed successfully");
@@ -241,7 +303,7 @@ pub unsafe fn execute_plan_directly(
         return Err("Target list is null".into());
     }
 
-    eprintln!("DEBUG: targetlist pointer: {:p}", targetlist);
+    eprintln!("DEBUG: targetlist pointer: {targetlist:p}");
     eprintln!("DEBUG: About to access targetlist.length");
     pgrx::info!("DEBUG: About to access targetlist.length");
 
@@ -254,7 +316,7 @@ pub unsafe fn execute_plan_directly(
     pgrx::info!("DEBUG: About to access targetlist.elements array");
 
     let elements_ptr = (*targetlist).elements;
-    eprintln!("DEBUG: elements array pointer: {:p}", elements_ptr);
+    eprintln!("DEBUG: elements array pointer: {elements_ptr:p}");
     pgrx::info!("DEBUG: elements array pointer: {:p}", elements_ptr);
 
     if elements_ptr.is_null() {
@@ -267,13 +329,13 @@ pub unsafe fn execute_plan_directly(
 
     // Use PostgreSQL's list_nth function instead of manual pointer access
     for i in 0..(*targetlist).length {
-        eprintln!("DEBUG: Starting iteration {}", i);
+        eprintln!("DEBUG: Starting iteration {i}");
         pgrx::info!("DEBUG: Starting iteration {}", i);
 
         // Use PostgreSQL's safe list access function
-        let target_entry = pg_sys::list_nth(targetlist, i as i32) as *mut pg_sys::TargetEntry;
+        let target_entry = pg_sys::list_nth(targetlist, i) as *mut pg_sys::TargetEntry;
 
-        eprintln!("DEBUG: Got TargetEntry from list_nth: {:p}", target_entry);
+        eprintln!("DEBUG: Got TargetEntry from list_nth: {target_entry:p}");
         pgrx::info!("DEBUG: Got TargetEntry from list_nth: {:p}", target_entry);
 
         if !target_entry.is_null() {
@@ -285,7 +347,7 @@ pub unsafe fn execute_plan_directly(
             pgrx::info!("DEBUG: Checking TargetEntry node type");
 
             let node_type = (*target_entry).xpr.type_;
-            eprintln!("DEBUG: TargetEntry node type: {:?}", node_type);
+            eprintln!("DEBUG: TargetEntry node type: {node_type:?}");
             pgrx::info!("DEBUG: TargetEntry node type: {:?}", node_type);
 
             eprintln!("DEBUG: About to access resno and resname");
@@ -294,8 +356,7 @@ pub unsafe fn execute_plan_directly(
             let resno = (*target_entry).resno;
             let resname = (*target_entry).resname;
             eprintln!(
-                "DEBUG: Successfully accessed TargetEntry[{}]: resno={}, resname={:p}",
-                i, resno, resname
+                "DEBUG: Successfully accessed TargetEntry[{i}]: resno={resno}, resname={resname:p}"
             );
             eprintln!(
                 "DEBUG: TargetEntry[{}] node type: {:?}",
@@ -347,10 +408,10 @@ pub unsafe fn execute_plan_directly(
                     );
                 }
             } else {
-                eprintln!("ERROR: TargetEntry[{}] expr is null!", i);
+                eprintln!("ERROR: TargetEntry[{i}] expr is null!");
             }
         } else {
-            eprintln!("ERROR: TargetEntry[{}] from list_nth is null!", i);
+            eprintln!("ERROR: TargetEntry[{i}] from list_nth is null!");
         }
     }
 
@@ -364,10 +425,7 @@ pub unsafe fn execute_plan_directly(
     // Use the expected tuple descriptor if provided (from AS clause),
     // otherwise generate from plan's target list
     let tupdesc = if let Some(expected_desc) = expected_tupdesc {
-        eprintln!(
-            "DEBUG: Using provided AS clause tuple descriptor: {:p}",
-            expected_desc
-        );
+        eprintln!("DEBUG: Using provided AS clause tuple descriptor: {expected_desc:p}");
         pgrx::info!(
             "DEBUG: Using provided AS clause tuple descriptor: {:p}",
             expected_desc
@@ -375,10 +433,7 @@ pub unsafe fn execute_plan_directly(
 
         // Create a copy of the AS clause descriptor in current memory context to ensure consistency
         let tupdesc_copy = pg_sys::CreateTupleDescCopy(expected_desc);
-        eprintln!(
-            "DEBUG: Created copy of AS clause descriptor: {:p}",
-            tupdesc_copy
-        );
+        eprintln!("DEBUG: Created copy of AS clause descriptor: {tupdesc_copy:p}");
         pgrx::info!(
             "DEBUG: Created copy of AS clause descriptor: {:p}",
             tupdesc_copy
@@ -387,22 +442,30 @@ pub unsafe fn execute_plan_directly(
     } else {
         eprintln!("DEBUG: Generating tuple descriptor from plan targetlist");
         pgrx::info!("DEBUG: Generating tuple descriptor from plan targetlist");
-        let generated_desc = pg_sys::ExecTypeFromTL(plan_tree.targetlist);
-        eprintln!(
-            "DEBUG: ExecTypeFromTL completed successfully, tupdesc: {:p}",
-            generated_desc
-        );
+        let temp_generated_desc = pg_sys::ExecTypeFromTL((*plan_tree).targetlist);
+        eprintln!("DEBUG: ExecTypeFromTL completed successfully, tupdesc: {temp_generated_desc:p}");
         pgrx::info!(
             "DEBUG: ExecTypeFromTL completed successfully, tupdesc: {:p}",
-            generated_desc
+            temp_generated_desc
         );
+
+        // Create a copy to prevent memory corruption and free the temporary descriptor
+        let generated_desc = if !temp_generated_desc.is_null() {
+            let copy_desc = pg_sys::CreateTupleDescCopy(temp_generated_desc);
+            pg_sys::FreeTupleDesc(temp_generated_desc);
+            pgrx::info!("DEBUG: Freed temporary generated tuple descriptor");
+            copy_desc
+        } else {
+            temp_generated_desc
+        };
+
         generated_desc
     };
 
     // DEBUG: Examine the tuple descriptor to find invalid type OIDs
     if !tupdesc.is_null() {
         let natts = (*tupdesc).natts;
-        eprintln!("DEBUG: Tuple descriptor has {} attributes", natts);
+        eprintln!("DEBUG: Tuple descriptor has {natts} attributes");
         pgrx::info!("DEBUG: Tuple descriptor has {} attributes", natts);
 
         for i in 0..natts {
@@ -431,10 +494,7 @@ pub unsafe fn execute_plan_directly(
             );
 
             if type_oid.to_u32() == 65536 {
-                eprintln!(
-                    "DEBUG: FOUND THE PROBLEM! Attribute {} has invalid OID 65536",
-                    i
-                );
+                eprintln!("DEBUG: FOUND THE PROBLEM! Attribute {i} has invalid OID 65536");
                 pgrx::info!(
                     "DEBUG: FOUND THE PROBLEM! Attribute {} has invalid OID 65536",
                     i
@@ -452,7 +512,7 @@ pub unsafe fn execute_plan_directly(
 
     // Debug the tuple descriptor attributes to see what type OIDs were created
     let natts = (*tupdesc).natts;
-    eprintln!("DEBUG: Tuple descriptor has {} attributes", natts);
+    eprintln!("DEBUG: Tuple descriptor has {natts} attributes");
     for i in 0..natts as usize {
         let attr = (*tupdesc).attrs.as_ptr().add(i);
         eprintln!(
@@ -495,8 +555,7 @@ pub unsafe fn execute_plan_directly(
     }
 
     eprintln!(
-        "DEBUG: Tuplestore created successfully with descriptor {:p}: {:p}",
-        tuplestore_desc, tuplestore
+        "DEBUG: Tuplestore created successfully with descriptor {tuplestore_desc:p}: {tuplestore:p}"
     );
     pgrx::info!(
         "DEBUG: Tuplestore created successfully with descriptor {:p}: {:p}",
@@ -515,7 +574,7 @@ pub unsafe fn execute_plan_directly(
         return Err("Failed to create executor state".into());
     }
 
-    eprintln!("DEBUG: Executor state created successfully: {:p}", estate);
+    eprintln!("DEBUG: Executor state created successfully: {estate:p}");
     pgrx::info!("DEBUG: Executor state created successfully: {:p}", estate);
 
     eprintln!("DEBUG: About to set range table on executor state");
@@ -533,7 +592,7 @@ pub unsafe fn execute_plan_directly(
         // Create range table dynamically from plan tree information
         eprintln!("DEBUG: Creating range table dynamically from plan tree");
         pgrx::info!("DEBUG: Creating range table dynamically from plan tree");
-        let dynamic_range_table = create_range_table_from_plan_tree(plan_tree)?;
+        let dynamic_range_table = create_range_table_from_plan_tree(&*plan_tree)?;
         if !dynamic_range_table.is_null() {
             (*estate).es_range_table = dynamic_range_table;
             eprintln!("DEBUG: Set dynamically created range table on executor state");
@@ -544,28 +603,120 @@ pub unsafe fn execute_plan_directly(
         }
     }
 
-    eprintln!("DEBUG: About to call ExecInitNode - THIS IS LIKELY WHERE OID 65536 ERROR OCCURS");
-    pgrx::info!("DEBUG: About to call ExecInitNode - THIS IS LIKELY WHERE OID 65536 ERROR OCCURS");
+    eprintln!("DEBUG: Using ExecutorStart pattern instead of direct ExecInitNode");
+    pgrx::info!("DEBUG: Using ExecutorStart pattern instead of direct ExecInitNode");
 
-    let plan_state = pg_sys::ExecInitNode(
-        plan_tree as *const pg_sys::Plan as *mut pg_sys::Plan,
-        estate,
-        0,
+    // Create a minimal QueryDesc that PostgreSQL's executor expects (like execute_plan_directly_raw)
+    let query_desc = pgrx::PgBox::<pg_sys::QueryDesc>::alloc0();
+    let query_desc_ptr = query_desc.into_pg();
+    pgrx::info!("DEBUG: QueryDesc allocated: {:p}", query_desc_ptr);
+
+    // Create a minimal PlannedStmt wrapper
+    let mut planned_stmt = pgrx::PgBox::<pg_sys::PlannedStmt>::alloc0();
+    planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
+    planned_stmt.planTree = plan_tree as *const pg_sys::Plan as *mut pg_sys::Plan;
+    planned_stmt.rtable = range_table as *mut pg_sys::List;
+    planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
+    planned_stmt.canSetTag = true; // Important for SELECT queries
+    planned_stmt.utilityStmt = std::ptr::null_mut();
+    planned_stmt.stmt_location = 0;
+    planned_stmt.stmt_len = 0;
+    let planned_stmt_ptr = planned_stmt.into_pg();
+    pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt_ptr);
+
+    // Set up the QueryDesc using the raw pointer
+    (*query_desc_ptr).operation = pg_sys::CmdType::CMD_SELECT;
+    (*query_desc_ptr).plannedstmt = planned_stmt_ptr;
+    (*query_desc_ptr).sourceText = std::ptr::null_mut();
+
+    // Get snapshot - if none exists, get a new one
+    let snapshot = pg_sys::GetActiveSnapshot();
+    if snapshot.is_null() {
+        pgrx::info!("DEBUG: No active snapshot, registering a new one");
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+    }
+    (*query_desc_ptr).snapshot = pg_sys::GetActiveSnapshot();
+
+    (*query_desc_ptr).crosscheck_snapshot = std::ptr::null_mut();
+    (*query_desc_ptr).dest = std::ptr::null_mut();
+    (*query_desc_ptr).params = std::ptr::null_mut();
+    (*query_desc_ptr).queryEnv = std::ptr::null_mut();
+    (*query_desc_ptr).instrument_options = 0;
+    pgrx::info!("DEBUG: QueryDesc setup complete");
+
+    pgrx::info!("DEBUG: Skipping ExecutorStart, manually initializing instead");
+
+    // Instead of ExecutorStart, manually set up the estate and call ExecInitNode
+    let estate = pg_sys::CreateExecutorState();
+    if estate.is_null() {
+        return Err("Failed to create executor state".into());
+    }
+
+    (*estate).es_range_table = range_table as *mut pg_sys::List;
+    (*estate).es_output_cid = 0;
+    (*estate).es_snapshot = (*query_desc_ptr).snapshot;
+    (*estate).es_crosscheck_snapshot = (*query_desc_ptr).crosscheck_snapshot;
+    (*estate).es_instrument = 0;
+    (*estate).es_top_eflags = 0;
+    (*estate).es_processed = 0;
+    // es_lastoid only exists in older PostgreSQL versions
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+    {
+        (*estate).es_lastoid = pg_sys::InvalidOid;
+    }
+
+    (*query_desc_ptr).estate = estate;
+
+    pgrx::info!(
+        "DEBUG: About to call ExecInitNode with plan_tree={:p}, estate={:p}",
+        plan_tree,
+        estate
     );
 
-    eprintln!(
-        "DEBUG: ExecInitNode returned successfully: {:p}",
+    // Now initialize the plan node
+    let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
+
+    pgrx::info!("DEBUG: ExecInitNode returned: {:p}", plan_state);
+
+    if plan_state.is_null() {
+        return Err("ExecInitNode failed".into());
+    }
+
+    (*query_desc_ptr).planstate = plan_state;
+
+    pgrx::info!("DEBUG: Manual initialization succeeded!");
+
+    // Get the plan state - ExecutorStart already called ExecInitNode for us!
+    let plan_state = (*query_desc_ptr).planstate;
+    eprintln!("DEBUG: ExecutorStart succeeded, plan_state: {plan_state:p}");
+    pgrx::info!(
+        "DEBUG: ExecutorStart succeeded, plan_state: {:p}",
         plan_state
     );
+
+    // Debug the plan state structure to understand what's different
+    if !plan_state.is_null() {
+        eprintln!("DEBUG: Plan state type: {:?}", (*plan_state).type_);
+        pgrx::info!("DEBUG: Plan state type: {:?}", (*plan_state).type_);
+
+        // Check if this is a SeqScan
+        if (*plan_state).type_ == pg_sys::NodeTag::T_SeqScanState {
+            eprintln!("DEBUG: Plan state is SeqScanState");
+            pgrx::info!("DEBUG: Plan state is SeqScanState");
+        }
+    }
+
+    eprintln!("DEBUG: ExecInitNode returned successfully: {plan_state:p}");
     pgrx::info!(
         "DEBUG: ExecInitNode returned successfully: {:p}",
         plan_state
     );
 
     if plan_state.is_null() {
-        eprintln!("ERROR: ExecInitNode returned null plan_state");
-        pgrx::info!("ERROR: ExecInitNode returned null plan_state");
-        pg_sys::FreeExecutorState(estate);
+        eprintln!("ERROR: ExecutorStart returned null plan_state");
+        pgrx::info!("ERROR: ExecutorStart returned null plan_state");
+        pg_sys::ExecutorFinish(query_desc_ptr);
+        pg_sys::ExecutorEnd(query_desc_ptr);
         return Err("Failed to initialize plan node for execution".into());
     }
 
@@ -574,12 +725,12 @@ pub unsafe fn execute_plan_directly(
     eprintln!("DEBUG: Starting plan execution loop");
     pgrx::info!("DEBUG: Starting plan execution loop");
     loop {
-        eprintln!("DEBUG: Calling ExecProcNode (iteration {})", tuple_count);
+        eprintln!("DEBUG: Calling ExecProcNode (iteration {tuple_count})");
         pgrx::info!("DEBUG: Calling ExecProcNode (iteration {})", tuple_count);
 
         // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
         let slot = pg_sys::ExecProcNode(plan_state);
-        eprintln!("DEBUG: ExecProcNode returned slot: {:p}", slot);
+        eprintln!("DEBUG: ExecProcNode returned slot: {slot:p}");
         pgrx::info!("DEBUG: ExecProcNode returned slot: {:p}", slot);
 
         if slot.is_null() {
@@ -589,7 +740,7 @@ pub unsafe fn execute_plan_directly(
         }
 
         // Debug the slot's tuple descriptor to find OID 65536 source
-        eprintln!("DEBUG: Examining execution slot for tuple {}", tuple_count);
+        eprintln!("DEBUG: Examining execution slot for tuple {tuple_count}");
         pgrx::info!("DEBUG: Examining execution slot for tuple {}", tuple_count);
 
         // Convert slot to AS clause format if expected descriptor was provided
@@ -632,47 +783,17 @@ pub unsafe fn execute_plan_directly(
 
         // Prevent infinite loops and excessive memory usage
         if tuple_count > 1000000 {
-            pg_sys::ExecEndNode(plan_state);
-
-            // CRITICAL CLEANUP: Close any opened relations before freeing executor state
-            if !(*estate).es_relations.is_null() {
-                let rtable = (*estate).es_range_table;
-                if !rtable.is_null() {
-                    let num_rels = (*rtable).length;
-                    for i in 0..num_rels {
-                        let relation = *(*estate).es_relations.add(i as usize);
-                        if !relation.is_null() {
-                            pg_sys::table_close(relation, pg_sys::AccessShareLock as i32);
-                        }
-                    }
-                }
-            }
-
-            pg_sys::FreeExecutorState(estate);
+            pg_sys::ExecutorFinish(query_desc_ptr);
+            pg_sys::ExecutorEnd(query_desc_ptr);
             return Err("Query returned too many rows (> 1M), execution aborted".into());
         }
     }
 
-    // Clean up executor
-    pg_sys::ExecEndNode(plan_state);
-
-    // CRITICAL CLEANUP: Close any opened relations before freeing executor state
-    if !(*estate).es_relations.is_null() {
-        eprintln!("DEBUG: Closing opened relations");
-        let rtable = (*estate).es_range_table;
-        if !rtable.is_null() {
-            let num_rels = (*rtable).length;
-            for i in 0..num_rels {
-                let relation = *(*estate).es_relations.add(i as usize);
-                if !relation.is_null() {
-                    pg_sys::table_close(relation, pg_sys::AccessShareLock as i32);
-                    eprintln!("DEBUG: Closed relation at index {i}");
-                }
-            }
-        }
-    }
-
-    pg_sys::FreeExecutorState(estate);
+    // Clean up using PostgreSQL's proper ExecutorFinish and ExecutorEnd sequence
+    eprintln!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
+    pgrx::info!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
+    pg_sys::ExecutorFinish(query_desc_ptr);
+    pg_sys::ExecutorEnd(query_desc_ptr);
 
     Ok((tupdesc, tuplestore))
 }
@@ -683,10 +804,7 @@ pub unsafe fn execute_postgres_plan(
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
 ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!(
-        "DEBUG: execute_postgres_plan ENTRY - plan_tree={:p}",
-        plan_tree
-    );
+    eprintln!("DEBUG: execute_postgres_plan ENTRY - plan_tree={plan_tree:p}");
     pgrx::info!(
         "DEBUG: execute_postgres_plan ENTRY - plan_tree={:p}",
         plan_tree
@@ -865,10 +983,7 @@ pub unsafe fn execute_postgres_plan_as_srf(
             datum
         }
         Err(panic_info) => {
-            eprintln!(
-                "PANIC: execute_postgres_plan_as_srf panicked: {:?}",
-                panic_info
-            );
+            eprintln!("PANIC: execute_postgres_plan_as_srf panicked: {panic_info:?}");
             pgrx::error!("Function panicked during execution");
         }
     }
@@ -888,7 +1003,7 @@ unsafe fn execute_postgres_plan_as_srf_inner(
     );
 
     // Check if this is the first call
-    let mut funcctx: *mut pg_sys::FuncCallContext;
+    let funcctx: *mut pg_sys::FuncCallContext;
     if (*fcinfo).flinfo.is_null() || (*(*fcinfo).flinfo).fn_extra.is_null() {
         eprintln!("DEBUG: SRF first call - setting up using init_MultiFuncCall");
         pgrx::info!("DEBUG: SRF first call - setting up using init_MultiFuncCall");
@@ -925,7 +1040,7 @@ unsafe fn execute_postgres_plan_as_srf_inner(
             range_table,
             Some(result_tuple_desc),
         );
-        let (generated_tupdesc, tuplestore) = execution_result.unwrap_or_else(|e| {
+        let (_generated_tupdesc, tuplestore) = execution_result.unwrap_or_else(|e| {
             pg_sys::MemoryContextSwitchTo(oldcontext);
             pgrx::error!("Plan execution failed: {}", e);
         });
@@ -980,7 +1095,7 @@ unsafe fn execute_postgres_plan_as_srf_inner(
         let slot_desc = (*slot).tts_tupleDescriptor;
         if !slot_desc.is_null() {
             let natts = (*slot_desc).natts;
-            eprintln!("DEBUG: Pre-conversion slot descriptor has {} attrs", natts);
+            eprintln!("DEBUG: Pre-conversion slot descriptor has {natts} attrs");
             pgrx::info!("DEBUG: Pre-conversion slot descriptor has {} attrs", natts);
             for i in 0..natts {
                 let attr = (*slot_desc).attrs.as_ptr().add(i as usize);
@@ -1002,19 +1117,19 @@ unsafe fn execute_postgres_plan_as_srf_inner(
         eprintln!("DEBUG: About to call ExecCopySlotHeapTuple");
         pgrx::info!("DEBUG: About to call ExecCopySlotHeapTuple");
         let heap_tuple = pg_sys::ExecCopySlotHeapTuple(slot);
-        eprintln!("DEBUG: ExecCopySlotHeapTuple returned: {:p}", heap_tuple);
+        eprintln!("DEBUG: ExecCopySlotHeapTuple returned: {heap_tuple:p}");
         pgrx::info!("DEBUG: ExecCopySlotHeapTuple returned: {:p}", heap_tuple);
 
         if !heap_tuple.is_null() {
             // DEBUG: Examine the heap tuple header
             let tuple_header = (*heap_tuple).t_data;
             if !tuple_header.is_null() {
-                eprintln!("DEBUG: Heap tuple header: {:p}", tuple_header);
+                eprintln!("DEBUG: Heap tuple header: {tuple_header:p}");
                 pgrx::info!("DEBUG: Heap tuple header: {:p}", tuple_header);
 
                 // Check if this has the datum_typeid field (composite type)
                 let heap_tuple_len = (*heap_tuple).t_len;
-                eprintln!("DEBUG: Heap tuple length: {}", heap_tuple_len);
+                eprintln!("DEBUG: Heap tuple length: {heap_tuple_len}");
                 pgrx::info!("DEBUG: Heap tuple length: {}", heap_tuple_len);
 
                 // The issue might be in how PostgreSQL interprets this as a composite type
@@ -1036,29 +1151,33 @@ unsafe fn execute_postgres_plan_as_srf_inner(
                 }
             }
 
-            // Use PostgreSQL's proper composite type conversion
-            // HeapTupleGetDatum is a macro: #define HeapTupleGetDatum(tuple) PointerGetDatum(tuple)
-            let result = pg_sys::Datum::from(heap_tuple as usize);
+            // Clean up the slot before returning
             pg_sys::ExecDropSingleTupleTableSlot(slot);
 
+            // Increment call counter
+            (*funcctx).call_cntr += 1;
+
+            // For composite type SRF, return the heap tuple directly
+            // PostgreSQL will handle the type information from the blessed tuple descriptor
+            (*fcinfo).isnull = false;
+
             eprintln!(
-                "DEBUG: Returning tuple using composite type pattern: {}",
-                result.value()
+                "DEBUG: Returning heap tuple {:p} directly as datum for SRF",
+                heap_tuple
             );
             pgrx::info!(
-                "DEBUG: Returning tuple using composite type pattern: {}",
-                result.value()
+                "DEBUG: Returning heap tuple {:p} directly as datum for SRF",
+                heap_tuple
             );
 
-            // Increment call counter and return the tuple
-            (*funcctx).call_cntr += 1;
-            (*fcinfo).isnull = false;
-            return result;
+            // Return the heap tuple as-is (HeapTupleGetDatum)
+            // The blessed tuple descriptor context should handle type information
+            pg_sys::Datum::from(heap_tuple as usize)
         } else {
             pg_sys::ExecDropSingleTupleTableSlot(slot);
             pg_sys::end_MultiFuncCall(fcinfo, funcctx);
             (*fcinfo).isnull = true;
-            return pg_sys::Datum::from(0);
+            pg_sys::Datum::from(0)
         }
     } else {
         eprintln!("DEBUG: No more tuples - ending SRF");
@@ -1072,7 +1191,7 @@ unsafe fn execute_postgres_plan_as_srf_inner(
 
         pg_sys::end_MultiFuncCall(fcinfo, funcctx);
         (*fcinfo).isnull = true;
-        return pg_sys::Datum::from(0);
+        pg_sys::Datum::from(0)
     }
 }
 

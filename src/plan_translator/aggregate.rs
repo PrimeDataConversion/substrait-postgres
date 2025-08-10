@@ -34,7 +34,7 @@ struct AggNodeBuilder {
 
 impl AggNodeBuilder {
     pub unsafe fn new(input_plan: *mut pg_sys::Plan) -> Self {
-        let mut node = pgrx::PgBox::<pg_sys::Agg>::alloc0();
+        let node = pgrx::PgBox::<pg_sys::Agg>::alloc0();
         let node = node.into_pg();
 
         // Set node tag FIRST (critical for ExecInitNode dispatch)
