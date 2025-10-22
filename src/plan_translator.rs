@@ -138,6 +138,17 @@ pub unsafe fn convert_rel_to_plan_tree(
                 Err("Read relation missing read type".into())
             }
         }
+        Some(RelType::Fetch(fetch)) => {
+            // Handle LIMIT/OFFSET (Fetch relation)
+            let input_plan = if let Some(input) = &fetch.input {
+                convert_rel_to_plan_tree(input)?
+            } else {
+                return Err("Fetch relation missing input".into());
+            };
+
+            // Create a Limit plan node
+            create_limit_node(input_plan, fetch.offset, fetch.count)
+        }
         _ => Err("Unsupported relation type".into()),
     }
 }
@@ -396,6 +407,64 @@ unsafe fn create_target_list_for_table(
     pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
 
     Ok(target_list)
+}
+
+pub unsafe fn create_limit_node(
+    input_plan: *mut pg_sys::Plan,
+    offset: i64,
+    count: i64,
+) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
+    // Create a Limit node
+    let limit_node =
+        pg_sys::palloc0(std::mem::size_of::<pg_sys::Limit>()) as *mut pg_sys::Limit;
+
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    {
+        (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
+        (*limit_node).plan.lefttree = input_plan;
+
+        // Copy target list from child plan
+        if !input_plan.is_null() {
+            (*limit_node).plan.targetlist = (*input_plan).targetlist;
+        }
+
+        // Set limit count (required)
+        if count > 0 {
+            let count_const = create_int8_const(count)?;
+            (*limit_node).limitCount = count_const as *mut pg_sys::Node;
+        }
+
+        // Set limit offset (optional)
+        if offset > 0 {
+            let offset_const = create_int8_const(offset)?;
+            (*limit_node).limitOffset = offset_const as *mut pg_sys::Node;
+        }
+    }
+
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    {
+        (*limit_node).plan.type_ = pg_sys::NodeTag::T_Limit;
+        (*limit_node).plan.lefttree = input_plan;
+
+        // Copy target list from child plan
+        if !input_plan.is_null() {
+            (*limit_node).plan.targetlist = (*input_plan).targetlist;
+        }
+
+        // Set limit count (required)
+        if count > 0 {
+            let count_const = create_int8_const(count)?;
+            (*limit_node).limitCount = count_const as *mut pg_sys::Node;
+        }
+
+        // Set limit offset (optional)
+        if offset > 0 {
+            let offset_const = create_int8_const(offset)?;
+            (*limit_node).limitOffset = offset_const as *mut pg_sys::Node;
+        }
+    }
+
+    Ok(limit_node as *mut pg_sys::Plan)
 }
 
 pub unsafe fn create_cstring(s: &str) -> *mut i8 {

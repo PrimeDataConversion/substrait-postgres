@@ -1253,6 +1253,107 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         pgrx::info!("TPC-H setup completed: {}", stdout);
     }
+
+    #[pg_test]
+    fn test_simple_table_scan() {
+        // Create a simple test table
+        Spi::run("CREATE TABLE test_scan (id int, name text)").expect("Failed to create table");
+        Spi::run("INSERT INTO test_scan VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+            .expect("Failed to insert data");
+
+        // Create a Substrait plan for: SELECT * FROM test_scan
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["id", "name"],
+                    "input": {
+                        "read": {
+                            "namedTable": {
+                                "names": ["test_scan"]
+                            }
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+        let query = format!(
+            "SELECT COUNT(*) FROM from_substrait_json('{}') AS t(id int, name text)",
+            escaped_plan
+        );
+
+        let result = Spi::get_one::<i64>(&query);
+        pgrx::info!("Table scan result: {:?}", result);
+
+        // Clean up
+        Spi::run("DROP TABLE test_scan").ok();
+
+        assert!(
+            result.is_ok(),
+            "Simple table scan should work: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            Some(3),
+            "Should have scanned 3 rows from test_scan"
+        );
+    }
+
+    #[pg_test]
+    fn test_table_scan_with_fetch() {
+        // Create a simple test table
+        Spi::run("CREATE TABLE test_fetch (id int, name text)").expect("Failed to create table");
+        Spi::run("INSERT INTO test_fetch VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'David'), (5, 'Eve')")
+            .expect("Failed to insert data");
+
+        // Create a Substrait plan for: SELECT * FROM test_fetch LIMIT 3
+        let json_plan = r#"{
+            "version": {"minorNumber": 54},
+            "relations": [{
+                "root": {
+                    "names": ["id", "name"],
+                    "input": {
+                        "fetch": {
+                            "input": {
+                                "read": {
+                                    "namedTable": {
+                                        "names": ["test_fetch"]
+                                    }
+                                }
+                            },
+                            "count": 3
+                        }
+                    }
+                }
+            }]
+        }"#;
+
+        let escaped_plan = json_plan.replace("'", "''");
+        let query = format!(
+            "SELECT COUNT(*) FROM from_substrait_json('{}') AS t(id int, name text)",
+            escaped_plan
+        );
+
+        let result = Spi::get_one::<i64>(&query);
+        pgrx::info!("Fetch test result: {:?}", result);
+
+        // Clean up
+        Spi::run("DROP TABLE test_fetch").ok();
+
+        assert!(
+            result.is_ok(),
+            "Table scan with fetch (LIMIT) should work: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap(),
+            Some(3),
+            "Should have fetched exactly 3 rows (LIMIT 3)"
+        );
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]

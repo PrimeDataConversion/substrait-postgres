@@ -200,6 +200,57 @@ pub unsafe fn execute_plan_tree_structured(
                 nulls: rows_and_nulls.1,
             })
         }
+        pg_sys::NodeTag::T_Limit => {
+            let limit_node = plan as *const pg_sys::Plan as *const pg_sys::Limit;
+
+            // Get the child plan
+            let child_plan = (*limit_node).plan.lefttree;
+            if child_plan.is_null() {
+                return Err("Limit node missing child plan".into());
+            }
+
+            // Execute the child plan to get all rows
+            let mut child_result = execute_plan_tree_structured(&*child_plan)?;
+
+            // Extract limit count and offset
+            let limit_count = if !(*limit_node).limitCount.is_null() {
+                let count_node = (*limit_node).limitCount as *const pg_sys::Const;
+                if (*count_node).type_ == pg_sys::NodeTag::T_Const {
+                    let datum = (*count_node).constvalue;
+                    pg_sys::Datum::cast_into::<i64>(datum).unwrap_or(i64::MAX)
+                } else {
+                    i64::MAX
+                }
+            } else {
+                i64::MAX
+            };
+
+            let limit_offset = if !(*limit_node).limitOffset.is_null() {
+                let offset_node = (*limit_node).limitOffset as *const pg_sys::Const;
+                if (*offset_node).type_ == pg_sys::NodeTag::T_Const {
+                    let datum = (*offset_node).constvalue;
+                    pg_sys::Datum::cast_into::<i64>(datum).unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            // Apply offset and limit to the rows
+            let start = limit_offset.max(0) as usize;
+            let end = if limit_count == i64::MAX {
+                child_result.rows.len()
+            } else {
+                (start + limit_count as usize).min(child_result.rows.len())
+            };
+
+            // Slice the rows and nulls
+            child_result.rows = child_result.rows[start..end].to_vec();
+            child_result.nulls = child_result.nulls[start..end].to_vec();
+
+            Ok(child_result)
+        }
         _ => Err(format!("Unsupported plan node type: {:?}", plan.type_).into()),
     }
 }
