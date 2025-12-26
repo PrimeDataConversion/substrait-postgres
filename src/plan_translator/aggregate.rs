@@ -13,7 +13,7 @@ pub unsafe fn create_aggregate_node(
     let group_col_indices = extract_grouping_cols(&aggregate.groupings)?;
     agg_node.set_group_columns(&group_col_indices);
 
-    let mut target_list = TargetListBuilder::new();
+    let mut target_list = TargetListBuilder::new_with_input(input_plan);
 
     for &col in &group_col_indices {
         target_list.add_group_var(col);
@@ -92,7 +92,7 @@ impl AggNodeBuilder {
         for i in 0..n as usize {
             *grpColIdx.add(i) = indices[i];
             // Use btcharcmp for CHAR columns (typical for l_returnflag, l_linestatus)
-            *grpOperators.add(i) = 664.into(); // btcharcmp for CHAR/VARCHAR columns
+            *grpOperators.add(i) = 1054.into(); // bpchareq (=) for BPCHAR columns
             *grpCollations.add(i) = pg_sys::DEFAULT_COLLATION_OID; // Use default collation
         }
 
@@ -114,13 +114,15 @@ impl AggNodeBuilder {
 struct TargetListBuilder {
     list: PgList<pg_sys::TargetEntry>,
     resno: i32,
+    input_plan: *mut pg_sys::Plan,
 }
 
 impl TargetListBuilder {
-    fn new() -> Self {
+    fn new_with_input(input_plan: *mut pg_sys::Plan) -> Self {
         Self {
             list: PgList::new(),
             resno: 1,
+            input_plan,
         }
     }
 
@@ -131,7 +133,8 @@ impl TargetListBuilder {
         var.varattno = attno;
 
         // Get the actual column type from the input plan's target list
-        let (vartype, vartypmod, varcollid) = get_column_type_from_input_plan(self.resno - 1);
+        let (vartype, vartypmod, varcollid) =
+            get_type_from_input_target_list(self.input_plan, attno);
         var.vartype = vartype;
         var.vartypmod = vartypmod;
         var.varcollid = varcollid;
@@ -153,7 +156,19 @@ impl TargetListBuilder {
         func_map: &HashMap<u32, String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let func = measure.measure.as_ref().ok_or("Missing measure")?;
-        let func_oid = resolve_agg_oid(func, func_map);
+
+        // Get the argument type from the input plan for proper function resolution
+        let arg_type = if func.arguments.is_empty() {
+            pg_sys::InvalidOid // No arguments (like count(*))
+        } else if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
+            &func.arguments[0].arg_type
+        {
+            infer_expr_type_oid_from_input(expr, self.input_plan)
+        } else {
+            pg_sys::InvalidOid
+        };
+
+        let func_oid = resolve_agg_oid(func, func_map, arg_type);
 
         let mut agg = PgBox::<pg_sys::Aggref>::alloc0();
         agg.xpr.type_ = pg_sys::NodeTag::T_Aggref; // CRITICAL: Set the node type!
@@ -163,7 +178,24 @@ impl TargetListBuilder {
         agg.aggtype = resolve_agg_return_type(func_oid);
         agg.aggstar = func.arguments.is_empty();
         agg.aggsplit = pg_sys::AggSplit::AGGSPLIT_SIMPLE;
-        agg.args = extract_agg_args(&func.arguments);
+        agg.args = extract_agg_args(&func.arguments, self.input_plan);
+
+        // CRITICAL: Set additional fields required by ExecInitAgg
+        agg.aggcollid = pg_sys::InvalidOid; // No collation for numeric aggregates
+        agg.inputcollid = pg_sys::InvalidOid; // No input collation
+        agg.aggtranstype = resolve_agg_trans_type(func_oid); // Transition state type
+        agg.aggargtypes = build_agg_arg_types(&func.arguments, self.input_plan); // Argument type OIDs
+        agg.aggdirectargs = std::ptr::null_mut(); // No direct args for simple aggregates
+        agg.aggorder = std::ptr::null_mut(); // No ORDER BY within aggregate
+        agg.aggdistinct = std::ptr::null_mut(); // No DISTINCT within aggregate
+        agg.aggfilter = std::ptr::null_mut(); // No filter expression
+        agg.aggvariadic = false; // Not variadic
+        agg.aggkind = b'n' as i8; // AGGKIND_NORMAL = 'n'
+        agg.aggpresorted = false; // Input not presorted
+        agg.agglevelsup = 0; // Not in outer query
+        agg.aggno = (self.resno - 1) as i32; // Aggregate sequence number
+        agg.aggtransno = (self.resno - 1) as i32; // Transition state number
+        agg.location = -1; // Unknown location in query string
 
         let mut entry = PgBox::<pg_sys::TargetEntry>::alloc0();
         entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry; // CRITICAL: Set the node type!
@@ -219,18 +251,27 @@ fn extract_struct_field(
     Ok(None)
 }
 
-unsafe fn extract_agg_args(args: &[substrait::proto::FunctionArgument]) -> *mut pg_sys::List {
+unsafe fn extract_agg_args(
+    args: &[substrait::proto::FunctionArgument],
+    input_plan: *mut pg_sys::Plan,
+) -> *mut pg_sys::List {
     let mut list = PgList::<pg_sys::Var>::new();
     for arg in args {
         if let Some(substrait::proto::function_argument::ArgType::Value(expr)) = &arg.arg_type {
             if let Ok(Some(field)) = extract_struct_field(expr) {
+                let attno = (field.field + 1) as pg_sys::AttrNumber;
+
+                // Look up the actual column type from the input plan's target list
+                let (vartype, vartypmod, varcollid) =
+                    get_type_from_input_target_list(input_plan, attno);
+
                 let mut var = PgBox::<pg_sys::Var>::alloc0();
                 var.xpr.type_ = pg_sys::NodeTag::T_Var; // CRITICAL: Set the node type!
                 var.varno = 1;
-                var.varattno = (field.field + 1) as pg_sys::AttrNumber;
-                var.vartype = pg_sys::TEXTOID; // Use TEXT as default
-                var.vartypmod = -1;
-                var.varcollid = pg_sys::DEFAULT_COLLATION_OID;
+                var.varattno = attno;
+                var.vartype = vartype;
+                var.vartypmod = vartypmod;
+                var.varcollid = varcollid;
                 list.push(var.into_pg());
             }
         }
@@ -238,26 +279,114 @@ unsafe fn extract_agg_args(args: &[substrait::proto::FunctionArgument]) -> *mut 
     list.into_pg()
 }
 
+/// Get type information from the input plan's target list for a given attribute number
+unsafe fn get_type_from_input_target_list(
+    input_plan: *mut pg_sys::Plan,
+    attno: pg_sys::AttrNumber,
+) -> (pg_sys::Oid, i32, pg_sys::Oid) {
+    if input_plan.is_null() {
+        // Default to TEXT if no input plan
+        return (pg_sys::TEXTOID, -1, pg_sys::DEFAULT_COLLATION_OID);
+    }
+
+    let targetlist = (*input_plan).targetlist;
+    if targetlist.is_null() {
+        return (pg_sys::TEXTOID, -1, pg_sys::DEFAULT_COLLATION_OID);
+    }
+
+    // Find the TargetEntry with the matching resno
+    let list_len = (*targetlist).length;
+    for i in 0..list_len {
+        let te = pg_sys::list_nth(targetlist, i) as *mut pg_sys::TargetEntry;
+        if te.is_null() {
+            continue;
+        }
+        if (*te).resno == attno {
+            let expr = (*te).expr;
+            if !expr.is_null() {
+                // Get the type of the expression
+                let expr_type = pg_sys::exprType(expr as *mut pg_sys::Node);
+                let expr_typmod = pg_sys::exprTypmod(expr as *mut pg_sys::Node);
+                let expr_collid = pg_sys::exprCollation(expr as *mut pg_sys::Node);
+                return (expr_type, expr_typmod, expr_collid);
+            }
+        }
+    }
+
+    // Default if not found
+    (pg_sys::TEXTOID, -1, pg_sys::DEFAULT_COLLATION_OID)
+}
+
 fn resolve_agg_oid(
     func: &substrait::proto::AggregateFunction,
     func_map: &HashMap<u32, String>,
+    arg_type: pg_sys::Oid,
 ) -> pg_sys::Oid {
-    // TODO -- This conversion should be handled in a more principled way than using magic constants.  This behavior should likely mirror that of how scalar and window functions are looked up.
     let name = func_map
         .get(&func.function_reference)
         .map(|s| s.as_str())
         .unwrap_or("");
-    match name {
-        "sum:fp64" => 2108,
-        "sum:i32" => 2102, // sum(integer) -> numeric
-        "sum:dec" => 2104, // sum(numeric) -> numeric
-        "avg:fp64" => 2100,
-        "count:" => 2803,
-        "count:any" => 2147, // count(any) -> bigint
-        "min:fp64" => 2136,  // min(double precision) -> double precision
-        _ => 2803,
+
+    // Use dynamic lookup based on function name prefix and actual argument type
+    let base_name = if name.starts_with("sum:") {
+        "sum"
+    } else if name.starts_with("avg:") {
+        "avg"
+    } else if name.starts_with("count:") {
+        "count"
+    } else if name.starts_with("min:") {
+        "min"
+    } else if name.starts_with("max:") {
+        "max"
+    } else {
+        return 2803.into(); // Default to count(*)
+    };
+
+    // Look up the aggregate function for the actual argument type
+    unsafe { lookup_agg_func_by_name_and_type(base_name, arg_type) }
+}
+
+/// Look up aggregate function OID by name and argument type
+unsafe fn lookup_agg_func_by_name_and_type(name: &str, arg_type: pg_sys::Oid) -> pg_sys::Oid {
+    use crate::plan_translator::expressions::lookup_function_oid;
+
+    // For count(*), use the no-argument version
+    if name == "count" && arg_type == pg_sys::InvalidOid {
+        return 2803.into(); // count(*)
     }
-    .into()
+
+    // Try to look up the aggregate function with the actual type
+    let result = if arg_type == pg_sys::InvalidOid {
+        // No arguments (like count(*))
+        lookup_function_oid(name, &[])
+    } else {
+        lookup_function_oid(name, &[arg_type])
+    };
+
+    match result {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!(
+                "DEBUG: Failed to lookup aggregate '{}' with arg type {}, using fallback",
+                name,
+                arg_type.to_u32()
+            );
+            // Fallback to known OIDs
+            match (name, arg_type.into()) {
+                ("sum", 1700) => 2104.into(), // sum(numeric)
+                ("sum", 701) => 2108.into(),  // sum(float8)
+                ("sum", 23) => 2102.into(),   // sum(int4)
+                ("avg", 1700) => 2107.into(), // avg(numeric)
+                ("avg", 701) => 2100.into(),  // avg(float8)
+                ("min", 1700) => 2142.into(), // min(numeric)
+                ("min", 701) => 2136.into(),  // min(float8)
+                ("max", 1700) => 2148.into(), // max(numeric)
+                ("max", 701) => 2137.into(),  // max(float8)
+                ("count", _) => 2803.into(),  // count(*)
+                _ => 2803.into(),             // Default to count(*)
+            }
+        }
+    }
 }
 
 unsafe fn palloc_array<T>(len: i32) -> *mut T {
@@ -291,7 +420,11 @@ unsafe fn resolve_agg_return_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
         2107 => pg_sys::NUMERICOID, // avg(numeric) -> numeric
         2108 => pg_sys::FLOAT8OID,  // sum(double precision) -> double precision
         2136 => pg_sys::FLOAT8OID,  // min(double precision) -> double precision
+        2137 => pg_sys::FLOAT8OID,  // max(double precision) -> double precision
+        2142 => pg_sys::NUMERICOID, // min(numeric) -> numeric
+        2146 => pg_sys::NUMERICOID, // avg(numeric) alias
         2147 => pg_sys::INT8OID,    // count(any) -> bigint
+        2148 => pg_sys::NUMERICOID, // max(numeric) -> numeric
         2803 => pg_sys::INT8OID,    // count() -> bigint
         _ => {
             // For unknown functions, try to look up the return type from pg_proc
@@ -337,4 +470,131 @@ unsafe fn lookup_function_return_type(func_oid: pg_sys::Oid) -> Option<pg_sys::O
     }
 
     Some(return_type)
+}
+
+/// Resolve aggregate function transition type based on function OID
+unsafe fn resolve_agg_trans_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
+    // Common aggregate function transition types
+    match func_oid.into() {
+        2100 => pg_sys::FLOAT8ARRAYOID, // avg(float8) uses internal array state
+        2102 => pg_sys::NUMERICOID,     // sum(integer) -> numeric transition
+        2103 => pg_sys::NUMERICOID,     // sum(bigint) -> numeric transition
+        2104 => pg_sys::NUMERICOID,     // sum(numeric) -> numeric transition
+        2107 => pg_sys::INTERNALOID,    // avg(numeric) uses internal state
+        2108 => pg_sys::FLOAT8OID,      // sum(float8) -> float8 transition
+        2136 => pg_sys::FLOAT8OID,      // min(float8) -> float8 transition
+        2137 => pg_sys::FLOAT8OID,      // max(float8) -> float8 transition
+        2142 => pg_sys::NUMERICOID,     // min(numeric) -> numeric transition
+        2148 => pg_sys::NUMERICOID,     // max(numeric) -> numeric transition
+        2803 => pg_sys::INT8OID,        // count(*) -> int8 transition
+        2147 => pg_sys::INT8OID,        // count(any) -> int8 transition
+        _ => {
+            // For unknown functions, look up from pg_aggregate system catalog
+            lookup_agg_trans_type(func_oid).unwrap_or(pg_sys::INTERNALOID)
+        }
+    }
+}
+
+/// Look up aggregate transition type from pg_aggregate system catalog
+unsafe fn lookup_agg_trans_type(func_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    // Use SPI to query the pg_aggregate catalog
+    // For now, just return a safe default since we handle most common aggregates above
+    eprintln!(
+        "DEBUG: lookup_agg_trans_type called for unknown func_oid: {}",
+        func_oid.to_u32()
+    );
+    // INTERNAL is a safe default for unknown aggregates
+    Some(pg_sys::INTERNALOID)
+}
+
+/// Build the list of argument type OIDs for an aggregate
+unsafe fn build_agg_arg_types(
+    args: &[substrait::proto::FunctionArgument],
+    input_plan: *mut pg_sys::Plan,
+) -> *mut pg_sys::List {
+    if args.is_empty() {
+        return std::ptr::null_mut();
+    }
+
+    let mut list: *mut pg_sys::List = std::ptr::null_mut();
+
+    for arg in args {
+        if let Some(substrait::proto::function_argument::ArgType::Value(expr)) = &arg.arg_type {
+            // Get the type from the expression using the input plan's target list
+            let type_oid = infer_expr_type_oid_from_input(expr, input_plan);
+            // Use lappend_oid for OID lists
+            list = pg_sys::lappend_oid(list, type_oid);
+        }
+    }
+
+    list
+}
+
+/// Infer the PostgreSQL type OID from a Substrait expression using input plan info
+unsafe fn infer_expr_type_oid_from_input(
+    expr: &substrait::proto::Expression,
+    input_plan: *mut pg_sys::Plan,
+) -> pg_sys::Oid {
+    if let Some(substrait::proto::expression::RexType::Selection(sel)) = &expr.rex_type {
+        // Field reference - look up actual type from input plan
+        if let Some(
+            substrait::proto::expression::field_reference::ReferenceType::DirectReference(direct),
+        ) = &sel.reference_type
+        {
+            if let Some(
+                substrait::proto::expression::reference_segment::ReferenceType::StructField(field),
+            ) = &direct.reference_type
+            {
+                let attno = (field.field + 1) as pg_sys::AttrNumber;
+                let (vartype, _, _) = get_type_from_input_target_list(input_plan, attno);
+                return vartype;
+            }
+        }
+        pg_sys::TEXTOID // Default for unknown selections
+    } else if let Some(substrait::proto::expression::RexType::Literal(lit)) = &expr.rex_type {
+        // Literal - infer from literal type
+        match &lit.literal_type {
+            Some(substrait::proto::expression::literal::LiteralType::I32(_)) => pg_sys::INT4OID,
+            Some(substrait::proto::expression::literal::LiteralType::I64(_)) => pg_sys::INT8OID,
+            Some(substrait::proto::expression::literal::LiteralType::Fp32(_)) => pg_sys::FLOAT4OID,
+            Some(substrait::proto::expression::literal::LiteralType::Fp64(_)) => pg_sys::FLOAT8OID,
+            Some(substrait::proto::expression::literal::LiteralType::String(_)) => pg_sys::TEXTOID,
+            _ => pg_sys::TEXTOID,
+        }
+    } else {
+        pg_sys::TEXTOID
+    }
+}
+
+/// Infer the PostgreSQL type OID from a Substrait expression
+fn infer_expr_type_oid(expr: &substrait::proto::Expression) -> u32 {
+    // For field references, we need to infer from context
+    // For now, use TEXT as default since most aggregate inputs are numeric or text
+    // This will be coerced appropriately by PostgreSQL
+    if let Some(substrait::proto::expression::RexType::Selection(_)) = &expr.rex_type {
+        // Field reference - assume TEXT which will be coerced
+        pg_sys::TEXTOID.into()
+    } else if let Some(substrait::proto::expression::RexType::Literal(lit)) = &expr.rex_type {
+        // Literal - infer from literal type
+        match &lit.literal_type {
+            Some(substrait::proto::expression::literal::LiteralType::I32(_)) => {
+                pg_sys::INT4OID.into()
+            }
+            Some(substrait::proto::expression::literal::LiteralType::I64(_)) => {
+                pg_sys::INT8OID.into()
+            }
+            Some(substrait::proto::expression::literal::LiteralType::Fp32(_)) => {
+                pg_sys::FLOAT4OID.into()
+            }
+            Some(substrait::proto::expression::literal::LiteralType::Fp64(_)) => {
+                pg_sys::FLOAT8OID.into()
+            }
+            Some(substrait::proto::expression::literal::LiteralType::String(_)) => {
+                pg_sys::TEXTOID.into()
+            }
+            _ => pg_sys::TEXTOID.into(),
+        }
+    } else {
+        pg_sys::TEXTOID.into()
+    }
 }

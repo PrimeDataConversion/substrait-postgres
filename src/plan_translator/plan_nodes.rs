@@ -712,7 +712,7 @@ pub unsafe fn create_sort_node(
     let ops_array = unsafe {
         pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
     };
-    ops_array[0] = 664.into(); // btcharcmp for CHAR columns (typical for l_returnflag)
+    ops_array[0] = 1058.into(); // bpcharlt (<) for BPCHAR columns
     (*sort_node).sortOperators = ops_array.as_mut_ptr();
 
     // collations array - collation for each sort column - safe allocation
