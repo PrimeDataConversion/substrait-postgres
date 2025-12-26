@@ -211,12 +211,12 @@ pub unsafe fn execute_plan_directly_raw(
 
     pgrx::info!("DEBUG: Manual initialization succeeded!");
 
-    // Get the plan state - ExecutorStart already called ExecInitNode for us!
+    // Get the plan state - we called ExecInitNode above.
     let plan_state = (*query_desc_ptr).planstate;
     if plan_state.is_null() {
-        pg_sys::ExecutorFinish(query_desc_ptr);
-        pg_sys::ExecutorEnd(query_desc_ptr);
-        return Err("ExecutorStart failed to create plan state".into());
+        // Manual cleanup since we bypassed ExecutorStart
+        pg_sys::FreeExecutorState(estate);
+        return Err("ExecInitNode failed to create plan state".into());
     }
 
     pgrx::info!("DEBUG: Plan state from ExecutorStart: {:p}", plan_state);
@@ -240,9 +240,9 @@ pub unsafe fn execute_plan_directly_raw(
         // Prevent infinite loops and excessive memory usage
         if tuple_count > 1000000 {
             pgrx::warning!("Query returned too many rows (> 1M), execution aborted");
-            // Clean up using PostgreSQL's proper sequence
-            pg_sys::ExecutorFinish(query_desc_ptr);
-            pg_sys::ExecutorEnd(query_desc_ptr);
+            // Manual cleanup since we bypassed ExecutorStart
+            pg_sys::ExecEndNode(plan_state);
+            pg_sys::FreeExecutorState(estate);
             return Err("Query returned too many rows (> 1M), execution aborted".into());
         }
     }
@@ -251,11 +251,12 @@ pub unsafe fn execute_plan_directly_raw(
         tuple_count
     );
 
-    // Clean up using PostgreSQL's proper ExecutorFinish and ExecutorEnd sequence
-    pgrx::info!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
-    pg_sys::ExecutorFinish(query_desc_ptr);
-    pg_sys::ExecutorEnd(query_desc_ptr);
-    pgrx::info!("DEBUG: ExecutorFinish and ExecutorEnd completed");
+    // Clean up manually since we bypassed ExecutorStart.
+    // ExecutorFinish/ExecutorEnd expect structures set up by ExecutorStart.
+    pgrx::info!("DEBUG: Cleaning up with manual ExecEndNode and FreeExecutorState");
+    pg_sys::ExecEndNode(plan_state);
+    pg_sys::FreeExecutorState(estate);
+    pgrx::info!("DEBUG: Manual cleanup completed");
 
     Ok((tupdesc, tuplestore))
 }
@@ -559,46 +560,6 @@ pub unsafe fn execute_plan_directly(
         tuplestore
     );
 
-    eprintln!("DEBUG: About to create executor state");
-    pgrx::info!("DEBUG: About to create executor state");
-
-    // Create executor state and start execution with proper error handling
-    let estate = pg_sys::CreateExecutorState();
-    if estate.is_null() {
-        eprintln!("ERROR: Failed to create executor state");
-        pgrx::info!("ERROR: Failed to create executor state");
-        return Err("Failed to create executor state".into());
-    }
-
-    eprintln!("DEBUG: Executor state created successfully: {estate:p}");
-    pgrx::info!("DEBUG: Executor state created successfully: {:p}", estate);
-
-    eprintln!("DEBUG: About to set range table on executor state");
-    pgrx::info!("DEBUG: About to set range table on executor state");
-    pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
-
-    // Set the range table from the translation phase or create it dynamically
-    if !range_table.is_null() {
-        eprintln!("DEBUG: Setting provided range table");
-        pgrx::info!("DEBUG: Setting provided range table");
-        (*estate).es_range_table = range_table as *mut pg_sys::List;
-        eprintln!("DEBUG: Set provided range table on executor state");
-        pgrx::info!("DEBUG: Set provided range table on executor state");
-    } else {
-        // Create range table dynamically from plan tree information
-        eprintln!("DEBUG: Creating range table dynamically from plan tree");
-        pgrx::info!("DEBUG: Creating range table dynamically from plan tree");
-        let dynamic_range_table = create_range_table_from_plan_tree(&*plan_tree)?;
-        if !dynamic_range_table.is_null() {
-            (*estate).es_range_table = dynamic_range_table;
-            eprintln!("DEBUG: Set dynamically created range table on executor state");
-            pgrx::info!("DEBUG: Set dynamically created range table on executor state");
-        } else {
-            eprintln!("DEBUG: Warning - no range table could be created");
-            pgrx::info!("DEBUG: Warning - no range table could be created");
-        }
-    }
-
     eprintln!("DEBUG: Using ExecutorStart pattern instead of direct ExecInitNode");
     pgrx::info!("DEBUG: Using ExecutorStart pattern instead of direct ExecInitNode");
 
@@ -707,8 +668,8 @@ pub unsafe fn execute_plan_directly(
     if plan_state.is_null() {
         eprintln!("ERROR: ExecutorStart returned null plan_state");
         pgrx::info!("ERROR: ExecutorStart returned null plan_state");
-        pg_sys::ExecutorFinish(query_desc_ptr);
-        pg_sys::ExecutorEnd(query_desc_ptr);
+        // Manual cleanup since we bypassed ExecutorStart
+        pg_sys::FreeExecutorState(estate);
         return Err("Failed to initialize plan node for execution".into());
     }
 
@@ -775,17 +736,19 @@ pub unsafe fn execute_plan_directly(
 
         // Prevent infinite loops and excessive memory usage
         if tuple_count > 1000000 {
-            pg_sys::ExecutorFinish(query_desc_ptr);
-            pg_sys::ExecutorEnd(query_desc_ptr);
+            // Manual cleanup since we bypassed ExecutorStart
+            pg_sys::ExecEndNode(plan_state);
+            pg_sys::FreeExecutorState(estate);
             return Err("Query returned too many rows (> 1M), execution aborted".into());
         }
     }
 
-    // Clean up using PostgreSQL's proper ExecutorFinish and ExecutorEnd sequence
-    eprintln!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
-    pgrx::info!("DEBUG: Cleaning up with ExecutorFinish and ExecutorEnd");
-    pg_sys::ExecutorFinish(query_desc_ptr);
-    pg_sys::ExecutorEnd(query_desc_ptr);
+    // Clean up manually since we bypassed ExecutorStart.
+    // ExecutorFinish/ExecutorEnd expect structures set up by ExecutorStart.
+    eprintln!("DEBUG: Cleaning up with manual ExecEndNode and FreeExecutorState");
+    pgrx::info!("DEBUG: Cleaning up with manual ExecEndNode and FreeExecutorState");
+    pg_sys::ExecEndNode(plan_state);
+    pg_sys::FreeExecutorState(estate);
 
     Ok((tupdesc, tuplestore))
 }
@@ -1149,22 +1112,25 @@ unsafe fn execute_postgres_plan_as_srf_inner(
             // Increment call counter
             (*funcctx).call_cntr += 1;
 
-            // For composite type SRF, return the heap tuple directly
-            // PostgreSQL will handle the type information from the blessed tuple descriptor
+            // For composite type SRF, use heap_copy_tuple_as_datum which properly
+            // sets up the type information from the tuple descriptor.
             (*fcinfo).isnull = false;
 
+            // Get the blessed tuple descriptor from function context
+            let tuple_desc = (*funcctx).tuple_desc;
+
             eprintln!(
-                "DEBUG: Returning heap tuple {:p} directly as datum for SRF",
-                heap_tuple
+                "DEBUG: Returning heap tuple {:p} via heap_copy_tuple_as_datum with tupdesc {:p}",
+                heap_tuple, tuple_desc
             );
             pgrx::info!(
-                "DEBUG: Returning heap tuple {:p} directly as datum for SRF",
-                heap_tuple
+                "DEBUG: Returning heap tuple {:p} via heap_copy_tuple_as_datum with tupdesc {:p}",
+                heap_tuple,
+                tuple_desc
             );
 
-            // Return the heap tuple as-is (HeapTupleGetDatum)
-            // The blessed tuple descriptor context should handle type information
-            pg_sys::Datum::from(heap_tuple as usize)
+            // Use heap_copy_tuple_as_datum which sets the proper type info
+            pg_sys::heap_copy_tuple_as_datum(heap_tuple, tuple_desc)
         } else {
             pg_sys::ExecDropSingleTupleTableSlot(slot);
             pg_sys::end_MultiFuncCall(fcinfo, funcctx);
