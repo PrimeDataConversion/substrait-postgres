@@ -57,7 +57,8 @@ impl AggNodeBuilder {
         (*node).plan.targetlist = std::ptr::null_mut();
 
         // Initialize all Agg-specific fields
-        (*node).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
+        // Note: aggstrategy will be set later based on whether there are GROUP BY columns
+        (*node).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN; // Default, overridden in set_group_columns
         (*node).aggsplit = pg_sys::AggSplit::AGGSPLIT_SIMPLE;
         (*node).numCols = 0;
         (*node).grpColIdx = std::ptr::null_mut();
@@ -77,6 +78,17 @@ impl AggNodeBuilder {
         (*self.ptr).numCols = n;
         // CRITICAL: Set numGroups to match numCols for GROUP BY queries
         (*self.ptr).numGroups = if n > 0 { 1 } else { 0 };
+
+        // Set aggstrategy based on whether there are GROUP BY columns
+        // AGG_PLAIN (0) = no grouping, just aggregate
+        // AGG_SORTED (1) = input is sorted on grouping columns
+        // AGG_HASHED (2) = use hash tables for grouping
+        // Note: Using AGG_SORTED which expects sorted input (may need Sort below Agg)
+        if n > 0 {
+            (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_SORTED;
+        } else {
+            (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
+        }
 
         if n == 0 {
             (*self.ptr).grpColIdx = std::ptr::null_mut();
@@ -114,6 +126,7 @@ impl AggNodeBuilder {
 struct TargetListBuilder {
     list: PgList<pg_sys::TargetEntry>,
     resno: i32,
+    agg_count: i32, // Track aggregate ordinal (aggno/aggtransno)
     input_plan: *mut pg_sys::Plan,
 }
 
@@ -122,6 +135,7 @@ impl TargetListBuilder {
         Self {
             list: PgList::new(),
             resno: 1,
+            agg_count: 0, // Initialize aggregate counter
             input_plan,
         }
     }
@@ -193,9 +207,10 @@ impl TargetListBuilder {
         agg.aggkind = b'n' as i8; // AGGKIND_NORMAL = 'n'
         agg.aggpresorted = false; // Input not presorted
         agg.agglevelsup = 0; // Not in outer query
-        agg.aggno = (self.resno - 1) as i32; // Aggregate sequence number
-        agg.aggtransno = (self.resno - 1) as i32; // Transition state number
+        agg.aggno = self.agg_count; // Aggregate ordinal (0-based, among all aggregates)
+        agg.aggtransno = self.agg_count; // Transition state number (same as aggno for simple aggs)
         agg.location = -1; // Unknown location in query string
+        self.agg_count += 1; // Increment for next aggregate
 
         let mut entry = PgBox::<pg_sys::TargetEntry>::alloc0();
         entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry; // CRITICAL: Set the node type!

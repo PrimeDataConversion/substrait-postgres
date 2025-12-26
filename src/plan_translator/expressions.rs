@@ -135,7 +135,7 @@ pub unsafe fn create_date_const(
     const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
     const_node.consttype = type_oid;
     const_node.consttypmod = -1;
-    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constcollid = pg_sys::InvalidOid; // DATE is not collatable
     const_node.constlen = 4;
     const_node.constvalue = pg_sys::Datum::from(value - PG_DATE_EPOCH_OFFSET);
     const_node.constisnull = false;
@@ -188,8 +188,8 @@ pub unsafe fn create_int4_const(
     const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
     const_node.consttype = type_oid;
     const_node.consttypmod = -1;
-    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
-    // Use catalog-derived type information instead of hardcoded values
+    const_node.constcollid = pg_sys::InvalidOid; // INT4 is not collatable
+                                                 // Use catalog-derived type information instead of hardcoded values
     const_node.constlen = type_len;
     const_node.constvalue = pg_sys::Datum::from(value);
     const_node.constisnull = false;
@@ -223,7 +223,7 @@ pub unsafe fn create_int8_const(
     const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
     const_node.consttype = type_oid;
     const_node.consttypmod = -1;
-    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constcollid = pg_sys::InvalidOid; // INT8 is not collatable
     const_node.constlen = 8;
     const_node.constvalue = pg_sys::Datum::from(value);
     const_node.constisnull = false;
@@ -247,7 +247,7 @@ pub unsafe fn create_bool_const(
     const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
     const_node.consttype = type_oid;
     const_node.consttypmod = -1;
-    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constcollid = pg_sys::InvalidOid; // BOOL is not collatable
     const_node.constlen = 1; // Boolean is 1 byte
     const_node.constvalue = pg_sys::Datum::from(value);
     const_node.constisnull = false;
@@ -340,7 +340,7 @@ pub unsafe fn create_numeric_const(
     const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
     const_node.consttype = type_oid;
     const_node.consttypmod = -1; // Let PostgreSQL determine typmod from value
-    const_node.constcollid = pg_sys::DEFAULT_COLLATION_OID;
+    const_node.constcollid = pg_sys::InvalidOid; // NUMERIC is not collatable
     const_node.constlen = -1; // Variable length
     const_node.constvalue = numeric_value.into_datum().unwrap();
     const_node.constisnull = false;
@@ -575,6 +575,12 @@ pub unsafe fn create_binary_op_expr(
     Ok(op_expr as *mut pg_sys::Expr)
 }
 
+/// Check if a type OID represents a collatable type
+unsafe fn is_type_collatable(type_oid: pg_sys::Oid) -> bool {
+    // Use PostgreSQL's type_is_collatable function
+    pg_sys::type_is_collatable(type_oid)
+}
+
 /// Create a PostgreSQL function call expression
 pub unsafe fn create_function_call_expr(
     function_oid: pg_sys::Oid,
@@ -588,14 +594,33 @@ pub unsafe fn create_function_call_expr(
     (*func_expr).funcresulttype = result_type;
     (*func_expr).funcretset = false;
     (*func_expr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
-    (*func_expr).funccollid = pg_sys::DEFAULT_COLLATION_OID;
-    (*func_expr).inputcollid = pg_sys::DEFAULT_COLLATION_OID;
+
+    // Set collation based on whether the result type is collatable
+    if is_type_collatable(result_type) {
+        (*func_expr).funccollid = pg_sys::DEFAULT_COLLATION_OID;
+        // For input collation, check if any argument is collatable
+        let mut input_collid = pg_sys::InvalidOid;
+        for arg in arguments {
+            if !(*arg).is_null() {
+                let arg_type = pg_sys::exprType(*arg as *const pg_sys::Node);
+                if is_type_collatable(arg_type) {
+                    input_collid = pg_sys::DEFAULT_COLLATION_OID;
+                    break;
+                }
+            }
+        }
+        (*func_expr).inputcollid = input_collid;
+    } else {
+        (*func_expr).funccollid = pg_sys::InvalidOid;
+        (*func_expr).inputcollid = pg_sys::InvalidOid;
+    }
 
     eprintln!(
-        "DEBUG: create_function_call_expr - func_expr type: {:?}, funcid: {}, funcresulttype: {}",
-        (*func_expr).xpr.type_,
+        "DEBUG: create_function_call_expr - funcid: {}, resulttype: {}, funccollid: {}, inputcollid: {}",
         (*func_expr).funcid.to_u32(),
-        (*func_expr).funcresulttype.to_u32()
+        (*func_expr).funcresulttype.to_u32(),
+        (*func_expr).funccollid.to_u32(),
+        (*func_expr).inputcollid.to_u32()
     );
 
     let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
@@ -1750,20 +1775,60 @@ unsafe fn convert_expression_to_target_entry_with_schema(
                 Err(format!("Literal expression {index} missing literal type").into())
             }
         }
-        _ => {
-            // For other expression types, fall back to the existing context-based approach
-            // TODO: Implement schema-based resolution for scalar functions, casts, etc.
-            let target_entry = convert_expression_to_target_entry_with_context(
-                expr,
-                index,
-                function_map,
-                None, // No table OID since we're using schema
-            )?;
+        Some(RexType::ScalarFunction(func)) => {
+            // Handle scalar function expressions with schema-based type resolution
+            let func_expr =
+                create_scalar_function_expr_with_schema(func, function_map, input_schema)?;
 
-            // Create a placeholder column info with TEXT type for now
-            let column_info = ColumnInfo::with_type(pg_sys::TEXTOID);
+            // Get the result type from the created expression
+            let result_type = pg_sys::exprType(func_expr as *const pg_sys::Node);
+            let column_info = ColumnInfo::with_type(result_type);
+
+            // Create TargetEntry
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = func_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
 
             Ok((target_entry, column_info))
+        }
+        Some(RexType::Cast(cast)) => {
+            // Handle cast expressions with schema-based type resolution
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres_with_schema(input, function_map, input_schema)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            let (cast_expr, target_oid) = if let Some(cast_type) = &cast.r#type {
+                let target_oid = get_pg_type_oid(cast_type)?;
+                (create_cast_expr(input_expr, target_oid)?, target_oid)
+            } else {
+                return Err("Cast expression missing type".into());
+            };
+
+            let column_info = ColumnInfo::with_type(target_oid);
+
+            // Create TargetEntry
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = cast_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
+        _ => {
+            // For unsupported expression types, return an error
+            Err(
+                format!("Unsupported expression type at index {index} in schema-based conversion")
+                    .into(),
+            )
         }
     }
 }
@@ -1813,6 +1878,416 @@ pub unsafe fn convert_selection_to_postgres_with_schema(
         }
     } else {
         Err("Missing reference type in selection".into())
+    }
+}
+
+/// Convert expression to PostgreSQL with schema-based type resolution
+/// This is the main entry point for schema-aware expression conversion
+pub unsafe fn convert_expression_to_postgres_with_schema(
+    expr: &Expression,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            // Handle literal values
+            if let Some(literal_type) = &literal.literal_type {
+                match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        create_int8_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        create_date_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Decimal(d) => {
+                        create_numeric_const(&d.value, d.precision, d.scale)
+                    }
+                    _ => Err("Unsupported literal type in expression".into()),
+                }
+            } else {
+                Err("Literal expression missing literal type".into())
+            }
+        }
+        Some(RexType::Selection(selection)) => {
+            convert_selection_to_postgres_with_schema(selection, input_schema)
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            create_scalar_function_expr_with_schema(func, function_map, input_schema)
+        }
+        Some(RexType::Cast(cast)) => {
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres_with_schema(input, function_map, input_schema)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            if let Some(cast_type) = &cast.r#type {
+                let target_oid = get_pg_type_oid(cast_type)?;
+                create_cast_expr(input_expr, target_oid)
+            } else {
+                Err("Cast expression missing type".into())
+            }
+        }
+        Some(rex_type) => {
+            let type_name = get_expression_type_name(rex_type);
+            Err(
+                format!("Unsupported expression type in schema-based conversion: {type_name}")
+                    .into(),
+            )
+        }
+        None => Err("Expression missing rex_type".into()),
+    }
+}
+
+/// Extract PostgreSQL expressions from Substrait function arguments with schema-based type resolution.
+unsafe fn extract_function_arguments_with_schema(
+    func_arguments: &[substrait::proto::FunctionArgument],
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<Vec<*mut pg_sys::Expr>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut pg_args = Vec::with_capacity(func_arguments.len());
+    for arg in func_arguments {
+        if let Some(value) = &arg.arg_type {
+            match value {
+                substrait::proto::function_argument::ArgType::Value(expr) => {
+                    let pg_expr = convert_expression_to_postgres_with_schema(
+                        expr,
+                        function_map,
+                        input_schema,
+                    )?;
+                    pg_args.push(pg_expr);
+                }
+                _ => {
+                    return Err("Unsupported argument type in function".into());
+                }
+            }
+        } else {
+            return Err("Missing argument type in function".into());
+        }
+    }
+    Ok(pg_args)
+}
+
+/// Create scalar function expression with schema-based type resolution
+pub unsafe fn create_scalar_function_expr_with_schema(
+    func: &substrait::proto::expression::ScalarFunction,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let function_reference = func.function_reference;
+    let argument_count = func.arguments.len();
+
+    // Look up function name from extension map
+    let function_name = function_map
+        .get(&function_reference)
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    eprintln!("DEBUG: Schema-based scalar function: ref={function_reference}, name={function_name}, args={argument_count}");
+
+    // Handle specific function types based on name
+    match function_name {
+        "lte:date_date" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid = lookup_function_oid("date_le", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("lte:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "and:bool" => {
+            if func.arguments.len() >= 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::AND_EXPR;
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                for arg in pg_args {
+                    args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
+                }
+                (*bool_expr).args = args_list;
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(
+                    format!("and:bool function expects at least 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "multiply:fp64_fp64" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("float8mul", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+            } else {
+                Err(format!(
+                    "multiply:fp64_fp64 function expects 2 arguments, got {argument_count}"
+                )
+                .into())
+            }
+        }
+        "subtract:fp64_fp64" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("float8mi", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+            } else {
+                Err(format!(
+                    "subtract:fp64_fp64 function expects 2 arguments, got {argument_count}"
+                )
+                .into())
+            }
+        }
+        "add:fp64_fp64" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("float8pl", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("add:fp64_fp64 function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "or:bool" => {
+            if func.arguments.len() >= 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::OR_EXPR;
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                for arg in pg_args {
+                    args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
+                }
+                (*bool_expr).args = args_list;
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(
+                    format!("or:bool function expects at least 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "not:bool" => {
+            if func.arguments.len() == 1 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let arg = pg_args[0];
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
+                (*bool_expr).args = args_list;
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(format!("not:bool function expects 1 argument, got {argument_count}").into())
+            }
+        }
+        // For all comparison and arithmetic functions, use schema-based argument extraction
+        // and look up function OID dynamically based on actual argument types
+        "equal:any_any" | "not_equal:any_any" | "lt:any_any" | "gt:any_any" | "lte:any_any"
+        | "gte:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                let func_name = match function_name {
+                    "equal:any_any" => "eq",
+                    "not_equal:any_any" => "ne",
+                    "lt:any_any" => "lt",
+                    "gt:any_any" => "gt",
+                    "lte:any_any" => "le",
+                    "gte:any_any" => "ge",
+                    _ => unreachable!(),
+                };
+                let func_oid = lookup_function_oid(func_name, &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("{function_name} function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "lt:date_date" | "gt:date_date" | "gte:date_date" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_name = match function_name {
+                    "lt:date_date" => "date_lt",
+                    "gt:date_date" => "date_gt",
+                    "gte:date_date" => "date_ge",
+                    _ => unreachable!(),
+                };
+                let func_oid = lookup_function_oid(func_name, &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("{function_name} function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "multiply:dec_dec" | "subtract:dec_dec" | "divide:dec_dec" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_name = match function_name {
+                    "multiply:dec_dec" => "numeric_mul",
+                    "subtract:dec_dec" => "numeric_sub",
+                    "divide:dec_dec" => "numeric_div",
+                    _ => unreachable!(),
+                };
+                let func_oid = lookup_function_oid(func_name, &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("{function_name} function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "like:str_str" | "like:vchar_vchar" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("{function_name} function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "add:i32_i32" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let right_type = get_expr_type_oid(right_arg)?;
+                let func_oid = lookup_function_oid("int4pl", &[left_type, right_type])?;
+                create_function_call_expr(func_oid, pg_sys::INT4OID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("add:i32_i32 function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "divide:fp64_fp64" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_schema(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("float8div", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("divide:fp64_fp64 function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        _ => {
+            // For unsupported functions, fall back to context-based approach
+            eprintln!("DEBUG: Unsupported function in schema-based conversion: {function_name}, falling back");
+            create_scalar_function_expr_with_context(func, function_map, None)
+        }
     }
 }
 

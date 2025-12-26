@@ -1,6 +1,7 @@
 use super::constants::get_relation_type_name;
 use super::expressions::{
-    convert_expression_to_postgres_with_context, convert_expressions_to_target_list_with_schema,
+    convert_expression_to_postgres_with_context, convert_expression_to_postgres_with_schema,
+    convert_expressions_to_target_list_with_schema,
 };
 use super::plan_nodes::*;
 use super::schema::RelationSchema;
@@ -466,22 +467,18 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             eprintln!("DEBUG: Filter - about to convert condition");
             pgrx::info!("DEBUG: Filter - about to convert condition");
 
-            // Convert the filter condition to a PostgreSQL expression
+            // Convert the filter condition to a PostgreSQL expression using schema-based type resolution
             let condition_expr = if let Some(condition) = &filter.condition {
-                eprintln!("DEBUG: Filter - calling convert_expression_to_postgres_with_context");
-                pgrx::info!("DEBUG: Filter - calling convert_expression_to_postgres_with_context");
+                eprintln!("DEBUG: Filter - calling convert_expression_to_postgres_with_schema");
+                pgrx::info!("DEBUG: Filter - calling convert_expression_to_postgres_with_schema");
 
-                convert_expression_to_postgres_with_context(
-                    condition,
-                    function_map,
-                    current_table_oid,
-                )?
+                convert_expression_to_postgres_with_schema(condition, function_map, &input_schema)?
             } else {
                 return Err("Filter relation missing condition".into());
             };
 
-            eprintln!("DEBUG: Filter - condition converted");
-            pgrx::info!("DEBUG: Filter - condition converted");
+            eprintln!("DEBUG: Filter - condition converted with schema-based types");
+            pgrx::info!("DEBUG: Filter - condition converted with schema-based types");
 
             // Filter passes through input schema and range table unchanged
             Ok((
