@@ -47,24 +47,35 @@ pub unsafe fn lookup_function_oid(
     function_name: &str,
     argument_types: &[pg_sys::Oid],
 ) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
-    let func_name_c = std::ffi::CString::new(function_name).unwrap();
-    let n_args = argument_types.len() as i32;
-
-    // Construct oidvector for proargtypes
-    let mut oid_vector = std::ptr::null_mut();
-    if n_args > 0 {
-        oid_vector = pg_sys::buildoidvector(argument_types.as_ptr(), n_args);
-    }
-
-    let tuple = pg_sys::SearchSysCache4(
-        pg_sys::SysCacheIdentifier::PROCNAMEARGSNSP as i32,
-        pg_sys::Datum::from(func_name_c.as_ptr()),
-        pg_sys::Datum::from(oid_vector),
-        pg_sys::Datum::from(pg_sys::PG_CATALOG_NAMESPACE), // Search in pg_catalog schema
-        0.into(),
+    pgrx::info!(
+        "DEBUG: lookup_function_oid called for '{}' with {} args",
+        function_name,
+        argument_types.len()
     );
 
-    if tuple.is_null() {
+    // Use PostgreSQL's built-in function to look up the function OID.
+    // This is safer than SearchSysCache4 which requires proper NameData.
+    let func_name_c = std::ffi::CString::new(function_name).unwrap();
+
+    // Build a list with a single function name element.
+    let name_string = pg_sys::makeString(func_name_c.as_ptr() as *mut i8);
+    let name_list = pg_sys::lappend(std::ptr::null_mut(), name_string as *mut std::ffi::c_void);
+
+    pgrx::info!("DEBUG: lookup_function_oid - calling LookupFuncName");
+
+    let func_oid = pg_sys::LookupFuncName(
+        name_list,
+        argument_types.len() as i32,
+        argument_types.as_ptr(),
+        true, // missing_ok
+    );
+
+    pgrx::info!(
+        "DEBUG: lookup_function_oid - LookupFuncName returned OID: {}",
+        func_oid.to_u32()
+    );
+
+    if func_oid == pg_sys::InvalidOid {
         return Err(format!(
             "Function '{}' with {} arguments not found in pg_proc",
             function_name,
@@ -73,12 +84,7 @@ pub unsafe fn lookup_function_oid(
         .into());
     }
 
-    let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
-    let function_oid = (*proc_form).oid;
-
-    pg_sys::ReleaseSysCache(tuple);
-
-    Ok(function_oid)
+    Ok(func_oid)
 }
 
 /// Look up the function OID for a given operator OID.
@@ -254,6 +260,15 @@ pub unsafe fn create_bool_const(
 pub unsafe fn create_text_const(
     value: &str,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!(
+        "DEBUG: create_text_const called with value len={}",
+        value.len()
+    );
+    pgrx::info!(
+        "DEBUG: create_text_const called with value len={}",
+        value.len()
+    );
+
     // Use the PostgreSQL built-in constant, but validate it first
     let type_oid = pg_sys::TEXTOID;
 
@@ -262,10 +277,14 @@ pub unsafe fn create_text_const(
         return Err(format!("Invalid TEXTOID: {type_oid}").into());
     }
 
+    pgrx::info!("DEBUG: About to call cstring_to_text_with_len");
     let text_datum =
         pg_sys::cstring_to_text_with_len(value.as_ptr() as *const i8, value.len() as i32);
+    pgrx::info!("DEBUG: cstring_to_text_with_len returned: {:p}", text_datum);
 
+    pgrx::info!("DEBUG: About to alloc Const node");
     let mut const_node = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    pgrx::info!("DEBUG: Const node allocated, setting fields");
     const_node.xpr.type_ = pg_sys::NodeTag::T_Const;
     const_node.consttype = type_oid;
     const_node.consttypmod = -1;
@@ -275,6 +294,7 @@ pub unsafe fn create_text_const(
     const_node.constisnull = false;
     const_node.constbyval = false;
 
+    pgrx::info!("DEBUG: Const node created successfully");
     Ok(const_node.into_pg() as *mut pg_sys::Expr)
 }
 
@@ -437,22 +457,54 @@ pub unsafe fn create_cast_expr(
     arg: *mut pg_sys::Expr,
     target_type_oid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let source_type_oid = pg_sys::exprType(arg as *const pg_sys::Node);
+    eprintln!(
+        "DEBUG: create_cast_expr called - source OID: {}, target OID: {}",
+        source_type_oid.to_u32(),
+        target_type_oid.to_u32()
+    );
+    pgrx::info!(
+        "DEBUG: create_cast_expr called - source OID: {}, target OID: {}",
+        source_type_oid.to_u32(),
+        target_type_oid.to_u32()
+    );
+
+    // If source and target types are the same, just return the argument.
+    if source_type_oid == target_type_oid {
+        eprintln!("DEBUG: create_cast_expr - same type, returning arg as-is");
+        pgrx::info!("DEBUG: create_cast_expr - same type, returning arg as-is");
+        return Ok(arg);
+    }
+
+    eprintln!("DEBUG: create_cast_expr - about to call coerce_type");
+    pgrx::info!("DEBUG: create_cast_expr - about to call coerce_type");
+
+    // Use coerce_type with COERCE_EXPLICIT_CAST format (not CoercionPathType!).
     let cast_expr = pg_sys::coerce_type(
-        std::ptr::null_mut(),                         // ParseState *pstate
-        arg as *mut pg_sys::Node,                     // Node *node
-        pg_sys::exprType(arg as *const pg_sys::Node), // Oid inputTypeId
-        target_type_oid,                              // Oid targetTypeId
-        -1,                                           // int32 targetTypeMod
-        pg_sys::CoercionContext::COERCION_EXPLICIT,   // CoercionContext ccontext
-        pg_sys::CoercionPathType::COERCION_PATH_FUNC, // CoercionPathType ptype
-        -1,                                           // int location
+        std::ptr::null_mut(),                       // ParseState *pstate
+        arg as *mut pg_sys::Node,                   // Node *node
+        source_type_oid,                            // Oid inputTypeId
+        target_type_oid,                            // Oid targetTypeId
+        -1,                                         // int32 targetTypeMod
+        pg_sys::CoercionContext::COERCION_EXPLICIT, // CoercionContext ccontext
+        pg_sys::CoercionForm::COERCE_EXPLICIT_CAST, // CoercionForm cformat
+        -1,                                         // int location
+    );
+
+    eprintln!(
+        "DEBUG: create_cast_expr - coerce_type returned: {:p}",
+        cast_expr
+    );
+    pgrx::info!(
+        "DEBUG: create_cast_expr - coerce_type returned: {:p}",
+        cast_expr
     );
 
     if cast_expr.is_null() {
         return Err(format!(
             "Failed to coerce type from OID {} to OID {}",
-            pg_sys::exprType(arg as *const pg_sys::Node),
-            target_type_oid
+            source_type_oid.to_u32(),
+            target_type_oid.to_u32()
         )
         .into());
     }
@@ -595,13 +647,39 @@ pub unsafe fn convert_expression_to_postgres_with_context(
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::RexType;
 
-    eprintln!("DEBUG: convert_expression_to_postgres_with_context called with expr: {expr:?}");
+    // Identify the rex_type without printing the full expression
+    let rex_type_name = match &expr.rex_type {
+        Some(substrait::proto::expression::RexType::Literal(_)) => "Literal",
+        Some(substrait::proto::expression::RexType::Selection(_)) => "Selection",
+        Some(substrait::proto::expression::RexType::ScalarFunction(_)) => "ScalarFunction",
+        Some(substrait::proto::expression::RexType::Cast(_)) => "Cast",
+        Some(substrait::proto::expression::RexType::Subquery(_)) => "Subquery",
+        Some(_) => "Other",
+        None => "None",
+    };
+    eprintln!(
+        "DEBUG: convert_expression_to_postgres_with_context called, rex_type={rex_type_name}"
+    );
+    pgrx::info!(
+        "DEBUG: convert_expression_to_postgres_with_context called, rex_type={}",
+        rex_type_name
+    );
 
     match &expr.rex_type {
         Some(RexType::Literal(literal)) => {
             // Handle literal values
             if let Some(literal_type) = &literal.literal_type {
-                eprintln!("DEBUG: Literal type: {literal_type:?}");
+                let type_name = match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(_) => "I32",
+                    substrait::proto::expression::literal::LiteralType::I64(_) => "I64",
+                    substrait::proto::expression::literal::LiteralType::String(_) => "String",
+                    substrait::proto::expression::literal::LiteralType::Date(_) => "Date",
+                    substrait::proto::expression::literal::LiteralType::FixedChar(_) => "FixedChar",
+                    substrait::proto::expression::literal::LiteralType::Decimal(_) => "Decimal",
+                    _ => "Other",
+                };
+                eprintln!("DEBUG: Literal type: {type_name}");
+                pgrx::info!("DEBUG: Literal type: {}", type_name);
                 match literal_type {
                     substrait::proto::expression::literal::LiteralType::I32(val) => {
                         create_int4_const(*val)
@@ -1017,13 +1095,22 @@ pub unsafe fn create_scalar_function_expr_with_context(
     eprintln!("  function_reference: {function_reference}");
     eprintln!("  function_name: {function_name}");
     eprintln!("  arguments.len(): {argument_count}");
+    pgrx::info!(
+        "DEBUG: Scalar function: ref={}, name={}, args={}",
+        function_reference,
+        function_name,
+        argument_count
+    );
 
     // Handle specific function types based on name
     match function_name {
         "lte:date_date" => {
+            pgrx::info!("DEBUG: Processing lte:date_date function");
             if func.arguments.len() == 2 {
+                pgrx::info!("DEBUG: About to extract 2 arguments for lte:date_date");
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
+                pgrx::info!("DEBUG: Arguments extracted successfully, creating function call");
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 

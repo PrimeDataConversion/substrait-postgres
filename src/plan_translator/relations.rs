@@ -79,11 +79,20 @@ pub unsafe fn convert_plan_relation_to_plan_tree_with_context(
                         "DEBUG: Root has input, calling convert_rel_to_plan_tree_with_context"
                     );
 
-                    let (plan, range_table, schema) = convert_rel_to_plan_tree_with_context(
+                    let result = convert_rel_to_plan_tree_with_context(
                         input,
                         _function_map,
                         current_table_oid,
-                    )?;
+                    );
+
+                    eprintln!("DEBUG: convert_rel_to_plan_tree_with_context returned to caller");
+                    pgrx::info!("DEBUG: convert_rel_to_plan_tree_with_context returned to caller");
+
+                    let (plan, range_table, schema) = result?;
+
+                    eprintln!("DEBUG: Unpacked result successfully, plan={:p}", plan);
+                    pgrx::info!("DEBUG: Unpacked result successfully, plan={:p}", plan);
+
                     Ok((plan, range_table, schema))
                 } else {
                     Err("Root relation missing input".into())
@@ -361,22 +370,22 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         }
         Some(RelType::Sort(sort)) => {
             // Handle sort relation - create a Sort node
-            let (input_plan, _input_range_table, input_schema) = if let Some(input) = &sort.input {
+            let (input_plan, input_range_table, input_schema) = if let Some(input) = &sort.input {
                 convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Sort relation missing input".into());
             };
 
-            // Sort passes through input schema unchanged
+            // Sort passes through input schema and range table unchanged
             Ok((
                 create_sort_node(input_plan, &sort.sorts)?,
-                std::ptr::null_mut(),
+                input_range_table,
                 input_schema,
             ))
         }
         Some(RelType::Fetch(fetch)) => {
             // Handle fetch relation - create a Limit node
-            let (input_plan, _input_range_table, input_schema) = if let Some(input) = &fetch.input {
+            let (input_plan, input_range_table, input_schema) = if let Some(input) = &fetch.input {
                 convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
             } else {
                 return Err("Fetch relation missing input".into());
@@ -423,24 +432,45 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 None // No count limit
             };
 
-            // Fetch/Limit passes through input schema unchanged
+            // Fetch/Limit passes through input schema and range table unchanged
             Ok((
                 create_limit_node_with_expressions(input_plan, offset_expr, count_expr)?,
-                std::ptr::null_mut(),
+                input_range_table,
                 input_schema,
             ))
         }
         Some(RelType::Filter(filter)) => {
             // Handle filter relation - create a Filter node
-            let (input_plan, _input_range_table, input_schema) = if let Some(input) = &filter.input
-            {
-                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
+            eprintln!("DEBUG: Filter - about to process input");
+            pgrx::info!("DEBUG: Filter - about to process input");
+
+            let (input_plan, input_range_table, input_schema) = if let Some(input) = &filter.input {
+                eprintln!(
+                    "DEBUG: Filter - calling recursive convert_rel_to_plan_tree_with_context"
+                );
+                pgrx::info!(
+                    "DEBUG: Filter - calling recursive convert_rel_to_plan_tree_with_context"
+                );
+
+                let res =
+                    convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?;
+
+                eprintln!("DEBUG: Filter - recursive call returned!");
+                pgrx::info!("DEBUG: Filter - recursive call returned!");
+
+                res
             } else {
                 return Err("Filter relation missing input".into());
             };
 
+            eprintln!("DEBUG: Filter - about to convert condition");
+            pgrx::info!("DEBUG: Filter - about to convert condition");
+
             // Convert the filter condition to a PostgreSQL expression
             let condition_expr = if let Some(condition) = &filter.condition {
+                eprintln!("DEBUG: Filter - calling convert_expression_to_postgres_with_context");
+                pgrx::info!("DEBUG: Filter - calling convert_expression_to_postgres_with_context");
+
                 convert_expression_to_postgres_with_context(
                     condition,
                     function_map,
@@ -450,22 +480,25 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 return Err("Filter relation missing condition".into());
             };
 
-            // Filter passes through input schema unchanged
+            eprintln!("DEBUG: Filter - condition converted");
+            pgrx::info!("DEBUG: Filter - condition converted");
+
+            // Filter passes through input schema and range table unchanged
             Ok((
                 create_filter_node(input_plan, condition_expr)?,
-                std::ptr::null_mut(),
+                input_range_table, // Pass through range table from input
                 input_schema,
             ))
         }
         Some(RelType::Cross(cross)) => {
             // Handle cross relation - create a NestLoop node for Cartesian product
-            let (left_plan, _left_range_table, left_schema) = if let Some(left) = &cross.left {
+            let (left_plan, left_range_table, left_schema) = if let Some(left) = &cross.left {
                 convert_rel_to_plan_tree_with_context(left, function_map, current_table_oid)?
             } else {
                 return Err("Cross relation missing left input".into());
             };
 
-            let (right_plan, _right_range_table, right_schema) = if let Some(right) = &cross.right {
+            let (right_plan, right_range_table, right_schema) = if let Some(right) = &cross.right {
                 convert_rel_to_plan_tree_with_context(right, function_map, current_table_oid)?
             } else {
                 return Err("Cross relation missing right input".into());
@@ -477,15 +510,18 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 combined_schema.add_column(column);
             }
 
+            // Combine range tables from left and right
+            let combined_range_table = pg_sys::list_concat(left_range_table, right_range_table);
+
             Ok((
                 create_cross_join_node(left_plan, right_plan)?,
-                std::ptr::null_mut(),
+                combined_range_table,
                 combined_schema,
             ))
         }
         Some(RelType::Aggregate(aggregate)) => {
             // Handle aggregate relation - create an Agg node for GROUP BY and aggregate functions
-            let (input_plan, _input_range_table, _input_schema) =
+            let (input_plan, input_range_table, _input_schema) =
                 if let Some(input) = &aggregate.input {
                     convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
                 } else {
@@ -499,19 +535,19 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 
             Ok((
                 create_aggregate_node(input_plan, aggregate, function_map)?,
-                std::ptr::null_mut(),
+                input_range_table, // Pass through range table from input
                 aggregate_schema,
             ))
         }
         Some(RelType::Join(join)) => {
             // Handle join relation
-            let (left_plan, _left_range_table, left_schema) = if let Some(left) = &join.left {
+            let (left_plan, left_range_table, left_schema) = if let Some(left) = &join.left {
                 convert_rel_to_plan_tree_with_context(left, function_map, current_table_oid)?
             } else {
                 return Err("Join relation missing left input".into());
             };
 
-            let (right_plan, _right_range_table, right_schema) = if let Some(right) = &join.right {
+            let (right_plan, right_range_table, right_schema) = if let Some(right) = &join.right {
                 convert_rel_to_plan_tree_with_context(right, function_map, current_table_oid)?
             } else {
                 return Err("Join relation missing right input".into());
@@ -544,9 +580,12 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 combined_schema.add_column(column);
             }
 
+            // Combine range tables from left and right
+            let combined_range_table = pg_sys::list_concat(left_range_table, right_range_table);
+
             Ok((
                 create_join_node(left_plan, right_plan, join_type, join_qual)?,
-                std::ptr::null_mut(),
+                combined_range_table,
                 combined_schema,
             ))
         }
@@ -559,10 +598,34 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 
     pgrx::info!("DEBUG: About to return from convert_rel_to_plan_tree_with_context");
 
-    // Now I know the issue is with plan tree memory validity, not return mechanism
-    // Let me try to return the actual result but ensure memory validity
-    eprintln!("DEBUG: Attempting to return actual result with memory validation");
-    pgrx::info!("DEBUG: Attempting to return actual result with memory validation");
+    // Validate result before returning
+    if let Ok((plan, range_table, ref schema)) = &result {
+        eprintln!(
+            "DEBUG: Result is Ok - plan={:p}, range_table={:p}, schema_columns={}",
+            *plan,
+            *range_table,
+            schema.column_count()
+        );
+        pgrx::info!(
+            "DEBUG: Result is Ok - plan={:p}, range_table={:p}, schema_columns={}",
+            *plan,
+            *range_table,
+            schema.column_count()
+        );
+
+        // Validate plan pointer
+        if !plan.is_null() {
+            let plan_type = (**plan).type_;
+            eprintln!("DEBUG: Plan node type: {:?}", plan_type);
+            pgrx::info!("DEBUG: Plan node type: {:?}", plan_type);
+        }
+    } else if let Err(ref e) = result {
+        eprintln!("DEBUG: Result is Err: {}", e);
+        pgrx::info!("DEBUG: Result is Err: {}", e);
+    }
+
+    eprintln!("DEBUG: About to return result from function");
+    pgrx::info!("DEBUG: About to return result from function");
 
     result
 }

@@ -145,6 +145,7 @@ pub unsafe fn execute_plan_directly_raw(
     planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
     planned_stmt.planTree = plan_tree;
     planned_stmt.rtable = range_table as *mut pg_sys::List;
+    planned_stmt.permInfos = std::ptr::null_mut(); // Empty permission info list - we bypass checks
     planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
     planned_stmt.canSetTag = true; // Important for SELECT queries
     planned_stmt.utilityStmt = std::ptr::null_mut();
@@ -181,7 +182,15 @@ pub unsafe fn execute_plan_directly_raw(
         return Err("Failed to create executor state".into());
     }
 
-    (*estate).es_range_table = range_table as *mut pg_sys::List;
+    // Use ExecInitRangeTable to properly initialize range table and related arrays.
+    // Pass empty permInfos list - we bypass permission checks for Substrait plans.
+    let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
+    pg_sys::ExecInitRangeTable(estate, range_table as *mut pg_sys::List, empty_perminfos);
+    pgrx::info!("DEBUG: ExecInitRangeTable completed");
+
+    // Set the planned statement reference on estate.
+    (*estate).es_plannedstmt = planned_stmt_ptr;
+
     (*estate).es_output_cid = 0;
     (*estate).es_snapshot = (*query_desc_ptr).snapshot;
     (*estate).es_crosscheck_snapshot = (*query_desc_ptr).crosscheck_snapshot;
@@ -573,6 +582,7 @@ pub unsafe fn execute_plan_directly(
     planned_stmt.type_ = pg_sys::NodeTag::T_PlannedStmt;
     planned_stmt.planTree = plan_tree as *const pg_sys::Plan as *mut pg_sys::Plan;
     planned_stmt.rtable = range_table as *mut pg_sys::List;
+    planned_stmt.permInfos = std::ptr::null_mut(); // Empty permission info list - we bypass checks
     planned_stmt.commandType = pg_sys::CmdType::CMD_SELECT;
     planned_stmt.canSetTag = true; // Important for SELECT queries
     planned_stmt.utilityStmt = std::ptr::null_mut();
@@ -609,7 +619,15 @@ pub unsafe fn execute_plan_directly(
         return Err("Failed to create executor state".into());
     }
 
-    (*estate).es_range_table = range_table as *mut pg_sys::List;
+    // Use ExecInitRangeTable to properly initialize range table and related arrays.
+    // Pass empty permInfos list - we bypass permission checks for Substrait plans.
+    let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
+    pg_sys::ExecInitRangeTable(estate, range_table as *mut pg_sys::List, empty_perminfos);
+    pgrx::info!("DEBUG: ExecInitRangeTable completed");
+
+    // Set the planned statement reference on estate.
+    (*estate).es_plannedstmt = planned_stmt_ptr;
+
     (*estate).es_output_cid = 0;
     (*estate).es_snapshot = (*query_desc_ptr).snapshot;
     (*estate).es_crosscheck_snapshot = (*query_desc_ptr).crosscheck_snapshot;
