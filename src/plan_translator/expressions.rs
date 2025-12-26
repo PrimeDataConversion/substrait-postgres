@@ -1170,16 +1170,16 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "multiply:fp64_fp64" => {
-            // Handle floating point multiplication
+            // Handle floating point multiplication.
+            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("float8mul", &[left_type, right_type])?;
+                let func_oid =
+                    lookup_function_oid("float8mul", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
@@ -1189,16 +1189,16 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "subtract:fp64_fp64" => {
-            // Handle floating point subtraction
+            // Handle floating point subtraction.
+            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("float8mi", &[left_type, right_type])?;
+                let func_oid =
+                    lookup_function_oid("float8mi", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(format!(
@@ -1208,16 +1208,16 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "add:fp64_fp64" => {
-            // Handle floating point addition
+            // Handle floating point addition.
+            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("float8pl", &[left_type, right_type])?;
+                let func_oid =
+                    lookup_function_oid("float8pl", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(
@@ -1612,16 +1612,16 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "divide:fp64_fp64" => {
-            // Handle floating point division
+            // Handle floating point division.
+            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("float8div", &[left_type, right_type])?;
+                let func_oid =
+                    lookup_function_oid("float8div", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
                 create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
             } else {
                 Err(
