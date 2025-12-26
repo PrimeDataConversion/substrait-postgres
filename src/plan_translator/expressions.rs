@@ -482,9 +482,16 @@ pub unsafe fn create_var_node_with_varno(
     var_node.vartypmod = vartypmod;
     var_node.varcollid = varcollid;
     var_node.varlevelsup = 0;
-    // These fields are required for proper plan execution in PG17.
-    var_node.varnosyn = varno as u32;
-    var_node.varattnosyn = attr_number as pg_sys::AttrNumber;
+    // For planner-generated Vars (OUTER_VAR, INNER_VAR, etc.), varnosyn/varattnosyn
+    // should be 0 since they don't correspond to simple relation columns.
+    // For base table references (varno >= 1), preserve the original values.
+    if varno >= 1 {
+        var_node.varnosyn = varno as u32;
+        var_node.varattnosyn = attr_number as pg_sys::AttrNumber;
+    } else {
+        var_node.varnosyn = 0;
+        var_node.varattnosyn = 0;
+    }
     var_node.location = -1;
 
     Ok(var_node.into_pg() as *mut pg_sys::Expr)
@@ -1770,7 +1777,8 @@ pub unsafe fn convert_expressions_to_target_list_for_child_output(
     Ok((target_list, output_schema))
 }
 
-/// Convert expression to target entry using OUTER_VAR for Var nodes.
+/// Convert expression to target entry using OUTER_VAR for all Var nodes.
+/// Use this for non-scan nodes like Result that reference their child plan's output.
 unsafe fn convert_expression_to_target_entry_for_child_output(
     expr: &Expression,
     index: usize,
@@ -1799,9 +1807,99 @@ unsafe fn convert_expression_to_target_entry_for_child_output(
 
             Ok((target_entry, column_info))
         }
+        Some(RexType::Literal(literal)) => {
+            // Handle literal values.
+            if let Some(literal_type) = &literal.literal_type {
+                let (const_expr, type_oid) = match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        (create_int4_const(*val)?, pg_sys::INT4OID)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        (create_int8_const(*val)?, pg_sys::INT8OID)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        (create_text_const(val)?, pg_sys::TEXTOID)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        (create_date_const(*val)?, pg_sys::DATEOID)
+                    }
+                    _ => {
+                        return Err(
+                            format!("Unsupported literal type for expression {index}").into()
+                        )
+                    }
+                };
+
+                let column_info = ColumnInfo::with_type(type_oid);
+
+                // Create TargetEntry.
+                let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+                target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+                target_entry.expr = const_expr;
+                target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+                target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+                target_entry.resjunk = false;
+                let target_entry = target_entry.into_pg();
+
+                Ok((target_entry, column_info))
+            } else {
+                Err(format!("Literal expression {index} missing literal type").into())
+            }
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            // Handle scalar function expressions using OUTER_VAR for all Var nodes.
+            let func_expr =
+                create_scalar_function_expr_for_child_output(func, function_map, input_schema)?;
+
+            // Get the result type from the created expression.
+            let result_type = pg_sys::exprType(func_expr as *const pg_sys::Node);
+            let column_info = ColumnInfo::with_type(result_type);
+
+            // Create TargetEntry.
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = func_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
+        Some(RexType::Cast(cast)) => {
+            // Handle cast expressions using OUTER_VAR for nested Var nodes.
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres_for_child_output(input, function_map, input_schema)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            let (cast_expr, target_oid) = if let Some(cast_type) = &cast.r#type {
+                let target_oid = get_pg_type_oid(cast_type)?;
+                (create_cast_expr(input_expr, target_oid)?, target_oid)
+            } else {
+                return Err("Cast expression missing type".into());
+            };
+
+            let column_info = ColumnInfo::with_type(target_oid);
+
+            // Create TargetEntry.
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = cast_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
         _ => {
-            // For non-selection expressions (literals, functions, casts), delegate to standard handler.
-            convert_expression_to_target_entry_with_schema(expr, index, function_map, input_schema)
+            // For unsupported expression types, return an error.
+            Err(
+                format!("Unsupported expression type at index {index} in child output conversion")
+                    .into(),
+            )
         }
     }
 }
@@ -2068,21 +2166,106 @@ pub unsafe fn convert_expression_to_postgres_with_schema(
     }
 }
 
-/// Extract PostgreSQL expressions from Substrait function arguments with schema-based type resolution.
-unsafe fn extract_function_arguments_with_schema(
+/// Convert expression to PostgreSQL using OUTER_VAR for all Var nodes.
+/// Use this for non-scan nodes like Result that reference their child plan's output.
+pub unsafe fn convert_expression_to_postgres_for_child_output(
+    expr: &Expression,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    convert_expression_to_postgres_with_varno(expr, function_map, input_schema, OUTER_VAR)
+}
+
+/// Core expression conversion with explicit varno parameter.
+/// Use varno=1 for scan nodes, varno=OUTER_VAR for non-scan nodes referencing child output.
+pub unsafe fn convert_expression_to_postgres_with_varno(
+    expr: &Expression,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+    varno: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            // Literals don't need varno - they're constants.
+            if let Some(literal_type) = &literal.literal_type {
+                match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        create_int8_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        create_date_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Decimal(d) => {
+                        create_numeric_const(&d.value, d.precision, d.scale)
+                    }
+                    _ => Err("Unsupported literal type in expression".into()),
+                }
+            } else {
+                Err("Literal expression missing literal type".into())
+            }
+        }
+        Some(RexType::Selection(selection)) => {
+            // Use specified varno for column references.
+            convert_selection_to_postgres_with_schema_and_varno(selection, input_schema, varno)
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            // Create function with specified varno for all nested Var nodes.
+            create_scalar_function_expr_with_varno(func, function_map, input_schema, varno)
+        }
+        Some(RexType::Cast(cast)) => {
+            // Recursively convert cast input using specified varno.
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres_with_varno(input, function_map, input_schema, varno)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            if let Some(cast_type) = &cast.r#type {
+                let target_oid = get_pg_type_oid(cast_type)?;
+                create_cast_expr(input_expr, target_oid)
+            } else {
+                Err("Cast expression missing type".into())
+            }
+        }
+        Some(rex_type) => {
+            let type_name = get_expression_type_name(rex_type);
+            Err(
+                format!("Unsupported expression type in varno-aware conversion: {type_name}")
+                    .into(),
+            )
+        }
+        None => Err("Expression missing rex_type".into()),
+    }
+}
+
+/// Extract PostgreSQL expressions from Substrait function arguments with specified varno.
+unsafe fn extract_function_arguments_with_varno(
     func_arguments: &[substrait::proto::FunctionArgument],
     function_map: &HashMap<u32, String>,
     input_schema: &RelationSchema,
+    varno: i32,
 ) -> Result<Vec<*mut pg_sys::Expr>, Box<dyn std::error::Error + Send + Sync>> {
     let mut pg_args = Vec::with_capacity(func_arguments.len());
     for arg in func_arguments {
         if let Some(value) = &arg.arg_type {
             match value {
                 substrait::proto::function_argument::ArgType::Value(expr) => {
-                    let pg_expr = convert_expression_to_postgres_with_schema(
+                    let pg_expr = convert_expression_to_postgres_with_varno(
                         expr,
                         function_map,
                         input_schema,
+                        varno,
                     )?;
                     pg_args.push(pg_expr);
                 }
@@ -2097,31 +2280,33 @@ unsafe fn extract_function_arguments_with_schema(
     Ok(pg_args)
 }
 
-/// Create scalar function expression with schema-based type resolution
-pub unsafe fn create_scalar_function_expr_with_schema(
+/// Create scalar function expression with specified varno for all Var nodes.
+pub unsafe fn create_scalar_function_expr_with_varno(
     func: &substrait::proto::expression::ScalarFunction,
     function_map: &HashMap<u32, String>,
     input_schema: &RelationSchema,
+    varno: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     let function_reference = func.function_reference;
     let argument_count = func.arguments.len();
 
-    // Look up function name from extension map
+    // Look up function name from extension map.
     let function_name = function_map
         .get(&function_reference)
         .map(|s| s.as_str())
         .unwrap_or("unknown");
 
-    eprintln!("DEBUG: Schema-based scalar function: ref={function_reference}, name={function_name}, args={argument_count}");
+    eprintln!("DEBUG: Scalar function (varno={varno}): ref={function_reference}, name={function_name}, args={argument_count}");
 
-    // Handle specific function types based on name
+    // Handle specific function types based on name.
     match function_name {
         "lte:date_date" => {
             if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
+                let pg_args = extract_function_arguments_with_varno(
                     &func.arguments,
                     function_map,
                     input_schema,
+                    varno,
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
@@ -2136,10 +2321,11 @@ pub unsafe fn create_scalar_function_expr_with_schema(
         }
         "and:bool" => {
             if func.arguments.len() >= 2 {
-                let pg_args = extract_function_arguments_with_schema(
+                let pg_args = extract_function_arguments_with_varno(
                     &func.arguments,
                     function_map,
                     input_schema,
+                    varno,
                 )?;
                 let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
                 let bool_expr = bool_expr.into_pg();
@@ -2160,10 +2346,11 @@ pub unsafe fn create_scalar_function_expr_with_schema(
         }
         "multiply:fp64_fp64" => {
             if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
+                let pg_args = extract_function_arguments_with_varno(
                     &func.arguments,
                     function_map,
                     input_schema,
+                    varno,
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
@@ -2179,10 +2366,11 @@ pub unsafe fn create_scalar_function_expr_with_schema(
         }
         "subtract:fp64_fp64" => {
             if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
+                let pg_args = extract_function_arguments_with_varno(
                     &func.arguments,
                     function_map,
                     input_schema,
+                    varno,
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
@@ -2198,10 +2386,11 @@ pub unsafe fn create_scalar_function_expr_with_schema(
         }
         "add:fp64_fp64" => {
             if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
+                let pg_args = extract_function_arguments_with_varno(
                     &func.arguments,
                     function_map,
                     input_schema,
+                    varno,
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
@@ -2217,10 +2406,11 @@ pub unsafe fn create_scalar_function_expr_with_schema(
         }
         "or:bool" => {
             if func.arguments.len() >= 2 {
-                let pg_args = extract_function_arguments_with_schema(
+                let pg_args = extract_function_arguments_with_varno(
                     &func.arguments,
                     function_map,
                     input_schema,
+                    varno,
                 )?;
                 let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
                 let bool_expr = bool_expr.into_pg();
@@ -2239,174 +2429,44 @@ pub unsafe fn create_scalar_function_expr_with_schema(
                 )
             }
         }
-        "not:bool" => {
-            if func.arguments.len() == 1 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let arg = pg_args[0];
-                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
-                let bool_expr = bool_expr.into_pg();
-                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
-                (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
-                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
-                args_list = pg_sys::lappend(args_list, arg as *mut std::ffi::c_void);
-                (*bool_expr).args = args_list;
-                Ok(bool_expr as *mut pg_sys::Expr)
-            } else {
-                Err(format!("not:bool function expects 1 argument, got {argument_count}").into())
-            }
-        }
-        // For all comparison and arithmetic functions, use schema-based argument extraction
-        // and look up function OID dynamically based on actual argument types
-        "equal:any_any" | "not_equal:any_any" | "lt:any_any" | "gt:any_any" | "lte:any_any"
-        | "gte:any_any" => {
-            if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let left_arg = pg_args[0];
-                let right_arg = pg_args[1];
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-
-                let func_name = match function_name {
-                    "equal:any_any" => "eq",
-                    "not_equal:any_any" => "ne",
-                    "lt:any_any" => "lt",
-                    "gt:any_any" => "gt",
-                    "lte:any_any" => "le",
-                    "gte:any_any" => "ge",
-                    _ => unreachable!(),
-                };
-                let func_oid = lookup_function_oid(func_name, &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
-            } else {
-                Err(
-                    format!("{function_name} function expects 2 arguments, got {argument_count}")
-                        .into(),
-                )
-            }
-        }
-        "lt:date_date" | "gt:date_date" | "gte:date_date" => {
-            if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let left_arg = pg_args[0];
-                let right_arg = pg_args[1];
-                let func_name = match function_name {
-                    "lt:date_date" => "date_lt",
-                    "gt:date_date" => "date_gt",
-                    "gte:date_date" => "date_ge",
-                    _ => unreachable!(),
-                };
-                let func_oid = lookup_function_oid(func_name, &[pg_sys::DATEOID, pg_sys::DATEOID])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
-            } else {
-                Err(
-                    format!("{function_name} function expects 2 arguments, got {argument_count}")
-                        .into(),
-                )
-            }
-        }
-        "multiply:dec_dec" | "subtract:dec_dec" | "divide:dec_dec" => {
-            if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let left_arg = pg_args[0];
-                let right_arg = pg_args[1];
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_name = match function_name {
-                    "multiply:dec_dec" => "numeric_mul",
-                    "subtract:dec_dec" => "numeric_sub",
-                    "divide:dec_dec" => "numeric_div",
-                    _ => unreachable!(),
-                };
-                let func_oid = lookup_function_oid(func_name, &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
-            } else {
-                Err(
-                    format!("{function_name} function expects 2 arguments, got {argument_count}")
-                        .into(),
-                )
-            }
-        }
-        "like:str_str" | "like:vchar_vchar" => {
-            if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let left_arg = pg_args[0];
-                let right_arg = pg_args[1];
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
-            } else {
-                Err(
-                    format!("{function_name} function expects 2 arguments, got {argument_count}")
-                        .into(),
-                )
-            }
-        }
-        "add:i32_i32" => {
-            if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let left_arg = pg_args[0];
-                let right_arg = pg_args[1];
-                let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("int4pl", &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::INT4OID, &[left_arg, right_arg])
-            } else {
-                Err(
-                    format!("add:i32_i32 function expects 2 arguments, got {argument_count}")
-                        .into(),
-                )
-            }
-        }
-        "divide:fp64_fp64" => {
-            if func.arguments.len() == 2 {
-                let pg_args = extract_function_arguments_with_schema(
-                    &func.arguments,
-                    function_map,
-                    input_schema,
-                )?;
-                let left_arg = pg_args[0];
-                let right_arg = pg_args[1];
-                let func_oid =
-                    lookup_function_oid("float8div", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
-            } else {
-                Err(
-                    format!("divide:fp64_fp64 function expects 2 arguments, got {argument_count}")
-                        .into(),
-                )
-            }
-        }
         _ => {
-            // For unsupported functions, fall back to context-based approach
-            eprintln!("DEBUG: Unsupported function in schema-based conversion: {function_name}, falling back");
-            create_scalar_function_expr_with_context(func, function_map, None)
+            // For other functions, return error for now.
+            Err(format!(
+                "Unsupported function '{}' in expression context",
+                function_name
+            )
+            .into())
         }
     }
+}
+
+/// Wrapper: Create scalar function expression using OUTER_VAR for all Var nodes.
+pub unsafe fn create_scalar_function_expr_for_child_output(
+    func: &substrait::proto::expression::ScalarFunction,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    create_scalar_function_expr_with_varno(func, function_map, input_schema, OUTER_VAR)
+}
+
+/// Wrapper: Extract PostgreSQL expressions from Substrait function arguments with schema-based type resolution.
+/// Uses varno=1 for scan nodes.
+unsafe fn extract_function_arguments_with_schema(
+    func_arguments: &[substrait::proto::FunctionArgument],
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<Vec<*mut pg_sys::Expr>, Box<dyn std::error::Error + Send + Sync>> {
+    extract_function_arguments_with_varno(func_arguments, function_map, input_schema, 1)
+}
+
+/// Wrapper: Create scalar function expression with schema-based type resolution.
+/// Uses varno=1 for scan nodes.
+pub unsafe fn create_scalar_function_expr_with_schema(
+    func: &substrait::proto::expression::ScalarFunction,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    create_scalar_function_expr_with_varno(func, function_map, input_schema, 1)
 }
 
 /// Extract column information from a selection expression using schema

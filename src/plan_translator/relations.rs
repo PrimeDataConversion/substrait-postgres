@@ -1,6 +1,7 @@
 use super::constants::get_relation_type_name;
 use super::expressions::{
-    convert_expression_to_postgres_with_context, convert_expression_to_postgres_with_schema,
+    convert_expression_to_postgres_for_child_output, convert_expression_to_postgres_with_context,
+    convert_expression_to_postgres_with_schema,
     convert_expressions_to_target_list_for_child_output,
     convert_expressions_to_target_list_with_schema,
 };
@@ -472,12 +473,22 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             eprintln!("DEBUG: Filter - about to convert condition");
             pgrx::info!("DEBUG: Filter - about to convert condition");
 
-            // Convert the filter condition to a PostgreSQL expression using schema-based type resolution
+            // Convert the filter condition to a PostgreSQL expression using OUTER_VAR.
+            // The Result node evaluates the filter condition against its child's output,
+            // so we use OUTER_VAR to reference the child plan's tuple slot.
             let condition_expr = if let Some(condition) = &filter.condition {
-                eprintln!("DEBUG: Filter - calling convert_expression_to_postgres_with_schema");
-                pgrx::info!("DEBUG: Filter - calling convert_expression_to_postgres_with_schema");
+                eprintln!(
+                    "DEBUG: Filter - calling convert_expression_to_postgres_for_child_output"
+                );
+                pgrx::info!(
+                    "DEBUG: Filter - calling convert_expression_to_postgres_for_child_output"
+                );
 
-                convert_expression_to_postgres_with_schema(condition, function_map, &input_schema)?
+                convert_expression_to_postgres_for_child_output(
+                    condition,
+                    function_map,
+                    &input_schema,
+                )?
             } else {
                 return Err("Filter relation missing condition".into());
             };

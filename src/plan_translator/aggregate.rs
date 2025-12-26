@@ -1,4 +1,4 @@
-use crate::plan_translator::expressions::create_cstring;
+use crate::plan_translator::expressions::{create_cstring, OUTER_VAR};
 use pgrx::pg_sys::AttrNumber;
 use pgrx::{pg_sys, PgBox, PgList};
 use std::collections::HashMap;
@@ -143,15 +143,21 @@ impl TargetListBuilder {
     unsafe fn add_group_var(&mut self, attno: pg_sys::AttrNumber) {
         let mut var = PgBox::<pg_sys::Var>::alloc0();
         var.xpr.type_ = pg_sys::NodeTag::T_Var; // CRITICAL: Set the node type!
-        var.varno = 1;
+                                                // Use OUTER_VAR since Agg node references its child plan's output.
+        var.varno = OUTER_VAR;
         var.varattno = attno;
 
-        // Get the actual column type from the input plan's target list
+        // Get the actual column type from the input plan's target list.
         let (vartype, vartypmod, varcollid) =
             get_type_from_input_target_list(self.input_plan, attno);
         var.vartype = vartype;
         var.vartypmod = vartypmod;
         var.varcollid = varcollid;
+        var.varlevelsup = 0;
+        // For planner-generated Vars (OUTER_VAR), varnosyn/varattnosyn should be 0.
+        var.varnosyn = 0;
+        var.varattnosyn = 0;
+        var.location = -1;
 
         let mut entry = PgBox::<pg_sys::TargetEntry>::alloc0();
         entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry; // CRITICAL: Set the node type!
@@ -276,17 +282,23 @@ unsafe fn extract_agg_args(
             if let Ok(Some(field)) = extract_struct_field(expr) {
                 let attno = (field.field + 1) as pg_sys::AttrNumber;
 
-                // Look up the actual column type from the input plan's target list
+                // Look up the actual column type from the input plan's target list.
                 let (vartype, vartypmod, varcollid) =
                     get_type_from_input_target_list(input_plan, attno);
 
                 let mut var = PgBox::<pg_sys::Var>::alloc0();
                 var.xpr.type_ = pg_sys::NodeTag::T_Var; // CRITICAL: Set the node type!
-                var.varno = 1;
+                                                        // Use OUTER_VAR since aggregate args reference the child plan's output.
+                var.varno = OUTER_VAR;
                 var.varattno = attno;
                 var.vartype = vartype;
                 var.vartypmod = vartypmod;
                 var.varcollid = varcollid;
+                var.varlevelsup = 0;
+                // For planner-generated Vars (OUTER_VAR), varnosyn/varattnosyn should be 0.
+                var.varnosyn = 0;
+                var.varattnosyn = 0;
+                var.location = -1;
                 list.push(var.into_pg());
             }
         }

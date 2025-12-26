@@ -1,7 +1,78 @@
 use anyhow::Result;
 use pgrx::{pg_sys, PgBox};
 
-use super::expressions::create_cstring;
+use super::expressions::{create_cstring, OUTER_VAR};
+
+/// Transform a target list to use OUTER_VAR for all Var nodes.
+/// This is used when creating non-scan nodes that reference their child's output.
+pub unsafe fn transform_target_list_to_outer_var(
+    target_list: *mut pg_sys::List,
+) -> *mut pg_sys::List {
+    if target_list.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let mut new_list: *mut pg_sys::List = std::ptr::null_mut();
+    let list_len = pg_sys::list_length(target_list);
+
+    // Iterate through the target list using list_nth.
+    for i in 0..list_len {
+        let te = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+        if !te.is_null() {
+            // Clone the target entry and transform its expression.
+            let new_te = clone_and_transform_target_entry(te);
+            new_list = pg_sys::lappend(new_list, new_te as *mut std::ffi::c_void);
+        }
+    }
+
+    new_list
+}
+
+/// Clone a target entry and transform its expression to use OUTER_VAR.
+unsafe fn clone_and_transform_target_entry(
+    te: *mut pg_sys::TargetEntry,
+) -> *mut pg_sys::TargetEntry {
+    let mut new_te = PgBox::<pg_sys::TargetEntry>::alloc0();
+    new_te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+    new_te.expr = transform_expr_to_outer_var((*te).expr);
+    new_te.resno = (*te).resno;
+    new_te.resname = (*te).resname; // Share the name pointer.
+    new_te.ressortgroupref = (*te).ressortgroupref;
+    new_te.resorigtbl = (*te).resorigtbl;
+    new_te.resorigcol = (*te).resorigcol;
+    new_te.resjunk = (*te).resjunk;
+    new_te.into_pg()
+}
+
+/// Transform an expression to use OUTER_VAR for Var nodes.
+unsafe fn transform_expr_to_outer_var(expr: *mut pg_sys::Expr) -> *mut pg_sys::Expr {
+    if expr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let node_tag = (*expr).type_;
+    match node_tag {
+        pg_sys::NodeTag::T_Var => {
+            // Clone the Var and change varno to OUTER_VAR.
+            let var = expr as *mut pg_sys::Var;
+            let mut new_var = PgBox::<pg_sys::Var>::alloc0();
+            new_var.xpr.type_ = pg_sys::NodeTag::T_Var;
+            new_var.varno = OUTER_VAR;
+            new_var.varattno = (*var).varattno;
+            new_var.vartype = (*var).vartype;
+            new_var.vartypmod = (*var).vartypmod;
+            new_var.varcollid = (*var).varcollid;
+            new_var.varlevelsup = (*var).varlevelsup;
+            // For OUTER_VAR, varnosyn and varattnosyn should be 0.
+            new_var.varnosyn = 0;
+            new_var.varattnosyn = 0;
+            new_var.location = -1;
+            new_var.into_pg() as *mut pg_sys::Expr
+        }
+        // For other expression types, just return as-is (they don't contain Var nodes directly).
+        _ => expr,
+    }
+}
 
 /// Create a simple values scan node for constant projections
 pub unsafe fn create_values_scan_node(
@@ -813,8 +884,8 @@ pub unsafe fn create_filter_node(
     input_plan: *mut pg_sys::Plan,
     condition_expr: *mut pg_sys::Expr,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // In PostgreSQL, filters are typically implemented as Result nodes with a qual condition
-    // For more complex filtering, we might need a custom scan node
+    // In PostgreSQL, filters are typically implemented as Result nodes with a qual condition.
+    // For more complex filtering, we might need a custom scan node.
 
     let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
     result_node.plan.type_ = pg_sys::NodeTag::T_Result;
@@ -832,8 +903,9 @@ pub unsafe fn create_filter_node(
     result_node.plan.async_capable = false;
     result_node.plan.plan_node_id = 1;
 
-    // Pass through the target list from input
-    result_node.plan.targetlist = (*input_plan).targetlist;
+    // Transform the input's target list to use OUTER_VAR.
+    // Result nodes reference their child's output via OUTER_VAR, not varno=1.
+    result_node.plan.targetlist = transform_target_list_to_outer_var((*input_plan).targetlist);
     result_node.resconstantqual = std::ptr::null_mut();
 
     // Set the filter condition as a qualification

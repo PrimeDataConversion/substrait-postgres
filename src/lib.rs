@@ -4138,8 +4138,9 @@ unsafe fn create_result_seqscan_plan(
     var_node.vartypmod = -1;
     var_node.varcollid = pg_sys::C_COLLATION_OID;
     var_node.varlevelsup = 0; // Current query level
-    var_node.varnosyn = OUTER_VAR as u32;
-    var_node.varattnosyn = 1;
+                              // For OUTER_VAR, use 0 for varnosyn/varattnosyn (planner-generated Vars).
+    var_node.varnosyn = 0;
+    var_node.varattnosyn = 0;
     var_node.location = -1;
 
     // Create a TargetEntry for the projection
