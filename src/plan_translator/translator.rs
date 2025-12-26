@@ -85,7 +85,7 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context call completed");
         pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context call completed");
 
-        let (plan_tree, _range_table, _output_schema) = relation_result?;
+        let (plan_tree, range_table_from_conversion, _output_schema) = relation_result?;
 
         eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context returned successfully, plan_tree: {plan_tree:p}");
         pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context returned successfully, plan_tree: {:p}", plan_tree);
@@ -158,25 +158,16 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: About to create return value");
         pgrx::info!("DEBUG: About to create return value");
 
-        // Build range table by collecting RTEs from the plan tree with error handling
-        eprintln!("DEBUG: About to call collect_range_table_from_plan_tree");
-        pgrx::info!("DEBUG: About to call collect_range_table_from_plan_tree");
-
-        let range_table = match collect_range_table_from_plan_tree(plan_tree) {
-            Ok(rt) => {
-                eprintln!("DEBUG: collect_range_table_from_plan_tree succeeded");
-                pgrx::info!("DEBUG: collect_range_table_from_plan_tree succeeded");
-                rt
-            }
-            Err(e) => {
-                eprintln!("DEBUG: collect_range_table_from_plan_tree failed: {e}");
-                pgrx::info!("DEBUG: collect_range_table_from_plan_tree failed: {}", e);
-                return Err(format!("Range table collection failed: {e}").into());
-            }
-        };
-
-        eprintln!("DEBUG: Built range table during translation");
-        pgrx::info!("DEBUG: Built range table during translation");
+        // Use the range table that was already built during plan conversion
+        let range_table = range_table_from_conversion;
+        eprintln!(
+            "DEBUG: Using range table from conversion: {:p}",
+            range_table
+        );
+        pgrx::info!(
+            "DEBUG: Using range table from conversion: {:p}",
+            range_table
+        );
 
         let result = (plan_tree, column_names, range_table);
 
@@ -189,6 +180,8 @@ pub fn translate_substrait_plan_with_function_map(
 
 /// Collect range table entries from a plan tree
 /// This function traverses the plan tree and builds a range table with proper scanrelid assignments
+/// NOTE: This is currently unused as range tables are built during plan conversion.
+#[allow(dead_code)]
 unsafe fn collect_range_table_from_plan_tree(
     plan_tree: *mut pg_sys::Plan,
 ) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
@@ -214,6 +207,7 @@ unsafe fn collect_range_table_from_plan_tree(
 }
 
 /// Recursively traverse plan tree to collect SeqScan nodes and build range table
+#[allow(dead_code)]
 unsafe fn collect_seqscan_nodes_recursive(
     plan: *mut pg_sys::Plan,
     range_table: &mut *mut pg_sys::List,

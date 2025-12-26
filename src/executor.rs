@@ -182,11 +182,60 @@ pub unsafe fn execute_plan_directly_raw(
         return Err("Failed to create executor state".into());
     }
 
+    // Debug the range table before passing it
+    let rt_len = if range_table.is_null() {
+        0
+    } else {
+        (*(range_table as *mut pg_sys::List)).length
+    };
+    pgrx::info!(
+        "DEBUG: Range table length before ExecInitRangeTable: {}",
+        rt_len
+    );
+
+    // If range table exists, debug its contents
+    if !range_table.is_null() && rt_len > 0 {
+        let rte_ptr = pg_sys::list_nth(range_table as *mut pg_sys::List, 0);
+        let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
+        if !rte.is_null() {
+            pgrx::info!(
+                "DEBUG: RTE[0]: type_={:?}, rtekind={:?}, relid={}",
+                (*rte).type_,
+                (*rte).rtekind,
+                (*rte).relid
+            );
+        }
+    }
+
     // Use ExecInitRangeTable to properly initialize range table and related arrays.
     // Pass empty permInfos list - we bypass permission checks for Substrait plans.
     let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
     pg_sys::ExecInitRangeTable(estate, range_table as *mut pg_sys::List, empty_perminfos);
     pgrx::info!("DEBUG: ExecInitRangeTable completed");
+
+    // Debug estate fields after ExecInitRangeTable
+    pgrx::info!(
+        "DEBUG: After ExecInitRangeTable: es_range_table_size={}",
+        (*estate).es_range_table_size
+    );
+
+    // Lock all tables in the range table before execution.
+    // PostgreSQL requires locks on relations before they can be opened.
+    if !range_table.is_null() {
+        let rt_list = range_table as *mut pg_sys::List;
+        for i in 0..(*rt_list).length {
+            let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
+            let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
+            if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
+                pgrx::info!(
+                    "DEBUG: Locking relation OID {} with AccessShareLock",
+                    (*rte).relid
+                );
+                pg_sys::LockRelationOid((*rte).relid, pg_sys::AccessShareLock as i32);
+                pgrx::info!("DEBUG: Lock acquired for relation OID {}", (*rte).relid);
+            }
+        }
+    }
 
     // Set the planned statement reference on estate.
     (*estate).es_plannedstmt = planned_stmt_ptr;
@@ -619,11 +668,60 @@ pub unsafe fn execute_plan_directly(
         return Err("Failed to create executor state".into());
     }
 
+    // Debug the range table before passing it
+    let rt_len = if range_table.is_null() {
+        0
+    } else {
+        (*(range_table as *mut pg_sys::List)).length
+    };
+    pgrx::info!(
+        "DEBUG: Range table length before ExecInitRangeTable: {}",
+        rt_len
+    );
+
+    // If range table exists, debug its contents
+    if !range_table.is_null() && rt_len > 0 {
+        let rte_ptr = pg_sys::list_nth(range_table as *mut pg_sys::List, 0);
+        let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
+        if !rte.is_null() {
+            pgrx::info!(
+                "DEBUG: RTE[0]: type_={:?}, rtekind={:?}, relid={}",
+                (*rte).type_,
+                (*rte).rtekind,
+                (*rte).relid
+            );
+        }
+    }
+
     // Use ExecInitRangeTable to properly initialize range table and related arrays.
     // Pass empty permInfos list - we bypass permission checks for Substrait plans.
     let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
     pg_sys::ExecInitRangeTable(estate, range_table as *mut pg_sys::List, empty_perminfos);
     pgrx::info!("DEBUG: ExecInitRangeTable completed");
+
+    // Debug estate fields after ExecInitRangeTable
+    pgrx::info!(
+        "DEBUG: After ExecInitRangeTable: es_range_table_size={}",
+        (*estate).es_range_table_size
+    );
+
+    // Lock all tables in the range table before execution.
+    // PostgreSQL requires locks on relations before they can be opened.
+    if !range_table.is_null() {
+        let rt_list = range_table as *mut pg_sys::List;
+        for i in 0..(*rt_list).length {
+            let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
+            let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
+            if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
+                pgrx::info!(
+                    "DEBUG: Locking relation OID {} with AccessShareLock",
+                    (*rte).relid
+                );
+                pg_sys::LockRelationOid((*rte).relid, pg_sys::AccessShareLock as i32);
+                pgrx::info!("DEBUG: Lock acquired for relation OID {}", (*rte).relid);
+            }
+        }
+    }
 
     // Set the planned statement reference on estate.
     (*estate).es_plannedstmt = planned_stmt_ptr;

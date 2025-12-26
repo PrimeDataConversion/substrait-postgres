@@ -161,7 +161,7 @@ unsafe fn create_seqscan_with_postgresql_stats(
     seqscan_node.scan.plan.plan_width = plan_width; // Use PostgreSQL's width estimate
     seqscan_node.scan.plan.parallel_aware = false;
     seqscan_node.scan.plan.parallel_safe = true;
-    seqscan_node.scan.plan.plan_node_id = table_oid.to_u32() as i32; // Store table OID for range table creation
+    seqscan_node.scan.plan.plan_node_id = 0; // Sequential plan node id (not table OID)
 
     seqscan_node.into_pg()
 }

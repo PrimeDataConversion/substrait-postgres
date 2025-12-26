@@ -488,38 +488,49 @@ unsafe fn lookup_function_return_type(func_oid: pg_sys::Oid) -> Option<pg_sys::O
 }
 
 /// Resolve aggregate function transition type based on function OID
+/// This queries the pg_aggregate system catalog for accurate type information.
 unsafe fn resolve_agg_trans_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
-    // Common aggregate function transition types
-    match func_oid.into() {
-        2100 => pg_sys::FLOAT8ARRAYOID, // avg(float8) uses internal array state
-        2102 => pg_sys::NUMERICOID,     // sum(integer) -> numeric transition
-        2103 => pg_sys::NUMERICOID,     // sum(bigint) -> numeric transition
-        2104 => pg_sys::NUMERICOID,     // sum(numeric) -> numeric transition
-        2107 => pg_sys::INTERNALOID,    // avg(numeric) uses internal state
-        2108 => pg_sys::FLOAT8OID,      // sum(float8) -> float8 transition
-        2136 => pg_sys::FLOAT8OID,      // min(float8) -> float8 transition
-        2137 => pg_sys::FLOAT8OID,      // max(float8) -> float8 transition
-        2142 => pg_sys::NUMERICOID,     // min(numeric) -> numeric transition
-        2148 => pg_sys::NUMERICOID,     // max(numeric) -> numeric transition
-        2803 => pg_sys::INT8OID,        // count(*) -> int8 transition
-        2147 => pg_sys::INT8OID,        // count(any) -> int8 transition
-        _ => {
-            // For unknown functions, look up from pg_aggregate system catalog
-            lookup_agg_trans_type(func_oid).unwrap_or(pg_sys::INTERNALOID)
-        }
-    }
-}
-
-/// Look up aggregate transition type from pg_aggregate system catalog
-unsafe fn lookup_agg_trans_type(func_oid: pg_sys::Oid) -> Option<pg_sys::Oid> {
-    // Use SPI to query the pg_aggregate catalog
-    // For now, just return a safe default since we handle most common aggregates above
-    eprintln!(
-        "DEBUG: lookup_agg_trans_type called for unknown func_oid: {}",
-        func_oid.to_u32()
+    // Query pg_aggregate system catalog for the transition type
+    let agg_tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::AGGFNOID as i32,
+        pg_sys::Datum::from(func_oid),
     );
-    // INTERNAL is a safe default for unknown aggregates
-    Some(pg_sys::INTERNALOID)
+
+    if agg_tuple.is_null() {
+        eprintln!(
+            "DEBUG: No pg_aggregate entry found for func_oid: {}, using INTERNALOID",
+            func_oid.to_u32()
+        );
+        return pg_sys::INTERNALOID;
+    }
+
+    // Get aggtranstype using SysCacheGetAttr
+    // Anum_pg_aggregate_aggtranstype is 17 in PostgreSQL 17
+    const ANUM_PG_AGGREGATE_AGGTRANSTYPE: u32 = 17;
+    let mut is_null = false;
+    let trans_type_datum = pg_sys::SysCacheGetAttr(
+        pg_sys::SysCacheIdentifier::AGGFNOID as i32,
+        agg_tuple,
+        ANUM_PG_AGGREGATE_AGGTRANSTYPE as i16,
+        &mut is_null,
+    );
+
+    let trans_type = if is_null {
+        pg_sys::INTERNALOID
+    } else {
+        // Datum for Oid is just the Oid value
+        pg_sys::Oid::from(trans_type_datum.value() as u32)
+    };
+
+    eprintln!(
+        "DEBUG: Resolved aggtranstype for func_oid {} -> {}",
+        func_oid.to_u32(),
+        trans_type.to_u32()
+    );
+
+    pg_sys::ReleaseSysCache(agg_tuple);
+
+    trans_type
 }
 
 /// Build the list of argument type OIDs for an aggregate
