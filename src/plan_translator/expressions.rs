@@ -387,7 +387,7 @@ pub unsafe fn resolve_column_type_info(
 }
 
 /// Create a PostgreSQL Var node for column references
-/// NOTE: This creates a Var with UNKNOWNOID - use create_var_node_with_type for proper typing
+/// NOTE: This creates a Var with TEXTOID - use create_var_node_with_type for proper typing
 pub unsafe fn create_var_node(
     attr_number: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
@@ -399,6 +399,10 @@ pub unsafe fn create_var_node(
     var_node.vartypmod = -1;
     var_node.varcollid = pg_sys::DEFAULT_COLLATION_OID;
     var_node.varlevelsup = 0;
+    // These fields are required for proper plan execution in PG17
+    var_node.varnosyn = 1;
+    var_node.varattnosyn = attr_number as pg_sys::AttrNumber;
+    var_node.location = -1;
 
     // Debug: Check for corruption right after creation
     if var_node.xpr.type_ as u32 == 124 {
@@ -429,9 +433,17 @@ pub unsafe fn create_var_node_with_table_schema(
     var_node.vartypmod = vartypmod;
     var_node.varcollid = varcollid;
     var_node.varlevelsup = 0;
+    // These fields are required for proper plan execution in PG17
+    var_node.varnosyn = 1;
+    var_node.varattnosyn = attr_number as pg_sys::AttrNumber;
+    var_node.location = -1;
 
     Ok(var_node.into_pg() as *mut pg_sys::Expr)
 }
+
+/// OUTER_VAR constant: references the left child plan's output in non-scan nodes.
+/// In PostgreSQL, OUTER_VAR is -2.
+pub const OUTER_VAR: i32 = -2;
 
 /// Create a PostgreSQL Var node with proper type information
 pub unsafe fn create_var_node_with_type(
@@ -440,14 +452,40 @@ pub unsafe fn create_var_node_with_type(
     vartypmod: i32,
     varcollid: pg_sys::Oid,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    create_var_node_with_varno(attr_number, vartype, vartypmod, varcollid, 1)
+}
+
+/// Create a PostgreSQL Var node that references output from a child plan.
+/// Use this for Vars in non-scan nodes (Result, Sort, etc.) that reference child output.
+pub unsafe fn create_var_node_for_child_output(
+    attr_number: i32,
+    vartype: pg_sys::Oid,
+    vartypmod: i32,
+    varcollid: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    create_var_node_with_varno(attr_number, vartype, vartypmod, varcollid, OUTER_VAR)
+}
+
+/// Create a PostgreSQL Var node with specified varno.
+pub unsafe fn create_var_node_with_varno(
+    attr_number: i32,
+    vartype: pg_sys::Oid,
+    vartypmod: i32,
+    varcollid: pg_sys::Oid,
+    varno: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     let mut var_node = pgrx::PgBox::<pg_sys::Var>::alloc0();
     var_node.xpr.type_ = pg_sys::NodeTag::T_Var;
-    var_node.varno = 1; // Single table reference for now
+    var_node.varno = varno;
     var_node.varattno = attr_number as pg_sys::AttrNumber;
-    var_node.vartype = vartype; // Use actual column type
+    var_node.vartype = vartype;
     var_node.vartypmod = vartypmod;
     var_node.varcollid = varcollid;
     var_node.varlevelsup = 0;
+    // These fields are required for proper plan execution in PG17.
+    var_node.varnosyn = varno as u32;
+    var_node.varattnosyn = attr_number as pg_sys::AttrNumber;
+    var_node.location = -1;
 
     Ok(var_node.into_pg() as *mut pg_sys::Expr)
 }
@@ -1707,6 +1745,67 @@ pub unsafe fn convert_expressions_to_target_list_with_schema(
     Ok((target_list, output_schema))
 }
 
+/// Convert Substrait expressions to PostgreSQL target list using OUTER_VAR for Var nodes.
+/// Use this for non-scan nodes like Result that reference their child plan's output.
+pub unsafe fn convert_expressions_to_target_list_for_child_output(
+    expressions: &[Expression],
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<(*mut pg_sys::List, RelationSchema), Box<dyn std::error::Error + Send + Sync>> {
+    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+    let mut output_columns = Vec::new();
+
+    for (i, expr) in expressions.iter().enumerate() {
+        let (target_entry, column_info) = convert_expression_to_target_entry_for_child_output(
+            expr,
+            i,
+            function_map,
+            input_schema,
+        )?;
+        target_list = pg_sys::lappend(target_list, target_entry as *mut std::ffi::c_void);
+        output_columns.push(column_info);
+    }
+
+    let output_schema = RelationSchema::with_columns(output_columns);
+    Ok((target_list, output_schema))
+}
+
+/// Convert expression to target entry using OUTER_VAR for Var nodes.
+unsafe fn convert_expression_to_target_entry_for_child_output(
+    expr: &Expression,
+    index: usize,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+) -> Result<(*mut pg_sys::TargetEntry, ColumnInfo), Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Selection(selection)) => {
+            // Handle column references using OUTER_VAR for child plan output.
+            let selection_expr =
+                convert_selection_to_postgres_for_child_output(selection, input_schema)?;
+
+            // Extract type information from the resolved column.
+            let column_info = extract_column_info_from_selection(selection, input_schema)?;
+
+            // Create TargetEntry.
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = selection_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
+        _ => {
+            // For non-selection expressions (literals, functions, casts), delegate to standard handler.
+            convert_expression_to_target_entry_with_schema(expr, index, function_map, input_schema)
+        }
+    }
+}
+
 /// Convert expression to target entry with schema-based type resolution
 unsafe fn convert_expression_to_target_entry_with_schema(
     expr: &Expression,
@@ -1838,6 +1937,24 @@ pub unsafe fn convert_selection_to_postgres_with_schema(
     selection: &substrait::proto::expression::FieldReference,
     input_schema: &RelationSchema,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    convert_selection_to_postgres_with_schema_and_varno(selection, input_schema, 1)
+}
+
+/// Convert selection to Var node using OUTER_VAR for referencing child plan output.
+/// Use this for non-scan nodes like Result that reference their child's output.
+pub unsafe fn convert_selection_to_postgres_for_child_output(
+    selection: &substrait::proto::expression::FieldReference,
+    input_schema: &RelationSchema,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    convert_selection_to_postgres_with_schema_and_varno(selection, input_schema, OUTER_VAR)
+}
+
+/// Convert selection to Var node with specified varno.
+unsafe fn convert_selection_to_postgres_with_schema_and_varno(
+    selection: &substrait::proto::expression::FieldReference,
+    input_schema: &RelationSchema,
+    varno: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ref_type) = &selection.reference_type {
         match ref_type {
             substrait::proto::expression::field_reference::ReferenceType::DirectReference(
@@ -1848,18 +1965,19 @@ pub unsafe fn convert_selection_to_postgres_with_schema(
                         substrait::proto::expression::reference_segment::ReferenceType::StructField(field) => {
                             let field_index = field.field as usize;
 
-                            // Look up column information from the input schema
+                            // Look up column information from the input schema.
                             if let Some(column_info) = input_schema.get_column(field_index) {
                                 eprintln!(
-                                    "DEBUG: Schema-based Selection field {} resolves to type OID {}",
-                                    field_index, column_info.type_oid
+                                    "DEBUG: Schema-based Selection field {} resolves to type OID {}, using varno={}",
+                                    field_index, column_info.type_oid, varno
                                 );
 
-                                create_var_node_with_type(
+                                create_var_node_with_varno(
                                     field.field + 1, // 1-based indexing
                                     column_info.type_oid,
                                     column_info.typmod,
                                     column_info.collid,
+                                    varno,
                                 )
                             } else {
                                 Err(format!(

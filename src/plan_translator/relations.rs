@@ -1,6 +1,7 @@
 use super::constants::get_relation_type_name;
 use super::expressions::{
     convert_expression_to_postgres_with_context, convert_expression_to_postgres_with_schema,
+    convert_expressions_to_target_list_for_child_output,
     convert_expressions_to_target_list_with_schema,
 };
 use super::plan_nodes::*;
@@ -215,12 +216,14 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     input_schema.column_count()
                 );
 
-                // Convert expressions to PostgreSQL target entries using the input schema
-                let (target_list, output_schema) = convert_expressions_to_target_list_with_schema(
-                    &project.expressions,
-                    function_map,
-                    &input_schema,
-                )?;
+                // Convert expressions to PostgreSQL target entries using OUTER_VAR.
+                // Result nodes reference their child plan's output via OUTER_VAR.
+                let (target_list, output_schema) =
+                    convert_expressions_to_target_list_for_child_output(
+                        &project.expressions,
+                        function_map,
+                        &input_schema,
+                    )?;
 
                 // Create a Result plan node using PostgreSQL's memory allocator
                 let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
@@ -237,8 +240,10 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 result_node.plan.plan_width = 32;
                 result_node.plan.parallel_aware = false;
                 result_node.plan.parallel_safe = true;
-                result_node.plan.plan_node_id = 0;
+                result_node.plan.async_capable = false;
+                result_node.plan.plan_node_id = 1;
                 result_node.plan.qual = std::ptr::null_mut();
+                result_node.resconstantqual = std::ptr::null_mut();
 
                 let result_ptr = result_node.into_pg();
                 // Return pointer to the plan field with output schema

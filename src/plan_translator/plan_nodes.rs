@@ -20,9 +20,11 @@ pub unsafe fn create_values_scan_node(
     result_node.plan.plan_width = 32;
     result_node.plan.parallel_aware = false;
     result_node.plan.parallel_safe = true;
-    result_node.plan.plan_node_id = 0;
+    result_node.plan.async_capable = false;
+    result_node.plan.plan_node_id = 1;
     result_node.plan.qual = std::ptr::null_mut();
     result_node.plan.targetlist = std::ptr::null_mut();
+    result_node.resconstantqual = std::ptr::null_mut();
 
     let result_ptr = result_node.into_pg();
     // Return pointer to the plan field
@@ -47,9 +49,11 @@ pub unsafe fn create_result_node_with_target_list(
     result_node.plan.plan_width = 32;
     result_node.plan.parallel_aware = false;
     result_node.plan.parallel_safe = true;
-    result_node.plan.plan_node_id = 0;
+    result_node.plan.async_capable = false;
+    result_node.plan.plan_node_id = 1;
     result_node.plan.qual = std::ptr::null_mut();
     result_node.plan.targetlist = target_list;
+    result_node.resconstantqual = std::ptr::null_mut();
 
     let result_ptr = result_node.into_pg();
     // Return pointer to the plan field
@@ -375,6 +379,10 @@ unsafe fn create_target_list_for_table(
         var_node.vartypmod = (*attr).atttypmod;
         var_node.varcollid = (*attr).attcollation;
         var_node.varlevelsup = 0;
+        // These fields are required for proper plan execution in PG17.
+        var_node.varnosyn = 1;
+        var_node.varattnosyn = (*attr).attnum;
+        var_node.location = -1;
 
         eprintln!(
             "DEBUG: Column {}: attnum={}, atttypid={}, atttypmod={}, attcollation={}",
@@ -821,10 +829,12 @@ pub unsafe fn create_filter_node(
     result_node.plan.plan_width = 32;
     result_node.plan.parallel_aware = false;
     result_node.plan.parallel_safe = true;
-    result_node.plan.plan_node_id = 0;
+    result_node.plan.async_capable = false;
+    result_node.plan.plan_node_id = 1;
 
     // Pass through the target list from input
     result_node.plan.targetlist = (*input_plan).targetlist;
+    result_node.resconstantqual = std::ptr::null_mut();
 
     // Set the filter condition as a qualification
     let mut qual_list: *mut pg_sys::List = std::ptr::null_mut();
