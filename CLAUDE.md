@@ -21,3 +21,10 @@
 4. The whole point is dynamic schema inference from Substrait plans
 5. Don't add external functions beyond `from_substrait()` and `from_substrait_json()`
 6. **DO NOT** remove functionality to make tests pass.
+
+## Technical Notes
+- Use manual `ExecInitNode` initialization instead of `ExecutorStart` when constructing plans programmatically.
+- Use PostgreSQL API calls instead of hardcoded values when constructing plan nodes.
+- Support only PostgreSQL 17 (pg17), not multiple versions.
+- After fixing crashes, verify OID handling is still correct - these issues are related.
+- Crashes during execution are caused by improper plan construction - debug the plan construction code.
