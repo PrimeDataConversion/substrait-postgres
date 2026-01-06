@@ -28,3 +28,5 @@
 - Support only PostgreSQL 17 (pg17), not multiple versions.
 - After fixing crashes, verify OID handling is still correct - these issues are related.
 - Crashes during execution are caused by improper plan construction - debug the plan construction code.
+- AGGREF.args must be a list of TargetEntry nodes in PostgreSQL 14+, not raw Var nodes.
+- Use TTS_FLAG_EMPTY flag check instead of TupIsNull macro (TupIsNull is a C macro not available in pgrx).

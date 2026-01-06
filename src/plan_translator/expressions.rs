@@ -87,6 +87,46 @@ pub unsafe fn lookup_function_oid(
     Ok(func_oid)
 }
 
+/// Get the comparison function name for a given type and operation.
+/// PostgreSQL uses type-specific function names like int4eq, texteq, etc.
+fn get_comparison_func_name(type_oid: pg_sys::Oid, operation: &str) -> String {
+    let type_prefix = match type_oid.into() {
+        pg_sys::INT2OID => "int2",
+        pg_sys::INT4OID => "int4",
+        pg_sys::INT8OID => "int8",
+        pg_sys::FLOAT4OID => "float4",
+        pg_sys::FLOAT8OID => "float8",
+        pg_sys::NUMERICOID => "numeric_",
+        pg_sys::TEXTOID => "text",
+        pg_sys::VARCHAROID => "text", // VARCHAR uses text functions
+        pg_sys::BPCHAROID => "bpchar",
+        pg_sys::DATEOID => "date_",
+        pg_sys::TIMESTAMPOID => "timestamp_",
+        pg_sys::TIMESTAMPTZOID => "timestamptz_",
+        pg_sys::BOOLOID => "bool",
+        pg_sys::OIDOID => "oid",
+        _ => "text", // Fallback to text comparison
+    };
+
+    // Map operation to PostgreSQL function suffix
+    let suffix = match operation {
+        "eq" => "eq",
+        "ne" => "ne",
+        "lt" => "lt",
+        "gt" => "gt",
+        "le" => "le",
+        "ge" => "ge",
+        _ => "eq", // Default to equality
+    };
+
+    // Handle special cases where there's no underscore
+    if type_prefix.ends_with('_') {
+        format!("{}{}", type_prefix, suffix)
+    } else {
+        format!("{}{}", type_prefix, suffix)
+    }
+}
+
 /// Look up the function OID for a given operator OID.
 /// This function queries pg_operator to find the OID of the function.
 pub unsafe fn get_operator_function_oid(
@@ -441,9 +481,13 @@ pub unsafe fn create_var_node_with_table_schema(
     Ok(var_node.into_pg() as *mut pg_sys::Expr)
 }
 
-/// OUTER_VAR constant: references the left child plan's output in non-scan nodes.
+/// OUTER_VAR constant: references the outer (left) child plan's output in join nodes.
 /// In PostgreSQL, OUTER_VAR is -2.
 pub const OUTER_VAR: i32 = -2;
+
+/// INNER_VAR constant: references the inner (right) child plan's output in join nodes.
+/// In PostgreSQL, INNER_VAR is -1.
+pub const INNER_VAR: i32 = -1;
 
 /// Create a PostgreSQL Var node with proper type information
 pub unsafe fn create_var_node_with_type(
@@ -2425,6 +2469,339 @@ pub unsafe fn create_scalar_function_expr_with_varno(
             } else {
                 Err(
                     format!("or:bool function expects at least 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "equal:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let func_name = get_comparison_func_name(left_type, "eq");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("equal:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "not_equal:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let func_name = get_comparison_func_name(left_type, "ne");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("not_equal:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "lt:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let func_name = get_comparison_func_name(left_type, "lt");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(format!("lt:any_any function expects 2 arguments, got {argument_count}").into())
+            }
+        }
+        "gt:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let func_name = get_comparison_func_name(left_type, "gt");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(format!("gt:any_any function expects 2 arguments, got {argument_count}").into())
+            }
+        }
+        "gte:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let func_name = get_comparison_func_name(left_type, "ge");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("gte:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "lte:any_any" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let left_type = get_expr_type_oid(left_arg)?;
+                let func_name = get_comparison_func_name(left_type, "le");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("lte:any_any function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "like:str_str" | "like:vchar_vchar" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("textlike", &[pg_sys::TEXTOID, pg_sys::TEXTOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(format!("like function expects 2 arguments, got {argument_count}").into())
+            }
+        }
+        "not:bool" => {
+            if func.arguments.len() == 1 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let bool_expr = pgrx::PgBox::<pg_sys::BoolExpr>::alloc0();
+                let bool_expr = bool_expr.into_pg();
+                (*bool_expr).xpr.type_ = pg_sys::NodeTag::T_BoolExpr;
+                (*bool_expr).boolop = pg_sys::BoolExprType::NOT_EXPR;
+                let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+                args_list = pg_sys::lappend(args_list, pg_args[0] as *mut std::ffi::c_void);
+                (*bool_expr).args = args_list;
+                Ok(bool_expr as *mut pg_sys::Expr)
+            } else {
+                Err(format!("not:bool function expects 1 argument, got {argument_count}").into())
+            }
+        }
+        "gte:date_date" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid = lookup_function_oid("date_ge", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("gte:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "lt:date_date" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid = lookup_function_oid("date_lt", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("lt:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "gt:date_date" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid = lookup_function_oid("date_gt", &[pg_sys::DATEOID, pg_sys::DATEOID])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("gt:date_date function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "divide:fp64_fp64" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("float8div", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
+                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("divide:fp64_fp64 function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "multiply:dec_dec" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("numeric_mul", &[pg_sys::NUMERICOID, pg_sys::NUMERICOID])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("multiply:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "subtract:dec_dec" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("numeric_sub", &[pg_sys::NUMERICOID, pg_sys::NUMERICOID])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("subtract:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "divide:dec_dec" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("numeric_div", &[pg_sys::NUMERICOID, pg_sys::NUMERICOID])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("divide:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "add:dec_dec" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid =
+                    lookup_function_oid("numeric_add", &[pg_sys::NUMERICOID, pg_sys::NUMERICOID])?;
+                create_function_call_expr(func_oid, pg_sys::NUMERICOID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("add:dec_dec function expects 2 arguments, got {argument_count}")
+                        .into(),
+                )
+            }
+        }
+        "add:i32_i32" => {
+            if func.arguments.len() == 2 {
+                let pg_args = extract_function_arguments_with_varno(
+                    &func.arguments,
+                    function_map,
+                    input_schema,
+                    varno,
+                )?;
+                let left_arg = pg_args[0];
+                let right_arg = pg_args[1];
+                let func_oid = lookup_function_oid("int4pl", &[pg_sys::INT4OID, pg_sys::INT4OID])?;
+                create_function_call_expr(func_oid, pg_sys::INT4OID, &[left_arg, right_arg])
+            } else {
+                Err(
+                    format!("add:i32_i32 function expects 2 arguments, got {argument_count}")
                         .into(),
                 )
             }

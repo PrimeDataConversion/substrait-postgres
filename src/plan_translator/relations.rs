@@ -1,7 +1,6 @@
 use super::constants::get_relation_type_name;
 use super::expressions::{
     convert_expression_to_postgres_for_child_output, convert_expression_to_postgres_with_context,
-    convert_expression_to_postgres_with_schema,
     convert_expressions_to_target_list_for_child_output,
     convert_expressions_to_target_list_with_schema,
 };
@@ -10,8 +9,37 @@ use super::schema::RelationSchema;
 use crate::plan_translator::aggregate::create_aggregate_node;
 use anyhow::Result;
 use pgrx::pg_sys;
+use std::cell::Cell;
 use std::collections::HashMap;
 use substrait::proto::{Plan, PlanRel, Rel};
+
+/// Conversion context that holds state during plan tree construction.
+pub struct ConversionContext<'a> {
+    pub function_map: &'a HashMap<u32, String>,
+    pub current_table_oid: Option<pg_sys::Oid>,
+    /// Counter for assigning unique scanrelids. Each SeqScan gets the next value.
+    next_scanrelid: Cell<u32>,
+}
+
+impl<'a> ConversionContext<'a> {
+    pub fn new(
+        function_map: &'a HashMap<u32, String>,
+        current_table_oid: Option<pg_sys::Oid>,
+    ) -> Self {
+        Self {
+            function_map,
+            current_table_oid,
+            next_scanrelid: Cell::new(1), // PostgreSQL scanrelids are 1-based
+        }
+    }
+
+    /// Get the next scanrelid and increment the counter.
+    pub fn next_scanrelid(&self) -> u32 {
+        let id = self.next_scanrelid.get();
+        self.next_scanrelid.set(id + 1);
+        id
+    }
+}
 
 /// Build a map of function references to their names from the plan's extensions
 /// This function directly accesses protobuf data without PostgreSQL memory context issues
@@ -129,7 +157,7 @@ pub fn extract_table_name_from_named_table(
     Ok(table_name)
 }
 
-/// Convert relation with function context
+/// Convert relation with function context (public entry point)
 pub unsafe fn convert_rel_to_plan_tree_with_context(
     rel: &Rel,
     function_map: &HashMap<u32, String>,
@@ -138,10 +166,22 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
     (*mut pg_sys::Plan, *mut pg_sys::List, RelationSchema),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    let ctx = ConversionContext::new(function_map, current_table_oid);
+    convert_rel_with_ctx(rel, &ctx)
+}
+
+/// Internal conversion function that uses the conversion context
+unsafe fn convert_rel_with_ctx(
+    rel: &Rel,
+    ctx: &ConversionContext,
+) -> Result<
+    (*mut pg_sys::Plan, *mut pg_sys::List, RelationSchema),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     use substrait::proto::rel::RelType;
 
-    eprintln!("DEBUG: convert_rel_to_plan_tree_with_context called");
-    pgrx::info!("DEBUG: convert_rel_to_plan_tree_with_context called");
+    eprintln!("DEBUG: convert_rel_with_ctx called");
+    pgrx::info!("DEBUG: convert_rel_with_ctx called");
 
     // Debug what relation type we're about to process
     let relation_type_name = match &rel.rel_type {
@@ -206,7 +246,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             if let Some(input) = &project.input {
                 // Project with input - create Result node with input as left tree
                 let (input_plan, input_range_table, input_schema) =
-                    convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?;
+                    convert_rel_with_ctx(input, ctx)?;
 
                 eprintln!(
                     "DEBUG: Project relation input schema has {} columns",
@@ -222,7 +262,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 let (target_list, output_schema) =
                     convert_expressions_to_target_list_for_child_output(
                         &project.expressions,
-                        function_map,
+                        ctx.function_map,
                         &input_schema,
                     )?;
 
@@ -259,7 +299,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 let empty_schema = RelationSchema::new();
                 let (target_list, output_schema) = convert_expressions_to_target_list_with_schema(
                     &project.expressions,
-                    function_map,
+                    ctx.function_map,
                     &empty_schema,
                 )?;
 
@@ -337,9 +377,14 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                         let table_name = extract_table_name_from_named_table(nt)?;
 
                         // Create a proper SeqScan node with range table entry
-                        // We use scanrelid 1 as this will be the first (and possibly only) table
+                        // Assign a unique scanrelid using the context counter
+                        let scanrelid = ctx.next_scanrelid();
+                        eprintln!(
+                            "DEBUG: Assigning scanrelid {} to table {}",
+                            scanrelid, table_name
+                        );
                         let (seqscan_plan, range_table_entry) =
-                            create_seqscan_node_with_scanrelid(&table_name, 1)?;
+                            create_seqscan_node_with_scanrelid(&table_name, scanrelid)?;
 
                         // Extract table OID from the range table entry to build schema
                         let table_oid = (*range_table_entry).relid;
@@ -378,7 +423,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Sort(sort)) => {
             // Handle sort relation - create a Sort node
             let (input_plan, input_range_table, input_schema) = if let Some(input) = &sort.input {
-                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
+                convert_rel_with_ctx(input, ctx)?
             } else {
                 return Err("Sort relation missing input".into());
             };
@@ -393,7 +438,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Fetch(fetch)) => {
             // Handle fetch relation - create a Limit node
             let (input_plan, input_range_table, input_schema) = if let Some(input) = &fetch.input {
-                convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
+                convert_rel_with_ctx(input, ctx)?
             } else {
                 return Err("Fetch relation missing input".into());
             };
@@ -405,8 +450,8 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     OffsetMode::OffsetExpr(expr) => {
                         Some(convert_expression_to_postgres_with_context(
                             expr,
-                            function_map,
-                            current_table_oid,
+                            ctx.function_map,
+                            ctx.current_table_oid,
                         )?)
                     }
                     OffsetMode::Offset(constant_offset) => {
@@ -425,8 +470,8 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     CountMode::CountExpr(expr) => {
                         Some(convert_expression_to_postgres_with_context(
                             expr,
-                            function_map,
-                            current_table_oid,
+                            ctx.function_map,
+                            ctx.current_table_oid,
                         )?)
                     }
                     CountMode::Count(constant_count) => {
@@ -459,8 +504,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                     "DEBUG: Filter - calling recursive convert_rel_to_plan_tree_with_context"
                 );
 
-                let res =
-                    convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?;
+                let res = convert_rel_with_ctx(input, ctx)?;
 
                 eprintln!("DEBUG: Filter - recursive call returned!");
                 pgrx::info!("DEBUG: Filter - recursive call returned!");
@@ -486,7 +530,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
 
                 convert_expression_to_postgres_for_child_output(
                     condition,
-                    function_map,
+                    ctx.function_map,
                     &input_schema,
                 )?
             } else {
@@ -506,16 +550,19 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Cross(cross)) => {
             // Handle cross relation - create a NestLoop node for Cartesian product
             let (left_plan, left_range_table, left_schema) = if let Some(left) = &cross.left {
-                convert_rel_to_plan_tree_with_context(left, function_map, current_table_oid)?
+                convert_rel_with_ctx(left, ctx)?
             } else {
                 return Err("Cross relation missing left input".into());
             };
 
             let (right_plan, right_range_table, right_schema) = if let Some(right) = &cross.right {
-                convert_rel_to_plan_tree_with_context(right, function_map, current_table_oid)?
+                // Use the same context to ensure unique scanrelids across both sides
+                convert_rel_with_ctx(right, ctx)?
             } else {
                 return Err("Cross relation missing right input".into());
             };
+
+            // No need to offset scanrelids - they are assigned uniquely by ctx.next_scanrelid()
 
             // Cross join combines left and right schemas
             let mut combined_schema = left_schema;
@@ -536,7 +583,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             // Handle aggregate relation - create an Agg node for GROUP BY and aggregate functions
             let (input_plan, input_range_table, _input_schema) =
                 if let Some(input) = &aggregate.input {
-                    convert_rel_to_plan_tree_with_context(input, function_map, current_table_oid)?
+                    convert_rel_with_ctx(input, ctx)?
                 } else {
                     return Err("Aggregate relation missing input".into());
                 };
@@ -547,7 +594,7 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
             let aggregate_schema = RelationSchema::new();
 
             Ok((
-                create_aggregate_node(input_plan, aggregate, function_map)?,
+                create_aggregate_node(input_plan, aggregate, ctx.function_map)?,
                 input_range_table, // Pass through range table from input
                 aggregate_schema,
             ))
@@ -555,16 +602,19 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
         Some(RelType::Join(join)) => {
             // Handle join relation
             let (left_plan, left_range_table, left_schema) = if let Some(left) = &join.left {
-                convert_rel_to_plan_tree_with_context(left, function_map, current_table_oid)?
+                convert_rel_with_ctx(left, ctx)?
             } else {
                 return Err("Join relation missing left input".into());
             };
 
             let (right_plan, right_range_table, right_schema) = if let Some(right) = &join.right {
-                convert_rel_to_plan_tree_with_context(right, function_map, current_table_oid)?
+                // Use the same context to ensure unique scanrelids across both sides
+                convert_rel_with_ctx(right, ctx)?
             } else {
                 return Err("Join relation missing right input".into());
             };
+
+            // No need to offset scanrelids - they are assigned uniquely by ctx.next_scanrelid()
 
             let join_type = match join.r#type {
                 0 => pg_sys::JoinType::JOIN_INNER,
@@ -578,8 +628,8 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
                 let mut qual_list: *mut pg_sys::List = std::ptr::null_mut();
                 let qual_expr = convert_expression_to_postgres_with_context(
                     expr,
-                    function_map,
-                    current_table_oid,
+                    ctx.function_map,
+                    ctx.current_table_oid,
                 )?;
                 qual_list = pg_sys::lappend(qual_list, qual_expr as *mut std::ffi::c_void);
                 qual_list

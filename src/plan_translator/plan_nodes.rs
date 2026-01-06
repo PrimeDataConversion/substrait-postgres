@@ -1,7 +1,7 @@
 use anyhow::Result;
 use pgrx::{pg_sys, PgBox};
 
-use super::expressions::{create_cstring, OUTER_VAR};
+use super::expressions::{create_cstring, INNER_VAR, OUTER_VAR};
 
 /// Transform a target list to use OUTER_VAR for all Var nodes.
 /// This is used when creating non-scan nodes that reference their child's output.
@@ -28,13 +28,43 @@ pub unsafe fn transform_target_list_to_outer_var(
     new_list
 }
 
-/// Clone a target entry and transform its expression to use OUTER_VAR.
+/// Clone a target entry and transform it to reference child output by position.
+/// The new Var uses OUTER_VAR as varno and the entry's resno as varattno,
+/// because we're referencing the position in the child plan's target list.
 unsafe fn clone_and_transform_target_entry(
     te: *mut pg_sys::TargetEntry,
 ) -> *mut pg_sys::TargetEntry {
+    let child_expr = (*te).expr;
+
+    // Get type info from the original expression
+    let (vartype, vartypmod, varcollid) = if !child_expr.is_null() {
+        (
+            pg_sys::exprType(child_expr as *mut pg_sys::Node),
+            pg_sys::exprTypmod(child_expr as *mut pg_sys::Node),
+            pg_sys::exprCollation(child_expr as *mut pg_sys::Node),
+        )
+    } else {
+        (pg_sys::InvalidOid, -1, pg_sys::InvalidOid)
+    };
+
+    // Create a new Var that references this position in the child's output.
+    // varno = OUTER_VAR (reference child plan's output)
+    // varattno = resno of the child's target entry (position in child's target list)
+    let mut new_var = PgBox::<pg_sys::Var>::alloc0();
+    new_var.xpr.type_ = pg_sys::NodeTag::T_Var;
+    new_var.varno = OUTER_VAR;
+    new_var.varattno = (*te).resno; // Reference by position in child's target list
+    new_var.vartype = vartype;
+    new_var.vartypmod = vartypmod;
+    new_var.varcollid = varcollid;
+    new_var.varlevelsup = 0;
+    new_var.varnosyn = 0;
+    new_var.varattnosyn = 0;
+    new_var.location = -1;
+
     let mut new_te = PgBox::<pg_sys::TargetEntry>::alloc0();
     new_te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-    new_te.expr = transform_expr_to_outer_var((*te).expr);
+    new_te.expr = new_var.into_pg() as *mut pg_sys::Expr;
     new_te.resno = (*te).resno;
     new_te.resname = (*te).resname; // Share the name pointer.
     new_te.ressortgroupref = (*te).ressortgroupref;
@@ -1151,15 +1181,16 @@ pub unsafe fn create_join_node(
     Ok(&mut (*nestloop_node).join.plan as *mut pg_sys::Plan)
 }
 
-/// Create a combined target list for join operations
+/// Create a combined target list for join operations.
+/// For NestLoop joins, we use OUTER_VAR for left (outer) relation and INNER_VAR for right (inner) relation.
 unsafe fn create_combined_target_list(
     left_plan: *mut pg_sys::Plan,
     right_plan: *mut pg_sys::Plan,
 ) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
     let mut combined_list: *mut pg_sys::List = std::ptr::null_mut();
-    let mut resno = 1;
+    let mut resno: i16 = 1;
 
-    // Add target entries from left plan
+    // Add target entries from left (outer) plan
     if !(*left_plan).targetlist.is_null() {
         let left_list = (*left_plan).targetlist;
         let length = (*left_list).length as usize;
@@ -1167,28 +1198,53 @@ unsafe fn create_combined_target_list(
         for i in 0..length {
             let target_entry = pg_sys::list_nth(left_list, i as i32) as *mut pg_sys::TargetEntry;
 
-            // Create a copy of the target entry with updated resno and varno
-            let new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
-            let new_target_entry = new_target_entry.into_pg();
-            *new_target_entry = *target_entry; // Copy the structure
-            (*new_target_entry).resno = resno;
+            // Create a NEW Var node referencing the outer tuple slot.
+            // For joins, we reference by position in child's target list (varattno = resno of child entry).
+            let child_resno = (*target_entry).resno;
+            let child_expr = (*target_entry).expr;
 
-            // Update varno in the expression if it's a Var node
-            if !(*new_target_entry).expr.is_null() {
-                let expr = (*new_target_entry).expr;
-                if (*expr).type_ == pg_sys::NodeTag::T_Var {
-                    let var_node = expr as *mut pg_sys::Var;
-                    (*var_node).varno = 1; // Left relation
-                }
-            }
+            // Get type info from the child expression
+            let (vartype, vartypmod, varcollid) = if !child_expr.is_null() {
+                (
+                    pg_sys::exprType(child_expr as *mut pg_sys::Node),
+                    pg_sys::exprTypmod(child_expr as *mut pg_sys::Node),
+                    pg_sys::exprCollation(child_expr as *mut pg_sys::Node),
+                )
+            } else {
+                (pg_sys::InvalidOid, -1, pg_sys::InvalidOid)
+            };
+
+            // Create new Var node for OUTER_VAR reference
+            let mut new_var = PgBox::<pg_sys::Var>::alloc0();
+            new_var.xpr.type_ = pg_sys::NodeTag::T_Var;
+            new_var.varno = OUTER_VAR; // Reference outer (left) relation
+            new_var.varattno = child_resno;
+            new_var.vartype = vartype;
+            new_var.vartypmod = vartypmod;
+            new_var.varcollid = varcollid;
+            new_var.varlevelsup = 0;
+            new_var.varnosyn = 0;
+            new_var.varattnosyn = 0;
+            new_var.location = -1;
+
+            // Create new target entry
+            let mut new_te = PgBox::<pg_sys::TargetEntry>::alloc0();
+            new_te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            new_te.expr = new_var.into_pg() as *mut pg_sys::Expr;
+            new_te.resno = resno;
+            new_te.resname = (*target_entry).resname; // Share the name pointer
+            new_te.ressortgroupref = 0;
+            new_te.resorigtbl = pg_sys::InvalidOid;
+            new_te.resorigcol = 0;
+            new_te.resjunk = false;
 
             combined_list =
-                pg_sys::lappend(combined_list, new_target_entry as *mut std::ffi::c_void);
+                pg_sys::lappend(combined_list, new_te.into_pg() as *mut std::ffi::c_void);
             resno += 1;
         }
     }
 
-    // Add target entries from right plan
+    // Add target entries from right (inner) plan
     if !(*right_plan).targetlist.is_null() {
         let right_list = (*right_plan).targetlist;
         let length = (*right_list).length as usize;
@@ -1196,23 +1252,47 @@ unsafe fn create_combined_target_list(
         for i in 0..length {
             let target_entry = pg_sys::list_nth(right_list, i as i32) as *mut pg_sys::TargetEntry;
 
-            // Create a copy of the target entry with updated resno and varno
-            let new_target_entry = PgBox::<pg_sys::TargetEntry>::alloc0();
-            let new_target_entry = new_target_entry.into_pg();
-            *new_target_entry = *target_entry; // Copy the structure
-            (*new_target_entry).resno = resno;
+            // Create a NEW Var node referencing the inner tuple slot.
+            let child_resno = (*target_entry).resno;
+            let child_expr = (*target_entry).expr;
 
-            // Update varno in the expression if it's a Var node
-            if !(*new_target_entry).expr.is_null() {
-                let expr = (*new_target_entry).expr;
-                if (*expr).type_ == pg_sys::NodeTag::T_Var {
-                    let var_node = expr as *mut pg_sys::Var;
-                    (*var_node).varno = 2; // Right relation
-                }
-            }
+            // Get type info from the child expression
+            let (vartype, vartypmod, varcollid) = if !child_expr.is_null() {
+                (
+                    pg_sys::exprType(child_expr as *mut pg_sys::Node),
+                    pg_sys::exprTypmod(child_expr as *mut pg_sys::Node),
+                    pg_sys::exprCollation(child_expr as *mut pg_sys::Node),
+                )
+            } else {
+                (pg_sys::InvalidOid, -1, pg_sys::InvalidOid)
+            };
+
+            // Create new Var node for INNER_VAR reference
+            let mut new_var = PgBox::<pg_sys::Var>::alloc0();
+            new_var.xpr.type_ = pg_sys::NodeTag::T_Var;
+            new_var.varno = INNER_VAR; // Reference inner (right) relation
+            new_var.varattno = child_resno;
+            new_var.vartype = vartype;
+            new_var.vartypmod = vartypmod;
+            new_var.varcollid = varcollid;
+            new_var.varlevelsup = 0;
+            new_var.varnosyn = 0;
+            new_var.varattnosyn = 0;
+            new_var.location = -1;
+
+            // Create new target entry
+            let mut new_te = PgBox::<pg_sys::TargetEntry>::alloc0();
+            new_te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            new_te.expr = new_var.into_pg() as *mut pg_sys::Expr;
+            new_te.resno = resno;
+            new_te.resname = (*target_entry).resname; // Share the name pointer
+            new_te.ressortgroupref = 0;
+            new_te.resorigtbl = pg_sys::InvalidOid;
+            new_te.resorigcol = 0;
+            new_te.resjunk = false;
 
             combined_list =
-                pg_sys::lappend(combined_list, new_target_entry as *mut std::ffi::c_void);
+                pg_sys::lappend(combined_list, new_te.into_pg() as *mut std::ffi::c_void);
             resno += 1;
         }
     }
