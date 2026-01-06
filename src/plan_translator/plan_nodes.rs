@@ -671,6 +671,89 @@ unsafe fn validate_plan_tree_recursive(plan: *mut pg_sys::Plan, depth: usize) {
     eprintln!("{indent}DEBUG: validate_plan_tree_recursive completed for depth {depth} node");
 }
 
+/// Extract column index (1-based) from a Substrait expression.
+/// Handles field references and returns the 1-based column index.
+fn extract_column_index_from_expression(expr: &substrait::proto::Expression) -> i16 {
+    use substrait::proto::expression::field_reference::ReferenceType as FieldRefType;
+    use substrait::proto::expression::reference_segment::ReferenceType as SegmentRefType;
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Selection(selection)) => {
+            // FieldReference has reference_type: DirectReference or MaskedReference
+            if let Some(ref_type) = &selection.reference_type {
+                match ref_type {
+                    FieldRefType::DirectReference(ref_seg) => {
+                        // ReferenceSegment has reference_type with StructField
+                        if let Some(seg_type) = &ref_seg.reference_type {
+                            match seg_type {
+                                SegmentRefType::StructField(sf) => {
+                                    // Substrait uses 0-based indices, PostgreSQL uses 1-based
+                                    return (sf.field + 1) as i16;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            1 // Default to first column if extraction fails
+        }
+        _ => 1, // Default to first column if not a field reference
+    }
+}
+
+/// Get the type OID from a target list entry at the given 1-based column index.
+unsafe fn get_type_from_targetlist(targetlist: *mut pg_sys::List, col_idx: i16) -> pg_sys::Oid {
+    if targetlist.is_null() {
+        return pg_sys::InvalidOid;
+    }
+
+    // col_idx is 1-based, list index is 0-based
+    let list_idx = (col_idx - 1) as i32;
+    if list_idx < 0 || list_idx >= (*targetlist).length {
+        return pg_sys::InvalidOid;
+    }
+
+    let te = pg_sys::list_nth(targetlist, list_idx) as *mut pg_sys::TargetEntry;
+    if te.is_null() || (*te).expr.is_null() {
+        return pg_sys::InvalidOid;
+    }
+
+    // Get the type from the expression
+    pg_sys::exprType((*te).expr as *mut pg_sys::Node)
+}
+
+/// Get the collation from a target list entry at the given 1-based column index.
+unsafe fn get_collation_from_targetlist(
+    targetlist: *mut pg_sys::List,
+    col_idx: i16,
+) -> pg_sys::Oid {
+    if targetlist.is_null() {
+        return pg_sys::InvalidOid;
+    }
+
+    // col_idx is 1-based, list index is 0-based
+    let list_idx = (col_idx - 1) as i32;
+    if list_idx < 0 || list_idx >= (*targetlist).length {
+        return pg_sys::DEFAULT_COLLATION_OID;
+    }
+
+    let te = pg_sys::list_nth(targetlist, list_idx) as *mut pg_sys::TargetEntry;
+    if te.is_null() || (*te).expr.is_null() {
+        return pg_sys::DEFAULT_COLLATION_OID;
+    }
+
+    // Get the collation from the expression
+    let collation = pg_sys::exprCollation((*te).expr as *mut pg_sys::Node);
+    if collation == pg_sys::InvalidOid {
+        pg_sys::DEFAULT_COLLATION_OID
+    } else {
+        collation
+    }
+}
+
 /// Create a PostgreSQL Sort plan node from Substrait sort specification
 pub unsafe fn create_sort_node(
     input_plan: *mut pg_sys::Plan,
@@ -771,41 +854,114 @@ pub unsafe fn create_sort_node(
     pgrx::info!("DEBUG: Basic Sort plan fields set");
 
     // Initialize Sort-specific fields following PostgreSQL's make_sort pattern
-    // Use numCols = 1 for simple single-column sort (typical for TPC-H Q1)
-    let num_cols = 1;
+    // Use actual number of sort columns from the sorts parameter
+    let num_cols = sorts.len() as i32;
     (*sort_node).numCols = num_cols;
 
     // All arrays must have exactly numCols elements (PostgreSQL requirement)
     eprintln!("DEBUG: Creating Sort arrays with numCols = {num_cols}");
     pgrx::info!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
 
-    // sortColIdx array - which columns to sort by (1-based target list indices) - safe allocation
+    // Allocate all arrays with the correct size
     let sort_col_array = unsafe {
         pgrx::PgMemoryContexts::CurrentMemoryContext
             .palloc_slice::<pg_sys::AttrNumber>(num_cols as usize)
     };
-    sort_col_array[0] = 1; // Sort by first column in target list
-    (*sort_node).sortColIdx = sort_col_array.as_mut_ptr();
-
-    // sortOperators array - comparison operators for each sort column - safe allocation
     let ops_array = unsafe {
         pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
     };
-    ops_array[0] = 1058.into(); // bpcharlt (<) for BPCHAR columns
-    (*sort_node).sortOperators = ops_array.as_mut_ptr();
-
-    // collations array - collation for each sort column - safe allocation
     let collations_array = unsafe {
         pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
     };
-    collations_array[0] = pg_sys::DEFAULT_COLLATION_OID; // Use default collation
-    (*sort_node).collations = collations_array.as_mut_ptr();
-
-    // nullsFirst array - null ordering for each sort column - safe allocation
     let nulls_array = unsafe {
         pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<bool>(num_cols as usize)
     };
-    nulls_array[0] = false; // Nulls last (PostgreSQL default)
+
+    // Process each sort field
+    for (i, sort_field) in sorts.iter().enumerate() {
+        // Extract column index from the sort expression (should be a field reference)
+        let col_idx = if let Some(expr) = &sort_field.expr {
+            extract_column_index_from_expression(expr)
+        } else {
+            // Default to column i+1 if no expression
+            (i + 1) as i16
+        };
+        sort_col_array[i] = col_idx;
+
+        // Determine sort direction and null handling from sort_kind
+        use substrait::proto::sort_field::SortKind;
+        let (is_ascending, nulls_first) = match &sort_field.sort_kind {
+            Some(SortKind::Direction(dir)) => {
+                // Substrait SortDirection:
+                // 1 = SORT_DIRECTION_ASC_NULLS_FIRST
+                // 2 = SORT_DIRECTION_ASC_NULLS_LAST
+                // 3 = SORT_DIRECTION_DESC_NULLS_FIRST
+                // 4 = SORT_DIRECTION_DESC_NULLS_LAST
+                // 5 = SORT_DIRECTION_CLUSTERED
+                match *dir {
+                    1 => (true, true),   // ASC NULLS FIRST
+                    2 => (true, false),  // ASC NULLS LAST
+                    3 => (false, true),  // DESC NULLS FIRST
+                    4 => (false, false), // DESC NULLS LAST
+                    _ => (true, false),  // Default: ASC NULLS LAST
+                }
+            }
+            _ => (true, false), // Default: ASC NULLS LAST
+        };
+        nulls_array[i] = nulls_first;
+
+        // Get the type OID from the target list to look up the correct sort operator
+        let type_oid = get_type_from_targetlist(input_targetlist, col_idx);
+
+        // Get the sort operator for this type using PostgreSQL's type cache
+        let mut lt_opr: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut eq_opr: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut gt_opr: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut is_hashable: bool = false;
+
+        pg_sys::get_sort_group_operators(
+            type_oid,
+            true,  // needLT
+            false, // needEQ
+            true,  // needGT
+            &mut lt_opr,
+            &mut eq_opr,
+            &mut gt_opr,
+            &mut is_hashable,
+        );
+
+        // Use less-than operator for ascending, greater-than for descending
+        ops_array[i] = if is_ascending { lt_opr } else { gt_opr };
+
+        // Get collation from the target entry
+        let collation = get_collation_from_targetlist(input_targetlist, col_idx);
+        collations_array[i] = collation;
+
+        eprintln!(
+            "DEBUG: Sort col {}: idx={}, type_oid={}, op={}, collation={}, asc={}, nulls_first={}",
+            i,
+            col_idx,
+            type_oid.to_u32(),
+            ops_array[i].to_u32(),
+            collation.to_u32(),
+            is_ascending,
+            nulls_first
+        );
+        pgrx::info!(
+            "DEBUG: Sort col {}: idx={}, type_oid={}, op={}, collation={}, asc={}, nulls_first={}",
+            i,
+            col_idx,
+            type_oid.to_u32(),
+            ops_array[i].to_u32(),
+            collation.to_u32(),
+            is_ascending,
+            nulls_first
+        );
+    }
+
+    (*sort_node).sortColIdx = sort_col_array.as_mut_ptr();
+    (*sort_node).sortOperators = ops_array.as_mut_ptr();
+    (*sort_node).collations = collations_array.as_mut_ptr();
     (*sort_node).nullsFirst = nulls_array.as_mut_ptr();
 
     eprintln!("DEBUG: All Sort arrays created with consistent sizing");

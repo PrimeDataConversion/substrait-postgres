@@ -892,14 +892,22 @@ mod tests {
             .columns
             .iter()
             .map(|col| {
-                let pg_type = match col.type_oid {
+                let pg_type = match col.type_oid.into() {
+                    pg_sys::INT2OID => "smallint",
                     pg_sys::INT4OID => "integer",
                     pg_sys::INT8OID => "bigint",
                     pg_sys::TEXTOID => "text",
+                    pg_sys::VARCHAROID => "varchar",
+                    pg_sys::BPCHAROID => "character", // CHAR(n) type
                     pg_sys::FLOAT4OID => "real",
                     pg_sys::FLOAT8OID => "double precision",
+                    pg_sys::NUMERICOID => "numeric",
                     pg_sys::BOOLOID => "boolean",
-                    _ => "text", // fallback
+                    pg_sys::DATEOID => "date",
+                    pg_sys::TIMESTAMPOID => "timestamp",
+                    pg_sys::TIMESTAMPTZOID => "timestamptz",
+                    pg_sys::INTERVALOID => "interval",
+                    _ => "text", // fallback for unknown types
                 };
                 format!("{} {}", col.name, pg_type)
             })
@@ -1507,8 +1515,18 @@ mod tests {
 
                 match $expected_value {
                     GoldenExpectation::IntExact(expected) => {
-                        // For int expectations, get the first column of the first row and convert to i64
-                        match Spi::get_one::<i64>(&format!("{} LIMIT 1", execution_query)) {
+                        // For int expectations, select the last column (typically COUNT_ORDER for TPC-H aggregates).
+                        // First column is often a grouping key (character type), not the expected int result.
+                        let last_col_name = execution_result
+                            .columns
+                            .last()
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("*");
+                        let query = format!(
+                            "SELECT {} FROM ({}) AS sub LIMIT 1",
+                            last_col_name, execution_query
+                        );
+                        match Spi::get_one::<i64>(&query) {
                             Ok(Some(actual)) => {
                                 assert_eq!(
                                     actual, expected,

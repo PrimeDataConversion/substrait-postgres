@@ -3,6 +3,125 @@ use pgrx::pg_sys;
 
 use crate::plan_translator::{ColumnInfo, ExecutionResult};
 
+/// Debug helper to dump plan tree structure before ExecInitNode
+unsafe fn debug_dump_plan_tree(plan: *mut pg_sys::Plan, depth: usize) {
+    let indent = "  ".repeat(depth);
+    if plan.is_null() {
+        pgrx::info!("{}PLAN_DUMP: NULL plan at depth {}", indent, depth);
+        return;
+    }
+
+    let node_tag = (*plan).type_;
+    pgrx::info!(
+        "{}PLAN_DUMP: depth={} type={:?} ptr={:p}",
+        indent,
+        depth,
+        node_tag,
+        plan
+    );
+    pgrx::info!(
+        "{}  targetlist={:p} qual={:p}",
+        indent,
+        (*plan).targetlist,
+        (*plan).qual
+    );
+    pgrx::info!(
+        "{}  lefttree={:p} righttree={:p}",
+        indent,
+        (*plan).lefttree,
+        (*plan).righttree
+    );
+
+    // Agg-specific debug
+    if node_tag == pg_sys::NodeTag::T_Agg {
+        let agg = plan as *mut pg_sys::Agg;
+        pgrx::info!(
+            "{}  AGG: aggstrategy={:?} numCols={}",
+            indent,
+            (*agg).aggstrategy,
+            (*agg).numCols
+        );
+        pgrx::info!(
+            "{}  AGG: grpColIdx={:p} grpOperators={:p}",
+            indent,
+            (*agg).grpColIdx,
+            (*agg).grpOperators
+        );
+        pgrx::info!(
+            "{}  AGG: numGroups={} aggParams={:p}",
+            indent,
+            (*agg).numGroups,
+            (*agg).aggParams
+        );
+        if (*agg).numCols > 0 && !(*agg).grpColIdx.is_null() {
+            for i in 0..(*agg).numCols.min(10) {
+                let col = *(*agg).grpColIdx.offset(i as isize);
+                let op = if !(*agg).grpOperators.is_null() {
+                    *(*agg).grpOperators.offset(i as isize)
+                } else {
+                    pg_sys::InvalidOid
+                };
+                let coll = if !(*agg).grpCollations.is_null() {
+                    *(*agg).grpCollations.offset(i as isize)
+                } else {
+                    pg_sys::InvalidOid
+                };
+                pgrx::info!(
+                    "{}    grpCol[{}]: idx={} op={} coll={}",
+                    indent,
+                    i,
+                    col,
+                    op,
+                    coll
+                );
+            }
+        }
+        // Check chain list
+        pgrx::info!(
+            "{}  AGG: chain={:p} aggsplit={:?}",
+            indent,
+            (*agg).chain,
+            (*agg).aggsplit
+        );
+    }
+
+    // Sort-specific debug
+    if node_tag == pg_sys::NodeTag::T_Sort {
+        let sort = plan as *mut pg_sys::Sort;
+        pgrx::info!("{}  SORT: numCols={}", indent, (*sort).numCols);
+        pgrx::info!(
+            "{}  SORT: sortColIdx={:p} sortOperators={:p}",
+            indent,
+            (*sort).sortColIdx,
+            (*sort).sortOperators
+        );
+    }
+
+    // SeqScan-specific debug
+    if node_tag == pg_sys::NodeTag::T_SeqScan {
+        let scan = plan as *mut pg_sys::SeqScan;
+        pgrx::info!("{}  SEQSCAN: scanrelid={}", indent, (*scan).scan.scanrelid);
+    }
+
+    // Result-specific debug
+    if node_tag == pg_sys::NodeTag::T_Result {
+        let result = plan as *mut pg_sys::Result;
+        pgrx::info!(
+            "{}  RESULT: resconstantqual={:p}",
+            indent,
+            (*result).resconstantqual
+        );
+    }
+
+    // Recurse into children
+    if !(*plan).lefttree.is_null() {
+        debug_dump_plan_tree((*plan).lefttree, depth + 1);
+    }
+    if !(*plan).righttree.is_null() {
+        debug_dump_plan_tree((*plan).righttree, depth + 1);
+    }
+}
+
 /// Executes a PostgreSQL plan tree from a raw pointer without creating invalid references
 /// This is the safe version that avoids memory corruption issues.
 pub unsafe fn execute_plan_directly_from_ptr(
@@ -215,8 +334,9 @@ pub unsafe fn execute_plan_directly_raw(
 
     // Debug estate fields after ExecInitRangeTable
     pgrx::info!(
-        "DEBUG: After ExecInitRangeTable: es_range_table_size={}",
-        (*estate).es_range_table_size
+        "DEBUG: After ExecInitRangeTable: es_range_table_size={} es_relations={:p}",
+        (*estate).es_range_table_size,
+        (*estate).es_relations
     );
 
     // Lock all tables in the range table before execution.
@@ -256,6 +376,9 @@ pub unsafe fn execute_plan_directly_raw(
         estate
     );
 
+    // Debug: dump plan tree structure before ExecInitNode
+    debug_dump_plan_tree(plan_tree, 0);
+
     // Now initialize the plan node
     let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
 
@@ -289,6 +412,18 @@ pub unsafe fn execute_plan_directly_raw(
         if slot.is_null() {
             break; // No more tuples
         }
+
+        // Check if slot is empty (TTS_EMPTY macro: slot == NULL || TTS_EMPTY(slot))
+        // TTS_EMPTY checks if tts_flags has TTS_FLAG_EMPTY set.
+        if (*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16 != 0 {
+            pgrx::info!("DEBUG: Slot is empty (TTS_EMPTY), ending loop");
+            break;
+        }
+
+        // Materialize the slot if needed (handles virtual slots).
+        // This ensures the slot contains a physical tuple that can be stored.
+        pgrx::info!("DEBUG: Materializing slot before storing");
+        pg_sys::ExecMaterializeSlot(slot);
 
         // Store tuple directly in tuplestore
         pg_sys::tuplestore_puttupleslot(tuplestore, slot);
@@ -701,8 +836,9 @@ pub unsafe fn execute_plan_directly(
 
     // Debug estate fields after ExecInitRangeTable
     pgrx::info!(
-        "DEBUG: After ExecInitRangeTable: es_range_table_size={}",
-        (*estate).es_range_table_size
+        "DEBUG: After ExecInitRangeTable: es_range_table_size={} es_relations={:p}",
+        (*estate).es_range_table_size,
+        (*estate).es_relations
     );
 
     // Lock all tables in the range table before execution.
@@ -742,6 +878,9 @@ pub unsafe fn execute_plan_directly(
         estate
     );
 
+    // Debug: dump plan tree structure before ExecInitNode
+    debug_dump_plan_tree(plan_tree, 0);
+
     // Now initialize the plan node
     let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
 
@@ -755,7 +894,7 @@ pub unsafe fn execute_plan_directly(
 
     pgrx::info!("DEBUG: Manual initialization succeeded!");
 
-    // Get the plan state - ExecutorStart already called ExecInitNode for us!
+    // Get the plan state - we called ExecInitNode above.
     let plan_state = (*query_desc_ptr).planstate;
     eprintln!("DEBUG: ExecutorStart succeeded, plan_state: {plan_state:p}");
     pgrx::info!(
@@ -822,32 +961,31 @@ pub unsafe fn execute_plan_directly(
             expected_tupdesc.is_some()
         );
 
-        if let Some(expected_desc) = expected_tupdesc {
-            eprintln!("DEBUG: Converting to AS clause format");
-            pgrx::info!("DEBUG: Converting to AS clause format");
+        // Check slot flags before materializing.
+        let flags = (*slot).tts_flags;
+        pgrx::info!(
+            "DEBUG: Slot {:p} flags={}, empty={}",
+            slot,
+            flags,
+            flags & pg_sys::TTS_FLAG_EMPTY as u16 != 0
+        );
 
-            // Create a slot with the AS clause descriptor
-            let as_clause_slot =
-                pg_sys::MakeTupleTableSlot(expected_desc, &pg_sys::TTSOpsMinimalTuple);
-
-            // Extract tuple from execution slot and create new tuple with AS clause descriptor
-            let tuple = pg_sys::ExecFetchSlotMinimalTuple(slot, &mut false);
-            if !tuple.is_null() {
-                eprintln!("DEBUG: Storing tuple in AS clause format slot");
-                pgrx::info!("DEBUG: Storing tuple in AS clause format slot");
-                // Store the tuple using the AS clause descriptor
-                pg_sys::ExecStoreMinimalTuple(tuple, as_clause_slot, false);
-                pg_sys::tuplestore_puttupleslot(tuplestore, as_clause_slot);
-            }
-
-            // Clean up the temporary slot
-            pg_sys::ExecDropSingleTupleTableSlot(as_clause_slot);
-        } else {
-            eprintln!("DEBUG: Storing tuple directly (no AS clause conversion)");
-            pgrx::info!("DEBUG: Storing tuple directly (no AS clause conversion)");
-            // Store tuple directly in tuplestore (original behavior)
-            pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        // Skip empty slots.
+        if flags & pg_sys::TTS_FLAG_EMPTY as u16 != 0 {
+            pgrx::info!("DEBUG: Slot is empty, breaking loop");
+            break;
         }
+
+        // Materialize the slot if needed (virtual slots need to be materialized).
+        pgrx::info!("DEBUG: About to materialize slot {:p}", slot);
+        pg_sys::ExecMaterializeSlot(slot);
+        pgrx::info!("DEBUG: Slot materialized successfully");
+
+        // Store tuple directly in tuplestore.
+        // The tuplestore handles type conversion as needed.
+        pgrx::info!("DEBUG: About to store tuple in tuplestore");
+        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
+        pgrx::info!("DEBUG: Tuple stored successfully");
         tuple_count += 1;
 
         // Prevent infinite loops and excessive memory usage

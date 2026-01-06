@@ -83,9 +83,10 @@ impl AggNodeBuilder {
         // AGG_PLAIN (0) = no grouping, just aggregate
         // AGG_SORTED (1) = input is sorted on grouping columns
         // AGG_HASHED (2) = use hash tables for grouping
-        // Note: Using AGG_SORTED which expects sorted input (may need Sort below Agg)
+        // Using AGG_HASHED since input may not be pre-sorted.
+        // AGG_SORTED would require Sort node below Agg, not above.
         if n > 0 {
-            (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_SORTED;
+            (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_HASHED;
         } else {
             (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
         }
@@ -272,12 +273,15 @@ fn extract_struct_field(
     Ok(None)
 }
 
+/// Extract aggregate arguments as TargetEntry nodes.
+/// CRITICAL: Aggref.args must be a list of TargetEntry nodes, not raw Var nodes.
+/// This was causing crashes during ExecInitNode.
 unsafe fn extract_agg_args(
     args: &[substrait::proto::FunctionArgument],
     input_plan: *mut pg_sys::Plan,
 ) -> *mut pg_sys::List {
-    let mut list = PgList::<pg_sys::Var>::new();
-    for arg in args {
+    let mut list = PgList::<pg_sys::TargetEntry>::new();
+    for (i, arg) in args.iter().enumerate() {
         if let Some(substrait::proto::function_argument::ArgType::Value(expr)) = &arg.arg_type {
             if let Ok(Some(field)) = extract_struct_field(expr) {
                 let attno = (field.field + 1) as pg_sys::AttrNumber;
@@ -286,9 +290,10 @@ unsafe fn extract_agg_args(
                 let (vartype, vartypmod, varcollid) =
                     get_type_from_input_target_list(input_plan, attno);
 
+                // Create Var node.
                 let mut var = PgBox::<pg_sys::Var>::alloc0();
-                var.xpr.type_ = pg_sys::NodeTag::T_Var; // CRITICAL: Set the node type!
-                                                        // Use OUTER_VAR since aggregate args reference the child plan's output.
+                var.xpr.type_ = pg_sys::NodeTag::T_Var;
+                // Use OUTER_VAR since aggregate args reference the child plan's output.
                 var.varno = OUTER_VAR;
                 var.varattno = attno;
                 var.vartype = vartype;
@@ -299,7 +304,19 @@ unsafe fn extract_agg_args(
                 var.varnosyn = 0;
                 var.varattnosyn = 0;
                 var.location = -1;
-                list.push(var.into_pg());
+
+                // Wrap the Var in a TargetEntry (required for Aggref.args in PostgreSQL 14+).
+                let mut te = PgBox::<pg_sys::TargetEntry>::alloc0();
+                te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+                te.expr = var.into_pg() as *mut pg_sys::Expr;
+                te.resno = (i + 1) as pg_sys::AttrNumber;
+                te.resname = std::ptr::null_mut(); // No name needed for agg args.
+                te.ressortgroupref = 0;
+                te.resorigtbl = pg_sys::InvalidOid;
+                te.resorigcol = 0;
+                te.resjunk = false;
+
+                list.push(te.into_pg());
             }
         }
     }
