@@ -28,6 +28,30 @@ pub unsafe fn transform_target_list_to_outer_var(
     new_list
 }
 
+/// Fix Var.varno values in a target list to match the given scanrelid.
+/// This is needed because create_target_list_for_table creates Vars with varno=1,
+/// but each SeqScan may have a different scanrelid.
+pub unsafe fn fix_targetlist_varnos(target_list: *mut pg_sys::List, scanrelid: pg_sys::Index) {
+    if target_list.is_null() {
+        return;
+    }
+
+    let list_len = pg_sys::list_length(target_list);
+    for i in 0..list_len {
+        let te = pg_sys::list_nth(target_list, i) as *mut pg_sys::TargetEntry;
+        if !te.is_null() && !(*te).expr.is_null() {
+            let expr = (*te).expr;
+            if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                let var = expr as *mut pg_sys::Var;
+                // Update varno to match the scanrelid
+                (*var).varno = scanrelid as i32;
+                // Also update varnosyn for consistency
+                (*var).varnosyn = scanrelid;
+            }
+        }
+    }
+}
+
 /// Clone a target entry and transform it to reference child output by position.
 /// The new Var uses OUTER_VAR as varno and the entry's resno as varattno,
 /// because we're referencing the position in the child plan's target list.
@@ -301,6 +325,10 @@ pub unsafe fn create_seqscan_node_with_scanrelid(
 
     // Create target list FIRST - PostgreSQL pattern
     let target_list = create_target_list_for_table(table_oid)?;
+
+    // CRITICAL: Fix Var.varno values in the target list to match the scanrelid
+    // The target list was created with varno=1, but each SeqScan may have a different scanrelid
+    fix_targetlist_varnos(target_list, scanrelid);
 
     // Use our improved SeqScan construction with PostgreSQL statistics
     let seqscan_node = create_seqscan_with_postgresql_stats(table_oid, scanrelid, target_list);
@@ -864,9 +892,12 @@ pub unsafe fn create_sort_node(
     // Set node tag FIRST (critical for ExecInitNode dispatch)
     (*sort_node).plan.type_ = pg_sys::NodeTag::T_Sort;
 
-    // Copy generic plan info from input (PostgreSQL's copy_generic_plan_info pattern)
+    // Copy generic plan info from input (PostgreSQL's copy_generic_plan_info pattern).
+    // Sort passes through tuples unchanged, so use the same targetlist as child.
+    // NOTE: For Sort, PostgreSQL directly uses the child's targetlist without transformation.
     (*sort_node).plan.targetlist = (*input_plan).targetlist;
-    (*sort_node).plan.qual = (*input_plan).qual;
+    // Sort nodes don't filter rows - they only reorder them. Set qual to NULL.
+    (*sort_node).plan.qual = std::ptr::null_mut();
     (*sort_node).plan.lefttree = input_plan;
     (*sort_node).plan.righttree = std::ptr::null_mut();
     (*sort_node).plan.initPlan = (*input_plan).initPlan;
@@ -888,37 +919,34 @@ pub unsafe fn create_sort_node(
     let num_cols = sorts.len() as i32;
     (*sort_node).numCols = num_cols;
 
-    // All arrays must have exactly numCols elements (PostgreSQL requirement)
+    // All arrays must have exactly numCols elements (PostgreSQL requirement).
     eprintln!("DEBUG: Creating Sort arrays with numCols = {num_cols}");
     pgrx::info!("DEBUG: Creating Sort arrays with numCols = {}", num_cols);
 
-    // Allocate all arrays with the correct size
-    let sort_col_array = unsafe {
-        pgrx::PgMemoryContexts::CurrentMemoryContext
-            .palloc_slice::<pg_sys::AttrNumber>(num_cols as usize)
-    };
-    let ops_array = unsafe {
-        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
-    };
-    let collations_array = unsafe {
-        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<pg_sys::Oid>(num_cols as usize)
-    };
-    let nulls_array = unsafe {
-        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<bool>(num_cols as usize)
-    };
+    // Allocate all arrays using palloc0 directly for proper PostgreSQL memory management.
+    let sort_col_idx_ptr =
+        pg_sys::palloc0((num_cols as usize) * std::mem::size_of::<pg_sys::AttrNumber>())
+            as *mut pg_sys::AttrNumber;
+    let sort_operators_ptr =
+        pg_sys::palloc0((num_cols as usize) * std::mem::size_of::<pg_sys::Oid>())
+            as *mut pg_sys::Oid;
+    let collations_ptr = pg_sys::palloc0((num_cols as usize) * std::mem::size_of::<pg_sys::Oid>())
+        as *mut pg_sys::Oid;
+    let nulls_first_ptr =
+        pg_sys::palloc0((num_cols as usize) * std::mem::size_of::<bool>()) as *mut bool;
 
-    // Process each sort field
+    // Process each sort field.
     for (i, sort_field) in sorts.iter().enumerate() {
-        // Extract column index from the sort expression (should be a field reference)
+        // Extract column index from the sort expression (should be a field reference).
         let col_idx = if let Some(expr) = &sort_field.expr {
             extract_column_index_from_expression(expr)
         } else {
-            // Default to column i+1 if no expression
+            // Default to column i+1 if no expression.
             (i + 1) as i16
         };
-        sort_col_array[i] = col_idx;
+        *sort_col_idx_ptr.add(i) = col_idx;
 
-        // Determine sort direction and null handling from sort_kind
+        // Determine sort direction and null handling from sort_kind.
         use substrait::proto::sort_field::SortKind;
         let (is_ascending, nulls_first) = match &sort_field.sort_kind {
             Some(SortKind::Direction(dir)) => {
@@ -938,12 +966,12 @@ pub unsafe fn create_sort_node(
             }
             _ => (true, false), // Default: ASC NULLS LAST
         };
-        nulls_array[i] = nulls_first;
+        *nulls_first_ptr.add(i) = nulls_first;
 
-        // Get the type OID from the target list to look up the correct sort operator
+        // Get the type OID from the target list to look up the correct sort operator.
         let type_oid = get_type_from_targetlist(input_targetlist, col_idx);
 
-        // Get the sort operator for this type using PostgreSQL's type cache
+        // Get the sort operator for this type using PostgreSQL's type cache.
         let mut lt_opr: pg_sys::Oid = pg_sys::InvalidOid;
         let mut eq_opr: pg_sys::Oid = pg_sys::InvalidOid;
         let mut gt_opr: pg_sys::Oid = pg_sys::InvalidOid;
@@ -960,19 +988,20 @@ pub unsafe fn create_sort_node(
             &mut is_hashable,
         );
 
-        // Use less-than operator for ascending, greater-than for descending
-        ops_array[i] = if is_ascending { lt_opr } else { gt_opr };
+        // Use less-than operator for ascending, greater-than for descending.
+        let sort_op = if is_ascending { lt_opr } else { gt_opr };
+        *sort_operators_ptr.add(i) = sort_op;
 
-        // Get collation from the target entry
+        // Get collation from the target entry.
         let collation = get_collation_from_targetlist(input_targetlist, col_idx);
-        collations_array[i] = collation;
+        *collations_ptr.add(i) = collation;
 
         eprintln!(
             "DEBUG: Sort col {}: idx={}, type_oid={}, op={}, collation={}, asc={}, nulls_first={}",
             i,
             col_idx,
             type_oid.to_u32(),
-            ops_array[i].to_u32(),
+            sort_op.to_u32(),
             collation.to_u32(),
             is_ascending,
             nulls_first
@@ -982,17 +1011,17 @@ pub unsafe fn create_sort_node(
             i,
             col_idx,
             type_oid.to_u32(),
-            ops_array[i].to_u32(),
+            sort_op.to_u32(),
             collation.to_u32(),
             is_ascending,
             nulls_first
         );
     }
 
-    (*sort_node).sortColIdx = sort_col_array.as_mut_ptr();
-    (*sort_node).sortOperators = ops_array.as_mut_ptr();
-    (*sort_node).collations = collations_array.as_mut_ptr();
-    (*sort_node).nullsFirst = nulls_array.as_mut_ptr();
+    (*sort_node).sortColIdx = sort_col_idx_ptr;
+    (*sort_node).sortOperators = sort_operators_ptr;
+    (*sort_node).collations = collations_ptr;
+    (*sort_node).nullsFirst = nulls_first_ptr;
 
     eprintln!("DEBUG: All Sort arrays created with consistent sizing");
     pgrx::info!("DEBUG: All Sort arrays created with consistent sizing");
@@ -1065,13 +1094,38 @@ pub unsafe fn create_limit_node_with_expressions(
     Ok(&mut (*limit_node).plan as *mut pg_sys::Plan)
 }
 
-/// Create a PostgreSQL Filter plan node from Substrait filter specification
+/// Create a PostgreSQL Filter plan node from Substrait filter specification.
+/// If the child is a SeqScan, pushes the filter down to the scan's qual for proper evaluation.
+/// Otherwise creates a Result node with the filter qual.
 pub unsafe fn create_filter_node(
     input_plan: *mut pg_sys::Plan,
     condition_expr: *mut pg_sys::Expr,
 ) -> Result<*mut pg_sys::Plan, Box<dyn std::error::Error + Send + Sync>> {
-    // In PostgreSQL, filters are typically implemented as Result nodes with a qual condition.
-    // For more complex filtering, we might need a custom scan node.
+    // Check if the input is a SeqScan - if so, push filter down to scan qual.
+    // This is how PostgreSQL normally handles filters for better performance and correctness.
+    if (*input_plan).type_ == pg_sys::NodeTag::T_SeqScan {
+        let seqscan = input_plan as *mut pg_sys::SeqScan;
+        let scanrelid = (*seqscan).scan.scanrelid as i32;
+
+        pgrx::info!(
+            "DEBUG: Pushing filter down to SeqScan with scanrelid={}",
+            scanrelid
+        );
+
+        // Transform the condition to use the SeqScan's scanrelid instead of OUTER_VAR.
+        let transformed_condition = transform_expr_varno(condition_expr, OUTER_VAR, scanrelid);
+
+        // Add the condition to the SeqScan's qual.
+        let mut qual_list = (*seqscan).scan.plan.qual;
+        qual_list = pg_sys::lappend(qual_list, transformed_condition as *mut std::ffi::c_void);
+        (*seqscan).scan.plan.qual = qual_list;
+
+        return Ok(input_plan);
+    }
+
+    // For non-SeqScan inputs, use a Result node for filtering.
+    // Note: Result nodes with qual may not filter correctly in all PostgreSQL versions.
+    pgrx::info!("DEBUG: Creating Result node for filter (input is not SeqScan)");
 
     let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
     result_node.plan.type_ = pg_sys::NodeTag::T_Result;
@@ -1094,14 +1148,95 @@ pub unsafe fn create_filter_node(
     result_node.plan.targetlist = transform_target_list_to_outer_var((*input_plan).targetlist);
     result_node.resconstantqual = std::ptr::null_mut();
 
-    // Set the filter condition as a qualification
+    // Set the filter condition as a qualification.
     let mut qual_list: *mut pg_sys::List = std::ptr::null_mut();
     qual_list = pg_sys::lappend(qual_list, condition_expr as *mut std::ffi::c_void);
     result_node.plan.qual = qual_list;
 
     let result_ptr = result_node.into_pg();
-    // Return pointer to the plan field
+    // Return pointer to the plan field.
     Ok(&mut (*result_ptr).plan as *mut pg_sys::Plan)
+}
+
+/// Transform all Var nodes in an expression from one varno to another.
+/// This is used when pushing filters down from Result nodes to scan nodes.
+unsafe fn transform_expr_varno(
+    expr: *mut pg_sys::Expr,
+    from_varno: i32,
+    to_varno: i32,
+) -> *mut pg_sys::Expr {
+    if expr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let node_tag = (*expr).type_;
+    match node_tag {
+        pg_sys::NodeTag::T_Var => {
+            let var = expr as *mut pg_sys::Var;
+            if (*var).varno == from_varno {
+                (*var).varno = to_varno;
+                (*var).varnosyn = to_varno as pg_sys::Index;
+            }
+            expr
+        }
+        pg_sys::NodeTag::T_BoolExpr => {
+            let bool_expr = expr as *mut pg_sys::BoolExpr;
+            // Transform all arguments.
+            let args = (*bool_expr).args;
+            if !args.is_null() {
+                let len = pg_sys::list_length(args);
+                for i in 0..len {
+                    let arg = pg_sys::list_nth(args, i) as *mut pg_sys::Expr;
+                    transform_expr_varno(arg, from_varno, to_varno);
+                }
+            }
+            expr
+        }
+        pg_sys::NodeTag::T_FuncExpr => {
+            let func_expr = expr as *mut pg_sys::FuncExpr;
+            // Transform all arguments.
+            let args = (*func_expr).args;
+            if !args.is_null() {
+                let len = pg_sys::list_length(args);
+                for i in 0..len {
+                    let arg = pg_sys::list_nth(args, i) as *mut pg_sys::Expr;
+                    transform_expr_varno(arg, from_varno, to_varno);
+                }
+            }
+            expr
+        }
+        pg_sys::NodeTag::T_OpExpr => {
+            let op_expr = expr as *mut pg_sys::OpExpr;
+            // Transform all arguments.
+            let args = (*op_expr).args;
+            if !args.is_null() {
+                let len = pg_sys::list_length(args);
+                for i in 0..len {
+                    let arg = pg_sys::list_nth(args, i) as *mut pg_sys::Expr;
+                    transform_expr_varno(arg, from_varno, to_varno);
+                }
+            }
+            expr
+        }
+        pg_sys::NodeTag::T_RelabelType => {
+            let relabel = expr as *mut pg_sys::RelabelType;
+            if !(*relabel).arg.is_null() {
+                transform_expr_varno((*relabel).arg as *mut pg_sys::Expr, from_varno, to_varno);
+            }
+            expr
+        }
+        pg_sys::NodeTag::T_CoerceViaIO => {
+            let coerce = expr as *mut pg_sys::CoerceViaIO;
+            if !(*coerce).arg.is_null() {
+                transform_expr_varno((*coerce).arg as *mut pg_sys::Expr, from_varno, to_varno);
+            }
+            expr
+        }
+        _ => {
+            // For other expression types, return as-is.
+            expr
+        }
+    }
 }
 
 /// Create a PostgreSQL NestLoop plan node for Cross (Cartesian product) join

@@ -2,16 +2,23 @@ use super::constants::get_relation_type_name;
 use super::expressions::{
     convert_expression_to_postgres_for_child_output, convert_expression_to_postgres_with_context,
     convert_expressions_to_target_list_for_child_output,
-    convert_expressions_to_target_list_with_schema,
+    convert_expressions_to_target_list_with_schema, set_collector_next_scanrelid,
+    set_current_outer_schema,
 };
 use super::plan_nodes::*;
 use super::schema::RelationSchema;
-use crate::plan_translator::aggregate::create_aggregate_node;
+use crate::plan_translator::aggregate::{create_aggregate_node, derive_aggregate_schema};
 use anyhow::Result;
 use pgrx::pg_sys;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use substrait::proto::{Plan, PlanRel, Rel};
+
+/// Subplan entry for tracking subplans during conversion.
+pub struct SubplanEntry {
+    pub plan: *mut pg_sys::Plan,
+    pub range_table: *mut pg_sys::List,
+}
 
 /// Conversion context that holds state during plan tree construction.
 pub struct ConversionContext<'a> {
@@ -19,6 +26,10 @@ pub struct ConversionContext<'a> {
     pub current_table_oid: Option<pg_sys::Oid>,
     /// Counter for assigning unique scanrelids. Each SeqScan gets the next value.
     next_scanrelid: Cell<u32>,
+    /// Counter for assigning unique subplan IDs. Each SubPlan gets the next value.
+    next_subplan_id: Cell<i32>,
+    /// List of subplans collected during conversion.
+    subplans: RefCell<Vec<SubplanEntry>>,
 }
 
 impl<'a> ConversionContext<'a> {
@@ -26,18 +37,55 @@ impl<'a> ConversionContext<'a> {
         function_map: &'a HashMap<u32, String>,
         current_table_oid: Option<pg_sys::Oid>,
     ) -> Self {
+        Self::with_start_scanrelid(function_map, current_table_oid, 1)
+    }
+
+    /// Create a new context with a specific starting scanrelid.
+    /// Use this when converting subplans that need to continue the scanrelid sequence.
+    pub fn with_start_scanrelid(
+        function_map: &'a HashMap<u32, String>,
+        current_table_oid: Option<pg_sys::Oid>,
+        start_scanrelid: u32,
+    ) -> Self {
         Self {
             function_map,
             current_table_oid,
-            next_scanrelid: Cell::new(1), // PostgreSQL scanrelids are 1-based
+            next_scanrelid: Cell::new(start_scanrelid), // Start from provided value
+            next_subplan_id: Cell::new(1),              // PostgreSQL subplan IDs are 1-based
+            subplans: RefCell::new(Vec::new()),
         }
     }
 
     /// Get the next scanrelid and increment the counter.
+    /// Also updates the SubplanCollector's counter to keep them in sync,
+    /// so subplans created during expression conversion get unique scanrelids.
     pub fn next_scanrelid(&self) -> u32 {
         let id = self.next_scanrelid.get();
         self.next_scanrelid.set(id + 1);
+        // Sync with the SubplanCollector so subplans continue the sequence
+        set_collector_next_scanrelid(id + 1);
         id
+    }
+
+    /// Get the current scanrelid counter value without incrementing.
+    /// Use this to retrieve the final value after conversion.
+    pub fn current_scanrelid(&self) -> u32 {
+        self.next_scanrelid.get()
+    }
+
+    /// Register a subplan and return its plan_id.
+    pub fn register_subplan(&self, plan: *mut pg_sys::Plan, range_table: *mut pg_sys::List) -> i32 {
+        let id = self.next_subplan_id.get();
+        self.next_subplan_id.set(id + 1);
+        self.subplans
+            .borrow_mut()
+            .push(SubplanEntry { plan, range_table });
+        id
+    }
+
+    /// Take ownership of the collected subplans.
+    pub fn take_subplans(&self) -> Vec<SubplanEntry> {
+        std::mem::take(&mut *self.subplans.borrow_mut())
     }
 }
 
@@ -170,6 +218,25 @@ pub unsafe fn convert_rel_to_plan_tree_with_context(
     convert_rel_with_ctx(rel, &ctx)
 }
 
+/// Convert relation with a specific starting scanrelid.
+/// Returns (plan, range_table, schema, next_scanrelid).
+/// Use this for subplan conversion to maintain unique scanrelids across the entire plan tree.
+pub unsafe fn convert_rel_to_plan_tree_with_start_scanrelid(
+    rel: &Rel,
+    function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
+    start_scanrelid: u32,
+) -> Result<
+    (*mut pg_sys::Plan, *mut pg_sys::List, RelationSchema, u32),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let ctx =
+        ConversionContext::with_start_scanrelid(function_map, current_table_oid, start_scanrelid);
+    let (plan, range_table, schema) = convert_rel_with_ctx(rel, &ctx)?;
+    // Return the final scanrelid counter so caller can continue the sequence
+    Ok((plan, range_table, schema, ctx.current_scanrelid()))
+}
+
 /// Internal conversion function that uses the conversion context
 unsafe fn convert_rel_with_ctx(
     rel: &Rel,
@@ -180,7 +247,17 @@ unsafe fn convert_rel_with_ctx(
 > {
     use substrait::proto::rel::RelType;
 
-    eprintln!("DEBUG: convert_rel_with_ctx called");
+    // Debug: track recursion depth
+    static CALL_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call_num = CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if call_num >= 50 {
+        panic!(
+            "REL_LIMIT: convert_rel_with_ctx called {} times",
+            call_num + 1
+        );
+    }
+
+    eprintln!("DEBUG: convert_rel_with_ctx called (call #{})", call_num);
     pgrx::info!("DEBUG: convert_rel_with_ctx called");
 
     // Debug what relation type we're about to process
@@ -203,6 +280,15 @@ unsafe fn convert_rel_with_ctx(
             // Handle projection - create a Result node
             eprintln!("DEBUG: ✅ Project relation - starts processing");
             pgrx::info!("DEBUG: ✅ Project relation - starts processing");
+
+            // TEMPORARY DEBUG: Skip Project to test if it's the issue
+            let skip_project = std::env::var("SKIP_PROJECT").is_ok();
+            if skip_project {
+                pgrx::info!("DEBUG: SKIPPING PROJECT NODE (SKIP_PROJECT env var set)");
+                if let Some(input) = &project.input {
+                    return convert_rel_with_ctx(input, ctx);
+                }
+            }
 
             // Check for common field with emit/output_mapping on ProjectRel
             if let Some(common) = &project.common {
@@ -259,12 +345,15 @@ unsafe fn convert_rel_with_ctx(
 
                 // Convert expressions to PostgreSQL target entries using OUTER_VAR.
                 // Result nodes reference their child plan's output via OUTER_VAR.
-                let (target_list, output_schema) =
-                    convert_expressions_to_target_list_for_child_output(
-                        &project.expressions,
-                        ctx.function_map,
-                        &input_schema,
-                    )?;
+                // Set the current outer schema for correlated subquery support.
+                set_current_outer_schema(Some(input_schema.clone()));
+                let result = convert_expressions_to_target_list_for_child_output(
+                    &project.expressions,
+                    ctx.function_map,
+                    &input_schema,
+                );
+                set_current_outer_schema(None);
+                let (target_list, output_schema) = result?;
 
                 // Create a Result plan node using PostgreSQL's memory allocator
                 let mut result_node = pgrx::PgBox::<pg_sys::Result>::alloc0();
@@ -428,6 +517,13 @@ unsafe fn convert_rel_with_ctx(
                 return Err("Sort relation missing input".into());
             };
 
+            // TEMPORARY DEBUG: Skip Sort to test if child plan works
+            let skip_sort = std::env::var("SKIP_SORT").is_ok();
+            if skip_sort {
+                pgrx::info!("DEBUG: SKIPPING SORT NODE (SKIP_SORT env var set)");
+                return Ok((input_plan, input_range_table, input_schema));
+            }
+
             // Sort passes through input schema and range table unchanged
             Ok((
                 create_sort_node(input_plan, &sort.sorts)?,
@@ -492,53 +588,44 @@ unsafe fn convert_rel_with_ctx(
             ))
         }
         Some(RelType::Filter(filter)) => {
-            // Handle filter relation - create a Filter node
-            eprintln!("DEBUG: Filter - about to process input");
-            pgrx::info!("DEBUG: Filter - about to process input");
-
+            // Handle filter relation - create a Result node with filter qual.
             let (input_plan, input_range_table, input_schema) = if let Some(input) = &filter.input {
-                eprintln!(
-                    "DEBUG: Filter - calling recursive convert_rel_to_plan_tree_with_context"
-                );
-                pgrx::info!(
-                    "DEBUG: Filter - calling recursive convert_rel_to_plan_tree_with_context"
-                );
-
-                let res = convert_rel_with_ctx(input, ctx)?;
-
-                eprintln!("DEBUG: Filter - recursive call returned!");
-                pgrx::info!("DEBUG: Filter - recursive call returned!");
-
-                res
+                convert_rel_with_ctx(input, ctx)?
             } else {
                 return Err("Filter relation missing input".into());
             };
 
-            eprintln!("DEBUG: Filter - about to convert condition");
-            pgrx::info!("DEBUG: Filter - about to convert condition");
+            // TEMPORARY DEBUG: Skip Filter to test if it's the issue
+            let skip_filter = std::env::var("SKIP_FILTER").is_ok();
+            if skip_filter {
+                pgrx::info!("DEBUG: SKIPPING FILTER NODE (SKIP_FILTER env var set)");
+                return Ok((input_plan, input_range_table, input_schema));
+            }
 
             // Convert the filter condition to a PostgreSQL expression using OUTER_VAR.
             // The Result node evaluates the filter condition against its child's output,
             // so we use OUTER_VAR to reference the child plan's tuple slot.
-            let condition_expr = if let Some(condition) = &filter.condition {
-                eprintln!(
-                    "DEBUG: Filter - calling convert_expression_to_postgres_for_child_output"
-                );
-                pgrx::info!(
-                    "DEBUG: Filter - calling convert_expression_to_postgres_for_child_output"
-                );
+            //
+            // Set the current outer schema for correlated subquery support.
+            // If the filter condition contains a subquery with outer references, those
+            // references will resolve against this schema when the subquery is converted.
+            set_current_outer_schema(Some(input_schema.clone()));
 
-                convert_expression_to_postgres_for_child_output(
+            let condition_expr = if let Some(condition) = &filter.condition {
+                let result = convert_expression_to_postgres_for_child_output(
                     condition,
                     ctx.function_map,
                     &input_schema,
-                )?
+                );
+
+                // Clear the outer schema after conversion (even on error)
+                set_current_outer_schema(None);
+
+                result?
             } else {
+                set_current_outer_schema(None);
                 return Err("Filter relation missing condition".into());
             };
-
-            eprintln!("DEBUG: Filter - condition converted with schema-based types");
-            pgrx::info!("DEBUG: Filter - condition converted with schema-based types");
 
             // Filter passes through input schema and range table unchanged
             Ok((
@@ -581,20 +668,29 @@ unsafe fn convert_rel_with_ctx(
         }
         Some(RelType::Aggregate(aggregate)) => {
             // Handle aggregate relation - create an Agg node for GROUP BY and aggregate functions
-            let (input_plan, input_range_table, _input_schema) =
+            let (input_plan, input_range_table, input_schema) =
                 if let Some(input) = &aggregate.input {
                     convert_rel_with_ctx(input, ctx)?
                 } else {
                     return Err("Aggregate relation missing input".into());
                 };
 
-            // TODO: Implement proper aggregate schema derivation
-            // For now, create a placeholder schema
-            // The schema should contain grouping columns + aggregate results
-            let aggregate_schema = RelationSchema::new();
+            // TEMPORARY DEBUG: Skip Agg to test if child plan works
+            let skip_agg = std::env::var("SKIP_AGG").is_ok();
+            if skip_agg {
+                pgrx::info!("DEBUG: SKIPPING AGG NODE (SKIP_AGG env var set)");
+                return Ok((input_plan, input_range_table, input_schema));
+            }
+
+            // Create the aggregate node first
+            let agg_plan = create_aggregate_node(input_plan, aggregate, ctx.function_map)?;
+
+            // Derive proper schema from aggregate - includes grouping cols + aggregate results
+            let aggregate_schema =
+                derive_aggregate_schema(aggregate, &input_schema, ctx.function_map, input_plan);
 
             Ok((
-                create_aggregate_node(input_plan, aggregate, ctx.function_map)?,
+                agg_plan,
                 input_range_table, // Pass through range table from input
                 aggregate_schema,
             ))
@@ -616,12 +712,18 @@ unsafe fn convert_rel_with_ctx(
 
             // No need to offset scanrelids - they are assigned uniquely by ctx.next_scanrelid()
 
+            // Substrait JoinType enum:
+            // 0 = UNSPECIFIED, 1 = INNER, 2 = OUTER (FULL), 3 = LEFT, 4 = RIGHT
+            // 5 = LEFT_SEMI, 6 = RIGHT_SEMI, 7 = LEFT_ANTI, 8 = RIGHT_ANTI
             let join_type = match join.r#type {
-                0 => pg_sys::JoinType::JOIN_INNER,
-                1 => pg_sys::JoinType::JOIN_LEFT,
-                2 => pg_sys::JoinType::JOIN_RIGHT,
-                3 => pg_sys::JoinType::JOIN_FULL,
-                _ => return Err("Unsupported join type".into()),
+                0 => pg_sys::JoinType::JOIN_INNER, // UNSPECIFIED defaults to INNER
+                1 => pg_sys::JoinType::JOIN_INNER,
+                2 => pg_sys::JoinType::JOIN_FULL, // OUTER = FULL OUTER
+                3 => pg_sys::JoinType::JOIN_LEFT,
+                4 => pg_sys::JoinType::JOIN_RIGHT,
+                5 => pg_sys::JoinType::JOIN_SEMI, // LEFT_SEMI
+                7 => pg_sys::JoinType::JOIN_ANTI, // LEFT_ANTI
+                _ => return Err(format!("Unsupported join type: {}", join.r#type).into()),
             };
 
             let join_qual = if let Some(expr) = &join.expression {

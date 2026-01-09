@@ -1,4 +1,5 @@
 use crate::plan_translator::expressions::{create_cstring, OUTER_VAR};
+use crate::plan_translator::schema::{ColumnInfo, RelationSchema};
 use pgrx::pg_sys::AttrNumber;
 use pgrx::{pg_sys, PgBox, PgList};
 use std::collections::HashMap;
@@ -76,19 +77,28 @@ impl AggNodeBuilder {
     pub unsafe fn set_group_columns(&mut self, indices: &[pg_sys::AttrNumber]) {
         let n = indices.len() as i32;
         (*self.ptr).numCols = n;
-        // CRITICAL: Set numGroups to match numCols for GROUP BY queries
-        (*self.ptr).numGroups = if n > 0 { 1 } else { 0 };
+        // CRITICAL: Set numGroups to at least 1.
+        // For AGG_PLAIN (no GROUP BY), there's exactly 1 group (the entire result).
+        // For AGG_HASHED/AGG_SORTED with GROUP BY, numGroups is an estimate.
+        // Use a reasonable default estimate for hash table sizing.
+        if n == 0 {
+            (*self.ptr).numGroups = 1;
+        } else {
+            // Estimate number of groups - use a reasonable default.
+            // PostgreSQL uses this for hash table sizing.
+            (*self.ptr).numGroups = 100; // Conservative estimate
+        }
 
-        // Set aggstrategy based on whether there are GROUP BY columns
-        // AGG_PLAIN (0) = no grouping, just aggregate
+        // Set aggstrategy based on whether there are GROUP BY columns.
+        // AGG_PLAIN (0) = no grouping, just aggregate (for queries without GROUP BY)
         // AGG_SORTED (1) = input is sorted on grouping columns
         // AGG_HASHED (2) = use hash tables for grouping
-        // Using AGG_HASHED since input may not be pre-sorted.
-        // AGG_SORTED would require Sort node below Agg, not above.
-        if n > 0 {
-            (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_HASHED;
-        } else {
+        if n == 0 {
             (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_PLAIN;
+        } else {
+            // Use AGG_HASHED for queries with GROUP BY.
+            // This requires proper hash function setup in grpOperators.
+            (*self.ptr).aggstrategy = pg_sys::AggStrategy::AGG_HASHED;
         }
 
         if n == 0 {
@@ -104,9 +114,30 @@ impl AggNodeBuilder {
 
         for i in 0..n as usize {
             *grpColIdx.add(i) = indices[i];
-            // Use btcharcmp for CHAR columns (typical for l_returnflag, l_linestatus)
-            *grpOperators.add(i) = 1054.into(); // bpchareq (=) for BPCHAR columns
-            *grpCollations.add(i) = pg_sys::DEFAULT_COLLATION_OID; // Use default collation
+            // Look up the correct equality operator for each grouping column's type.
+            // For now, use bpchareq (1054) for BPCHAR and texteq (98) for TEXT,
+            // with fallback to int4eq (96) for INT4.
+            // TODO: Use proper operator lookup from pg_operator catalog.
+            let attno = indices[i];
+            let (vartype, _vartypmod, varcollid) =
+                get_type_from_input_target_list((*self.ptr).plan.lefttree, attno);
+            let eq_oid = match vartype.to_u32() {
+                1042 => 1054.into(), // BPCHAROID -> bpchareq
+                25 => 98.into(),     // TEXTOID -> texteq
+                1043 => 98.into(),   // VARCHAROID -> texteq (text operators work for varchar)
+                23 => 96.into(),     // INT4OID -> int4eq
+                20 => 410.into(),    // INT8OID -> int8eq
+                1700 => 1752.into(), // NUMERICOID -> numeric_eq
+                _ => {
+                    pgrx::info!(
+                        "DEBUG: Unknown type {} for grouping column, using generic eq",
+                        vartype.to_u32()
+                    );
+                    1054.into() // Default to bpchareq as fallback
+                }
+            };
+            *grpOperators.add(i) = eq_oid;
+            *grpCollations.add(i) = varcollid;
         }
 
         (*self.ptr).grpColIdx = grpColIdx;
@@ -328,23 +359,43 @@ unsafe fn get_type_from_input_target_list(
     input_plan: *mut pg_sys::Plan,
     attno: pg_sys::AttrNumber,
 ) -> (pg_sys::Oid, i32, pg_sys::Oid) {
+    pgrx::info!(
+        "DEBUG: get_type_from_input_target_list called for attno={}",
+        attno
+    );
+
     if input_plan.is_null() {
-        // Default to TEXT if no input plan
+        pgrx::info!("DEBUG: input_plan is null, returning TEXTOID");
         return (pg_sys::TEXTOID, -1, pg_sys::DEFAULT_COLLATION_OID);
     }
 
+    pgrx::info!("DEBUG: input_plan type: {:?}", (*input_plan).type_);
+
     let targetlist = (*input_plan).targetlist;
     if targetlist.is_null() {
+        pgrx::info!("DEBUG: targetlist is null, returning TEXTOID");
         return (pg_sys::TEXTOID, -1, pg_sys::DEFAULT_COLLATION_OID);
     }
 
     // Find the TargetEntry with the matching resno
     let list_len = (*targetlist).length;
+    pgrx::info!("DEBUG: targetlist has {} entries", list_len);
+
     for i in 0..list_len {
         let te = pg_sys::list_nth(targetlist, i) as *mut pg_sys::TargetEntry;
         if te.is_null() {
             continue;
         }
+        pgrx::info!(
+            "DEBUG: TargetEntry[{}] resno={} expr_type={:?}",
+            i,
+            (*te).resno,
+            if !(*te).expr.is_null() {
+                (*((*te).expr as *mut pg_sys::Node)).type_
+            } else {
+                pg_sys::NodeTag::T_Invalid
+            }
+        );
         if (*te).resno == attno {
             let expr = (*te).expr;
             if !expr.is_null() {
@@ -352,11 +403,19 @@ unsafe fn get_type_from_input_target_list(
                 let expr_type = pg_sys::exprType(expr as *mut pg_sys::Node);
                 let expr_typmod = pg_sys::exprTypmod(expr as *mut pg_sys::Node);
                 let expr_collid = pg_sys::exprCollation(expr as *mut pg_sys::Node);
+                pgrx::info!(
+                    "DEBUG: Found attno={}, returning type={}, typmod={}, collid={}",
+                    attno,
+                    expr_type.to_u32(),
+                    expr_typmod,
+                    expr_collid.to_u32()
+                );
                 return (expr_type, expr_typmod, expr_collid);
             }
         }
     }
 
+    pgrx::info!("DEBUG: attno={} not found, returning TEXTOID", attno);
     // Default if not found
     (pg_sys::TEXTOID, -1, pg_sys::DEFAULT_COLLATION_OID)
 }
@@ -371,6 +430,13 @@ fn resolve_agg_oid(
         .map(|s| s.as_str())
         .unwrap_or("");
 
+    pgrx::info!(
+        "DEBUG: resolve_agg_oid: func_ref={} name='{}' arg_type={}",
+        func.function_reference,
+        name,
+        arg_type.to_u32()
+    );
+
     // Use dynamic lookup based on function name prefix and actual argument type
     let base_name = if name.starts_with("sum:") {
         "sum"
@@ -383,54 +449,172 @@ fn resolve_agg_oid(
     } else if name.starts_with("max:") {
         "max"
     } else {
+        pgrx::info!("DEBUG: resolve_agg_oid: unknown function prefix, defaulting to count(*)");
         return 2803.into(); // Default to count(*)
     };
 
     // Look up the aggregate function for the actual argument type
-    unsafe { lookup_agg_func_by_name_and_type(base_name, arg_type) }
+    let oid = unsafe { lookup_agg_func_by_name_and_type(base_name, arg_type) };
+    pgrx::info!(
+        "DEBUG: resolve_agg_oid: base_name='{}' -> OID={}",
+        base_name,
+        oid.to_u32()
+    );
+    oid
 }
 
-/// Look up aggregate function OID by name and argument type
+/// Look up aggregate function OID by name and argument type.
+/// This searches the pg_aggregate catalog to find the correct aggregate function.
 unsafe fn lookup_agg_func_by_name_and_type(name: &str, arg_type: pg_sys::Oid) -> pg_sys::Oid {
     use crate::plan_translator::expressions::lookup_function_oid;
 
-    // For count(*), use the no-argument version
+    pgrx::info!(
+        "DEBUG: lookup_agg_func_by_name_and_type: name='{}' arg_type={}",
+        name,
+        arg_type.to_u32()
+    );
+
+    // For count(*), use the no-argument version.
     if name == "count" && arg_type == pg_sys::InvalidOid {
+        pgrx::info!("DEBUG: lookup_agg_func: count(*) -> 2803");
         return 2803.into(); // count(*)
     }
 
-    // Try to look up the aggregate function with the actual type
-    let result = if arg_type == pg_sys::InvalidOid {
-        // No arguments (like count(*))
+    // Try to look up the function first.
+    let func_oid_result = if arg_type == pg_sys::InvalidOid {
         lookup_function_oid(name, &[])
     } else {
         lookup_function_oid(name, &[arg_type])
     };
 
-    match result {
-        Ok(oid) => oid,
-        Err(_) => {
-            eprintln!(
-                "DEBUG: Failed to lookup aggregate '{}' with arg type {}, using fallback",
+    // Search pg_aggregate catalog directly for exact aggregate name and arg type match.
+    // This is more reliable than LookupFuncName which may return polymorphic versions.
+    if let Some(agg_oid) = search_aggregate_catalog(name, arg_type) {
+        pgrx::info!(
+            "DEBUG: lookup_agg_func: found exact match {} in pg_aggregate -> {}",
+            name,
+            agg_oid.to_u32()
+        );
+        return agg_oid;
+    }
+
+    // Fallback: use LookupFuncName result if it's a valid aggregate.
+    if let Ok(func_oid) = func_oid_result {
+        if is_aggregate_function(func_oid) {
+            pgrx::info!(
+                "DEBUG: lookup_agg_func: using LookupFuncName aggregate {} -> {}",
                 name,
-                arg_type.to_u32()
+                func_oid.to_u32()
             );
-            // Fallback to known OIDs
-            match (name, arg_type.into()) {
-                ("sum", 1700) => 2104.into(), // sum(numeric)
-                ("sum", 701) => 2108.into(),  // sum(float8)
-                ("sum", 23) => 2102.into(),   // sum(int4)
-                ("avg", 1700) => 2107.into(), // avg(numeric)
-                ("avg", 701) => 2100.into(),  // avg(float8)
-                ("min", 1700) => 2142.into(), // min(numeric)
-                ("min", 701) => 2136.into(),  // min(float8)
-                ("max", 1700) => 2148.into(), // max(numeric)
-                ("max", 701) => 2137.into(),  // max(float8)
-                ("count", _) => 2803.into(),  // count(*)
-                _ => 2803.into(),             // Default to count(*)
+            return func_oid;
+        }
+        pgrx::info!(
+            "DEBUG: lookup_agg_func: {} ({}) is NOT an aggregate",
+            name,
+            func_oid.to_u32()
+        );
+    }
+
+    pgrx::info!(
+        "DEBUG: lookup_agg_func: Failed to find '{}' with arg type {}, defaulting to count(*)",
+        name,
+        arg_type.to_u32()
+    );
+    // Default to count(*) for unknown aggregates.
+    2803.into()
+}
+
+/// Check if a function OID is an aggregate function by querying pg_aggregate.
+unsafe fn is_aggregate_function(func_oid: pg_sys::Oid) -> bool {
+    let agg_tuple = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::AGGFNOID as i32,
+        pg_sys::Datum::from(func_oid),
+    );
+
+    if agg_tuple.is_null() {
+        return false;
+    }
+
+    pg_sys::ReleaseSysCache(agg_tuple);
+    true
+}
+
+/// Search pg_aggregate catalog for an aggregate function by name and argument type.
+/// Returns the aggregate function OID if found, None otherwise.
+unsafe fn search_aggregate_catalog(name: &str, arg_type: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    // We need to search pg_proc for functions with the given name that are also in pg_aggregate.
+    // Use a catalog scan on pg_proc, then verify each match is in pg_aggregate.
+    let name_c = std::ffi::CString::new(name).ok()?;
+
+    // Search pg_proc using the function name.
+    let pg_proc_rel =
+        pg_sys::table_open(pg_sys::ProcedureRelationId, pg_sys::AccessShareLock as i32);
+
+    // Build a scan key for proname.
+    let mut scan_key = pg_sys::ScanKeyData::default();
+    pg_sys::ScanKeyInit(
+        &mut scan_key,
+        pg_sys::Anum_pg_proc_proname as i16,
+        pg_sys::BTEqualStrategyNumber as u16,
+        62.into(), // F_NAMEEQ
+        pg_sys::Datum::from(name_c.as_ptr() as usize),
+    );
+
+    let scan = pg_sys::systable_beginscan(
+        pg_proc_rel,
+        pg_sys::ProcedureNameArgsNspIndexId.into(), // Index on proname
+        true,                                       // index_ok
+        std::ptr::null_mut(),                       // snapshot
+        1,                                          // nkeys
+        &mut scan_key,
+    );
+
+    let mut result_oid: Option<pg_sys::Oid> = None;
+
+    loop {
+        let tuple = pg_sys::systable_getnext(scan);
+        if tuple.is_null() {
+            break;
+        }
+
+        let proc_form = pg_sys::GETSTRUCT(tuple) as *mut pg_sys::FormData_pg_proc;
+        let proc_oid = (*proc_form).oid;
+
+        // Check if this function matches our argument type.
+        let nargs = (*proc_form).pronargs;
+        if arg_type == pg_sys::InvalidOid {
+            // Looking for no-argument aggregate.
+            if nargs != 0 {
+                continue;
+            }
+        } else {
+            // Looking for single-argument aggregate with matching type.
+            if nargs != 1 {
+                continue;
+            }
+            // Get the first argument type.
+            // proargtypes is an oidvector, first element is at offset 0.
+            let argtypes = &(*proc_form).proargtypes;
+            if argtypes.dim1 < 1 {
+                continue;
+            }
+            let first_arg_type = *argtypes.values.as_ptr();
+            if first_arg_type != arg_type {
+                continue;
             }
         }
+
+        // Verify this is an aggregate.
+        if is_aggregate_function(proc_oid) {
+            result_oid = Some(proc_oid);
+            break;
+        }
     }
+
+    pg_sys::systable_endscan(scan);
+    pg_sys::table_close(pg_proc_rel, pg_sys::AccessShareLock as i32);
+
+    result_oid
 }
 
 unsafe fn palloc_array<T>(len: i32) -> *mut T {
@@ -516,10 +700,11 @@ unsafe fn lookup_function_return_type(func_oid: pg_sys::Oid) -> Option<pg_sys::O
     Some(return_type)
 }
 
-/// Resolve aggregate function transition type based on function OID
-/// This queries the pg_aggregate system catalog for accurate type information.
+/// Resolve aggregate function transition type based on function OID.
+/// For simple aggregates like min/max, the transition type equals the result type.
+/// For others, we query the pg_aggregate catalog.
 unsafe fn resolve_agg_trans_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
-    // Query pg_aggregate system catalog for the transition type
+    // First check if this is in pg_aggregate.
     let agg_tuple = pg_sys::SearchSysCache1(
         pg_sys::SysCacheIdentifier::AGGFNOID as i32,
         pg_sys::Datum::from(func_oid),
@@ -527,37 +712,46 @@ unsafe fn resolve_agg_trans_type(func_oid: pg_sys::Oid) -> pg_sys::Oid {
 
     if agg_tuple.is_null() {
         eprintln!(
-            "DEBUG: No pg_aggregate entry found for func_oid: {}, using INTERNALOID",
+            "DEBUG: No pg_aggregate entry found for func_oid: {}, using return type",
             func_oid.to_u32()
         );
-        return pg_sys::INTERNALOID;
+        // Use return type as fallback (works for min/max).
+        return resolve_agg_return_type(func_oid);
     }
 
-    // Get aggtranstype using SysCacheGetAttr
-    // Anum_pg_aggregate_aggtranstype is 17 in PostgreSQL 17
-    const ANUM_PG_AGGREGATE_AGGTRANSTYPE: u32 = 17;
+    // Use SysCacheGetAttr to get the transition type.
+    // Attribute number for aggtranstype varies by PostgreSQL version.
+    // In PostgreSQL 14-17, it's attribute 17.
+    // In pgrx, Anum_pg_aggregate_aggtranstype should be available.
+    let attr_num: i16 =
+        if cfg!(feature = "pg17") || cfg!(feature = "pg16") || cfg!(feature = "pg15") {
+            17 // PostgreSQL 14-17
+        } else {
+            17 // Default
+        };
+
     let mut is_null = false;
     let trans_type_datum = pg_sys::SysCacheGetAttr(
         pg_sys::SysCacheIdentifier::AGGFNOID as i32,
         agg_tuple,
-        ANUM_PG_AGGREGATE_AGGTRANSTYPE as i16,
+        attr_num,
         &mut is_null,
     );
 
     let trans_type = if is_null {
-        pg_sys::INTERNALOID
+        // Fallback to return type (works for min/max).
+        resolve_agg_return_type(func_oid)
     } else {
-        // Datum for Oid is just the Oid value
         pg_sys::Oid::from(trans_type_datum.value() as u32)
     };
+
+    pg_sys::ReleaseSysCache(agg_tuple);
 
     eprintln!(
         "DEBUG: Resolved aggtranstype for func_oid {} -> {}",
         func_oid.to_u32(),
         trans_type.to_u32()
     );
-
-    pg_sys::ReleaseSysCache(agg_tuple);
 
     trans_type
 }
@@ -652,4 +846,74 @@ fn infer_expr_type_oid(expr: &substrait::proto::Expression) -> u32 {
     } else {
         pg_sys::TEXTOID.into()
     }
+}
+
+/// Derive output schema from an aggregate relation.
+/// The schema includes grouping columns followed by aggregate result columns.
+pub unsafe fn derive_aggregate_schema(
+    aggregate: &substrait::proto::AggregateRel,
+    input_schema: &RelationSchema,
+    function_map: &HashMap<u32, String>,
+    input_plan: *mut pg_sys::Plan,
+) -> RelationSchema {
+    let mut columns = Vec::new();
+
+    // 1. Add grouping columns from input schema
+    let group_indices = extract_grouping_cols(&aggregate.groupings).unwrap_or_default();
+    for idx in &group_indices {
+        // idx is 1-based AttrNumber, convert to 0-based index
+        let col_index = (*idx - 1) as usize;
+        if let Some(col) = input_schema.get_column(col_index) {
+            columns.push(col.clone());
+        } else {
+            // Fallback: generic column if input schema doesn't have the column
+            columns.push(ColumnInfo {
+                type_oid: pg_sys::INT4OID,
+                typmod: -1,
+                collid: pg_sys::InvalidOid,
+                name: None,
+            });
+        }
+    }
+
+    // 2. Add aggregate result columns
+    for measure in &aggregate.measures {
+        if let Some(func) = &measure.measure {
+            // Get the argument type from the input plan
+            let arg_type = if func.arguments.is_empty() {
+                pg_sys::InvalidOid
+            } else if let Some(substrait::proto::function_argument::ArgType::Value(expr)) =
+                &func.arguments[0].arg_type
+            {
+                infer_expr_type_oid_from_input(expr, input_plan)
+            } else {
+                pg_sys::InvalidOid
+            };
+
+            // Resolve the aggregate function OID
+            let func_oid = resolve_agg_oid(func, function_map, arg_type);
+
+            // Get the return type for this aggregate function
+            let return_type = resolve_agg_return_type(func_oid);
+
+            columns.push(ColumnInfo {
+                type_oid: return_type,
+                typmod: -1,
+                collid: pg_sys::InvalidOid,
+                name: None,
+            });
+        }
+    }
+
+    pgrx::info!(
+        "DEBUG: Derived aggregate schema with {} columns (group: {}, agg: {})",
+        columns.len(),
+        group_indices.len(),
+        aggregate.measures.len()
+    );
+    for (i, col) in columns.iter().enumerate() {
+        pgrx::info!("  Column {}: type_oid={}", i, col.type_oid.to_u32());
+    }
+
+    RelationSchema::with_columns(columns)
 }

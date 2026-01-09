@@ -2,15 +2,24 @@ use anyhow::Result;
 use pgrx::pg_sys;
 use substrait::proto::Plan;
 
+use super::expressions::{
+    set_subplan_collector, take_subplan_collector, SubplanCollector, SubplanEntry,
+};
 use super::relations::{
     build_function_extension_map, convert_plan_relation_to_plan_tree_with_context,
 };
 
-/// Translates a Substrait plan to a PostgreSQL plan tree without executing it
+/// Translates a Substrait plan to a PostgreSQL plan tree without executing it.
+/// Returns: (plan_tree, column_names, range_table, subplans)
 pub fn translate_substrait_plan(
     plan: &Plan,
 ) -> Result<
-    (*mut pg_sys::Plan, Vec<String>, *mut pg_sys::List),
+    (
+        *mut pg_sys::Plan,
+        Vec<String>,
+        *mut pg_sys::List,
+        Vec<SubplanEntry>,
+    ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     pgrx::info!(
@@ -37,13 +46,19 @@ pub fn translate_substrait_plan(
     translate_substrait_plan_with_function_map(plan, function_map)
 }
 
-/// Translates a Substrait plan to a PostgreSQL plan tree using a pre-built function map
-/// This avoids memory context issues when accessing protobuf data
+/// Translates a Substrait plan to a PostgreSQL plan tree using a pre-built function map.
+/// This avoids memory context issues when accessing protobuf data.
+/// Returns: (plan_tree, column_names, range_table, subplans)
 pub fn translate_substrait_plan_with_function_map(
     plan: &Plan,
     function_map: std::collections::HashMap<u32, String>,
 ) -> Result<
-    (*mut pg_sys::Plan, Vec<String>, *mut pg_sys::List),
+    (
+        *mut pg_sys::Plan,
+        Vec<String>,
+        *mut pg_sys::List,
+        Vec<SubplanEntry>,
+    ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     pgrx::info!(
@@ -76,11 +91,24 @@ pub fn translate_substrait_plan_with_function_map(
         eprintln!("DEBUG: About to call convert_plan_relation_to_plan_tree_with_context");
         pgrx::info!("DEBUG: About to call convert_plan_relation_to_plan_tree_with_context");
 
+        // Set up the subplan collector to capture subplans during conversion
+        let collector = SubplanCollector::new(function_map.clone(), None);
+        set_subplan_collector(collector);
+
         eprintln!("DEBUG: Calling convert_plan_relation_to_plan_tree_with_context");
         pgrx::info!("DEBUG: Calling convert_plan_relation_to_plan_tree_with_context");
 
         let relation_result =
             convert_plan_relation_to_plan_tree_with_context(relation, &function_map, None);
+
+        // Take the collector to get subplans (even if conversion failed)
+        let subplans = take_subplan_collector()
+            .map(|c| c.take_subplans())
+            .unwrap_or_default();
+        eprintln!(
+            "DEBUG: Collected {} subplans during conversion",
+            subplans.len()
+        );
 
         eprintln!("DEBUG: convert_plan_relation_to_plan_tree_with_context call completed");
         pgrx::info!("DEBUG: convert_plan_relation_to_plan_tree_with_context call completed");
@@ -169,7 +197,7 @@ pub fn translate_substrait_plan_with_function_map(
             range_table
         );
 
-        let result = (plan_tree, column_names, range_table);
+        let result = (plan_tree, column_names, range_table, subplans);
 
         eprintln!("DEBUG: Return value created, about to return");
         pgrx::info!("DEBUG: Return value created, about to return");

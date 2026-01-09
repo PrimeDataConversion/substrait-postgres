@@ -4,12 +4,308 @@ use std::collections::HashMap;
 use substrait::proto::Expression;
 
 use super::constants::get_expression_type_name;
-use super::relations::convert_rel_to_plan_tree_with_context;
+use super::relations::{convert_rel_to_plan_tree_with_context, ConversionContext};
 use super::schema::{ColumnInfo, RelationSchema};
 
 use pgrx::{AnyNumeric, IntoDatum, PgBox};
+use std::cell::RefCell;
 use std::str::FromStr;
 use substrait::proto::{r#type::Kind, Type};
+
+/// Thread-local storage for subplan collection during conversion.
+/// This allows nested expression conversion functions to register subplans
+/// without threading the ConversionContext through all function signatures.
+thread_local! {
+    static SUBPLAN_COLLECTOR: RefCell<Option<SubplanCollector>> = RefCell::new(None);
+}
+
+/// Collector for subplans during expression conversion.
+pub struct SubplanCollector {
+    pub function_map: HashMap<u32, String>,
+    pub current_table_oid: Option<pg_sys::Oid>,
+    subplans: Vec<SubplanEntry>,
+    next_plan_id: i32,
+    /// Counter for assigning unique scanrelids across main plan and subplans.
+    next_scanrelid: u32,
+    /// Stack of outer query schemas for resolving outer references in correlated subqueries.
+    outer_schemas: Vec<RelationSchema>,
+    /// Parameters collected during subquery conversion for outer references.
+    param_entries: Vec<ParamEntry>,
+    /// Counter for assigning unique parameter IDs.
+    next_param_id: i32,
+    /// The schema of the current query context, to be pushed when entering a subquery.
+    current_outer_schema: Option<RelationSchema>,
+}
+
+/// Entry for a collected subplan.
+pub struct SubplanEntry {
+    pub plan: *mut pg_sys::Plan,
+    pub range_table: *mut pg_sys::List,
+}
+
+/// Entry for a parameter used in correlated subquery (outer reference).
+#[derive(Clone)]
+pub struct ParamEntry {
+    pub param_id: i32,
+    pub field_index: usize,
+    pub type_oid: pg_sys::Oid,
+    pub typmod: i32,
+    pub collid: pg_sys::Oid,
+}
+
+impl SubplanCollector {
+    pub fn new(function_map: HashMap<u32, String>, current_table_oid: Option<pg_sys::Oid>) -> Self {
+        Self {
+            function_map,
+            current_table_oid,
+            subplans: Vec::new(),
+            next_plan_id: 1,
+            next_scanrelid: 1, // Start at 1 (PostgreSQL scanrelids are 1-based)
+            outer_schemas: Vec::new(),
+            param_entries: Vec::new(),
+            next_param_id: 0, // Start at 0 (PostgreSQL param IDs are 0-based)
+            current_outer_schema: None,
+        }
+    }
+
+    /// Create a collector with a specific starting scanrelid.
+    /// Use this when the main plan has already consumed some scanrelids.
+    pub fn with_start_scanrelid(
+        function_map: HashMap<u32, String>,
+        current_table_oid: Option<pg_sys::Oid>,
+        start_scanrelid: u32,
+    ) -> Self {
+        Self {
+            function_map,
+            current_table_oid,
+            subplans: Vec::new(),
+            next_plan_id: 1,
+            next_scanrelid: start_scanrelid,
+            outer_schemas: Vec::new(),
+            param_entries: Vec::new(),
+            next_param_id: 0,
+            current_outer_schema: None,
+        }
+    }
+
+    /// Set the current outer schema (called before converting expressions that may contain subqueries).
+    pub fn set_current_outer_schema(&mut self, schema: Option<RelationSchema>) {
+        self.current_outer_schema = schema;
+    }
+
+    /// Get the current outer schema to push when entering a subquery.
+    pub fn get_current_outer_schema(&self) -> Option<&RelationSchema> {
+        self.current_outer_schema.as_ref()
+    }
+
+    pub fn register_subplan(
+        &mut self,
+        plan: *mut pg_sys::Plan,
+        range_table: *mut pg_sys::List,
+    ) -> i32 {
+        let id = self.next_plan_id;
+        self.next_plan_id += 1;
+        self.subplans.push(SubplanEntry { plan, range_table });
+        id
+    }
+
+    /// Get the current next_scanrelid value for subplan conversion.
+    pub fn get_next_scanrelid(&self) -> u32 {
+        self.next_scanrelid
+    }
+
+    /// Update the next_scanrelid counter after subplan conversion.
+    pub fn set_next_scanrelid(&mut self, value: u32) {
+        self.next_scanrelid = value;
+    }
+
+    /// Push an outer schema onto the stack (when entering a subquery).
+    pub fn push_outer_schema(&mut self, schema: RelationSchema) {
+        self.outer_schemas.push(schema);
+    }
+
+    /// Pop an outer schema from the stack (when leaving a subquery).
+    pub fn pop_outer_schema(&mut self) -> Option<RelationSchema> {
+        self.outer_schemas.pop()
+    }
+
+    /// Get the outer schema at the specified level (1 = immediate outer, 2 = two levels up, etc).
+    pub fn get_outer_schema(&self, steps_out: u32) -> Option<&RelationSchema> {
+        if steps_out == 0 || steps_out as usize > self.outer_schemas.len() {
+            return None;
+        }
+        // steps_out=1 means the most recent outer schema (last in the vec)
+        let index = self.outer_schemas.len() - steps_out as usize;
+        Some(&self.outer_schemas[index])
+    }
+
+    /// Register a parameter for an outer reference and return the param ID.
+    pub fn register_outer_param(
+        &mut self,
+        field_index: usize,
+        type_oid: pg_sys::Oid,
+        typmod: i32,
+        collid: pg_sys::Oid,
+    ) -> i32 {
+        let param_id = self.next_param_id;
+        self.next_param_id += 1;
+        self.param_entries.push(ParamEntry {
+            param_id,
+            field_index,
+            type_oid,
+            typmod,
+            collid,
+        });
+        param_id
+    }
+
+    /// Take the collected parameters (clears the list).
+    pub fn take_param_entries(&mut self) -> Vec<ParamEntry> {
+        std::mem::take(&mut self.param_entries)
+    }
+
+    /// Get the current param entries without clearing.
+    pub fn get_param_entries(&self) -> &[ParamEntry] {
+        &self.param_entries
+    }
+
+    pub fn take_subplans(self) -> Vec<SubplanEntry> {
+        self.subplans
+    }
+}
+
+/// Set up the subplan collector for use during conversion.
+/// Returns the previous collector (if any) for restoration.
+pub fn set_subplan_collector(collector: SubplanCollector) -> Option<SubplanCollector> {
+    SUBPLAN_COLLECTOR.with(|c| c.borrow_mut().replace(collector))
+}
+
+/// Take the subplan collector, returning ownership to the caller.
+pub fn take_subplan_collector() -> Option<SubplanCollector> {
+    SUBPLAN_COLLECTOR.with(|c| c.borrow_mut().take())
+}
+
+/// Register a subplan with the current collector, if one is active.
+/// Returns the plan_id if registered, or None if no collector is active.
+fn register_subplan_if_active(
+    plan: *mut pg_sys::Plan,
+    range_table: *mut pg_sys::List,
+) -> Option<i32> {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .map(|collector| collector.register_subplan(plan, range_table))
+    })
+}
+
+/// Check if a subplan collector is active.
+fn has_active_collector() -> bool {
+    SUBPLAN_COLLECTOR.with(|c| c.borrow().is_some())
+}
+
+/// Get a reference to the function map from the active collector.
+fn get_collector_function_map() -> Option<HashMap<u32, String>> {
+    SUBPLAN_COLLECTOR.with(|c| c.borrow().as_ref().map(|col| col.function_map.clone()))
+}
+
+/// Get the current table OID from the active collector.
+fn get_collector_table_oid() -> Option<pg_sys::Oid> {
+    SUBPLAN_COLLECTOR.with(|c| c.borrow().as_ref().and_then(|col| col.current_table_oid))
+}
+
+/// Get the current next_scanrelid value from the active collector.
+fn get_collector_next_scanrelid() -> Option<u32> {
+    SUBPLAN_COLLECTOR.with(|c| c.borrow().as_ref().map(|col| col.get_next_scanrelid()))
+}
+
+/// Update the next_scanrelid value in the active collector.
+pub fn set_collector_next_scanrelid(value: u32) {
+    SUBPLAN_COLLECTOR.with(|c| {
+        if let Some(collector) = c.borrow_mut().as_mut() {
+            collector.set_next_scanrelid(value);
+        }
+    })
+}
+
+/// Push an outer schema onto the collector's stack (when entering a subquery).
+pub fn push_outer_schema(schema: RelationSchema) {
+    SUBPLAN_COLLECTOR.with(|c| {
+        if let Some(collector) = c.borrow_mut().as_mut() {
+            collector.push_outer_schema(schema);
+        }
+    })
+}
+
+/// Pop an outer schema from the collector's stack (when leaving a subquery).
+pub fn pop_outer_schema() -> Option<RelationSchema> {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .and_then(|collector| collector.pop_outer_schema())
+    })
+}
+
+/// Get the outer schema at the specified level from the collector.
+fn get_outer_schema(steps_out: u32) -> Option<RelationSchema> {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|collector| collector.get_outer_schema(steps_out).cloned())
+    })
+}
+
+/// Register a parameter for an outer reference in the collector.
+fn register_outer_param(
+    field_index: usize,
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+    collid: pg_sys::Oid,
+) -> Option<i32> {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .map(|collector| collector.register_outer_param(field_index, type_oid, typmod, collid))
+    })
+}
+
+/// Take the collected parameters from the collector.
+pub fn take_param_entries() -> Vec<ParamEntry> {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .map(|collector| collector.take_param_entries())
+            .unwrap_or_default()
+    })
+}
+
+/// Set the current outer schema in the collector.
+/// This should be called before converting expressions that may contain subqueries.
+pub fn set_current_outer_schema(schema: Option<RelationSchema>) {
+    SUBPLAN_COLLECTOR.with(|c| {
+        if let Some(collector) = c.borrow_mut().as_mut() {
+            collector.set_current_outer_schema(schema);
+        }
+    })
+}
+
+/// Get the current outer schema from the collector (cloned).
+fn get_current_outer_schema() -> Option<RelationSchema> {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|collector| collector.get_current_outer_schema().cloned())
+    })
+}
+
+/// Get the depth of the outer schema stack.
+fn get_outer_schema_stack_depth() -> usize {
+    SUBPLAN_COLLECTOR.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|collector| collector.outer_schemas.len())
+            .unwrap_or(0)
+    })
+}
 
 /// Create a CString from a Rust string
 pub fn create_cstring(s: &str) -> *mut std::os::raw::c_char {
@@ -351,9 +647,19 @@ pub unsafe fn create_numeric_const(
         return Err(format!("Invalid NUMERICOID: {type_oid}").into());
     }
 
-    // Convert the two's complement byte array to a BigInt
-    // The bytes are typically in big-endian order.
-    let big_int = num_bigint::BigInt::from_signed_bytes_be(value_bytes);
+    // Convert the two's complement byte array to a BigInt.
+    // Substrait spec: decimal values are little-endian two's complement.
+    let big_int = num_bigint::BigInt::from_signed_bytes_le(value_bytes);
+
+    eprintln!(
+        "DEBUG: create_numeric_const - bytes={:?}, scale={}, big_int={}",
+        value_bytes, scale, big_int
+    );
+    pgrx::info!(
+        "DEBUG: create_numeric_const - big_int={}, scale={}",
+        big_int.to_string(),
+        scale
+    );
 
     // Format the BigInt into a string, applying the scale
     let mut numeric_string = big_int.to_string();
@@ -373,6 +679,15 @@ pub unsafe fn create_numeric_const(
         // If scale is negative, append zeros
         numeric_string.push_str(&"0".repeat((-scale) as usize));
     }
+
+    eprintln!(
+        "DEBUG: create_numeric_const - final numeric_string={}",
+        numeric_string
+    );
+    pgrx::info!(
+        "DEBUG: create_numeric_const - final numeric_string={}",
+        numeric_string
+    );
 
     let numeric_value: AnyNumeric = AnyNumeric::from_str(&numeric_string)
         .map_err(|e| format!("Failed to parse numeric value from string: {e}"))?;
@@ -601,6 +916,96 @@ pub unsafe fn create_cast_expr(
     Ok(cast_expr as *mut pg_sys::Expr)
 }
 
+/// Coerce an argument to a target type if needed.
+/// Returns the original argument if it already has the target type, or a cast expression otherwise.
+unsafe fn coerce_arg_to_type(
+    arg: *mut pg_sys::Expr,
+    target_type: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let arg_type = pg_sys::exprType(arg as *const pg_sys::Node);
+    if arg_type == target_type {
+        Ok(arg)
+    } else {
+        create_cast_expr(arg, target_type)
+    }
+}
+
+/// Create a PostgreSQL CaseExpr from a Substrait IfThen expression.
+/// This implements CASE WHEN ... THEN ... ELSE ... END.
+unsafe fn create_case_expr_with_varno(
+    if_then: &substrait::proto::expression::IfThen,
+    function_map: &HashMap<u32, String>,
+    input_schema: &RelationSchema,
+    varno: i32,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Build the list of CaseWhen nodes.
+    let mut case_when_list: *mut pg_sys::List = std::ptr::null_mut();
+    let mut result_type: Option<pg_sys::Oid> = None;
+
+    for if_clause in &if_then.ifs {
+        // Convert the IF condition.
+        let condition = if_clause
+            .r#if
+            .as_ref()
+            .ok_or("IfThen clause missing 'if' condition")?;
+        let condition_expr = convert_expression_to_postgres_with_varno(
+            condition,
+            function_map,
+            input_schema,
+            varno,
+        )?;
+
+        // Convert the THEN result.
+        let then_result = if_clause
+            .then
+            .as_ref()
+            .ok_or("IfThen clause missing 'then' result")?;
+        let then_expr = convert_expression_to_postgres_with_varno(
+            then_result,
+            function_map,
+            input_schema,
+            varno,
+        )?;
+
+        // Track the result type from the first THEN clause.
+        if result_type.is_none() {
+            result_type = Some(pg_sys::exprType(then_expr as *const pg_sys::Node));
+        }
+
+        // Create CaseWhen node.
+        let mut case_when = pgrx::PgBox::<pg_sys::CaseWhen>::alloc0();
+        case_when.xpr.type_ = pg_sys::NodeTag::T_CaseWhen;
+        case_when.expr = condition_expr;
+        case_when.result = then_expr;
+        let case_when = case_when.into_pg();
+
+        case_when_list = pg_sys::lappend(case_when_list, case_when as *mut std::ffi::c_void);
+    }
+
+    // Convert the ELSE clause if present.
+    let default_result = if let Some(else_expr) = &if_then.r#else {
+        convert_expression_to_postgres_with_varno(else_expr, function_map, input_schema, varno)?
+    } else {
+        // If no ELSE clause, the default result is NULL.
+        std::ptr::null_mut()
+    };
+
+    // Determine the result type.
+    let case_type = result_type.unwrap_or(pg_sys::INT4OID);
+
+    // Create the CaseExpr node.
+    let mut case_expr = pgrx::PgBox::<pg_sys::CaseExpr>::alloc0();
+    case_expr.xpr.type_ = pg_sys::NodeTag::T_CaseExpr;
+    case_expr.casetype = case_type;
+    case_expr.casecollid = pg_sys::InvalidOid; // Will be set by PostgreSQL if needed.
+    case_expr.arg = std::ptr::null_mut(); // NULL for searched CASE (CASE WHEN ...).
+    case_expr.args = case_when_list;
+    case_expr.defresult = default_result;
+    case_expr.location = -1;
+
+    Ok(case_expr.into_pg() as *mut pg_sys::Expr)
+}
+
 /// Get the PostgreSQL type OID from an expression node.
 unsafe fn get_expr_type_oid(
     expr: *mut pg_sys::Expr,
@@ -726,6 +1131,71 @@ pub unsafe fn convert_selection_to_postgres(
     selection: &substrait::proto::expression::FieldReference,
     current_table_oid: Option<pg_sys::Oid>,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Check if this is an outer reference (correlated subquery reference).
+    if let Some(root_type) = &selection.root_type {
+        use substrait::proto::expression::field_reference::RootType;
+        if let RootType::OuterReference(outer_ref) = root_type {
+            let steps_out = outer_ref.steps_out;
+            eprintln!(
+                "DEBUG: OuterReference detected with steps_out={} (non-schema path)",
+                steps_out
+            );
+
+            // Get the field index from the direct reference.
+            let field_index = if let Some(ref_type) = &selection.reference_type {
+                if let substrait::proto::expression::field_reference::ReferenceType::DirectReference(direct_ref) = ref_type {
+                    if let Some(struct_field) = &direct_ref.reference_type {
+                        if let substrait::proto::expression::reference_segment::ReferenceType::StructField(field) = struct_field {
+                            field.field as usize
+                        } else {
+                            return Err("OuterReference with unsupported reference type".into());
+                        }
+                    } else {
+                        return Err("OuterReference missing struct field".into());
+                    }
+                } else {
+                    return Err("OuterReference with non-direct reference".into());
+                }
+            } else {
+                return Err("OuterReference missing reference_type".into());
+            };
+
+            // Get the outer schema at the specified level.
+            let outer_schema = get_outer_schema(steps_out).ok_or_else(|| {
+                format!(
+                    "No outer schema available at steps_out={} (are we in a subquery?)",
+                    steps_out
+                )
+            })?;
+
+            // Look up the column info from the outer schema.
+            let column_info = outer_schema.get_column(field_index).ok_or_else(|| {
+                format!(
+                    "Field index {} out of bounds for outer schema with {} columns",
+                    field_index,
+                    outer_schema.column_count()
+                )
+            })?;
+
+            // Register the parameter with the collector.
+            let param_id = register_outer_param(
+                field_index,
+                column_info.type_oid,
+                column_info.typmod,
+                column_info.collid,
+            )
+            .ok_or("No active subplan collector for outer reference")?;
+
+            // Create a Param node (PARAM_EXEC type).
+            return create_param_node(
+                param_id,
+                column_info.type_oid,
+                column_info.typmod,
+                column_info.collid,
+            );
+        }
+    }
+
     if let Some(ref_type) = &selection.reference_type {
         match ref_type {
             substrait::proto::expression::field_reference::ReferenceType::DirectReference(
@@ -842,7 +1312,8 @@ pub unsafe fn convert_expression_to_postgres_with_context(
             }
         }
         Some(RexType::Subquery(subquery)) => {
-            // Handle subquery expressions
+            // Handle subquery expressions - creates SubLink (parse-time structure)
+            // For proper execution, use convert_expression_to_postgres_with_ctx which creates SubPlan
             create_subquery_expr(subquery, function_map).map(|node| node as *mut pg_sys::Expr)
         }
         Some(rex_type) => {
@@ -853,23 +1324,114 @@ pub unsafe fn convert_expression_to_postgres_with_context(
     }
 }
 
-/// Create a PostgreSQL subquery expression from Substrait subquery
+/// Convert a Substrait expression to PostgreSQL with full ConversionContext.
+/// This version creates SubPlan nodes for subqueries instead of SubLink,
+/// which are required for execution.
+pub unsafe fn convert_expression_to_postgres_with_ctx(
+    expr: &Expression,
+    ctx: &ConversionContext,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::RexType;
+
+    match &expr.rex_type {
+        Some(RexType::Literal(literal)) => {
+            if let Some(literal_type) = &literal.literal_type {
+                match literal_type {
+                    substrait::proto::expression::literal::LiteralType::I32(val) => {
+                        create_int4_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::I64(val) => {
+                        create_int8_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::String(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Date(val) => {
+                        create_date_const(*val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::FixedChar(val) => {
+                        create_text_const(val)
+                    }
+                    substrait::proto::expression::literal::LiteralType::Decimal(d) => {
+                        create_numeric_const(&d.value, d.precision, d.scale)
+                    }
+                    _ => Err("Unsupported literal type in expression".into()),
+                }
+            } else {
+                Err("Literal expression missing literal type".into())
+            }
+        }
+        Some(RexType::Selection(selection)) => {
+            convert_selection_to_postgres(selection, ctx.current_table_oid)
+        }
+        Some(RexType::ScalarFunction(func)) => {
+            // Use context-aware scalar function conversion
+            create_scalar_function_expr_with_ctx(func, ctx)
+        }
+        Some(RexType::Cast(cast)) => {
+            let input_expr = if let Some(input) = &cast.input {
+                convert_expression_to_postgres_with_ctx(input, ctx)?
+            } else {
+                return Err("Cast expression missing input".into());
+            };
+
+            if let Some(cast_type) = &cast.r#type {
+                let target_oid = get_pg_type_oid(cast_type)?;
+                create_cast_expr(input_expr, target_oid)
+            } else {
+                Err("Cast expression missing type".into())
+            }
+        }
+        Some(RexType::Subquery(subquery)) => {
+            // Use SubPlan creation with context for proper execution
+            create_subquery_expr_with_ctx(subquery, ctx).map(|node| node as *mut pg_sys::Expr)
+        }
+        Some(rex_type) => {
+            let type_name = get_expression_type_name(rex_type);
+            Err(format!("Unsupported expression type: {type_name}").into())
+        }
+        None => Err("Expression missing rex_type".into()),
+    }
+}
+
+/// Create scalar function expression with ConversionContext.
+/// This calls the existing create_scalar_function_expr_with_context but
+/// uses context-aware argument extraction to handle nested subqueries.
+unsafe fn create_scalar_function_expr_with_ctx(
+    func: &substrait::proto::expression::ScalarFunction,
+    ctx: &ConversionContext,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // For now, delegate to the existing function that handles all special cases
+    // The arguments will be converted recursively and any subqueries in them
+    // will be handled by the next call to convert_expression_to_postgres_with_ctx
+    create_scalar_function_expr_with_context(func, ctx.function_map, ctx.current_table_oid)
+}
+
+/// Create a PostgreSQL subquery expression from Substrait subquery.
+/// If a SubplanCollector is active (thread-local), creates SubPlan for execution.
+/// Otherwise, creates SubLink (parse-time structure).
 pub unsafe fn create_subquery_expr(
     subquery: &substrait::proto::expression::Subquery,
     function_map: &HashMap<u32, String>,
 ) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::subquery::SubqueryType;
 
+    // Check if we have an active collector - if so, create SubPlan for execution
+    if has_active_collector() {
+        eprintln!("DEBUG: create_subquery_expr - using SubPlan path (collector active)");
+        return create_subquery_as_subplan(subquery, function_map);
+    }
+
+    // No collector - create SubLink (parse-time structure)
+    eprintln!("DEBUG: create_subquery_expr - using SubLink path (no collector)");
     match &subquery.subquery_type {
         Some(SubqueryType::Scalar(scalar_subquery)) => {
-            // The scalar_subquery should contain the inner relation
             create_scalar_subquery_expr(scalar_subquery, function_map)
         }
         Some(SubqueryType::InPredicate(in_predicate)) => {
             create_in_predicate_expr(in_predicate, function_map)
         }
         Some(SubqueryType::SetPredicate(set_predicate)) => {
-            // Handle EXISTS/UNIQUE subqueries
             create_set_predicate_expr(set_predicate, function_map)
         }
         Some(SubqueryType::SetComparison(_)) => {
@@ -877,6 +1439,307 @@ pub unsafe fn create_subquery_expr(
         }
         None => Err("Subquery missing subquery_type".into()),
     }
+}
+
+/// Create a SubPlan for a subquery when a collector is active.
+unsafe fn create_subquery_as_subplan(
+    subquery: &substrait::proto::expression::Subquery,
+    function_map: &HashMap<u32, String>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::SubqueryType;
+
+    let current_table_oid = get_collector_table_oid();
+
+    match &subquery.subquery_type {
+        Some(SubqueryType::Scalar(scalar_subquery)) => {
+            create_scalar_subquery_as_subplan(scalar_subquery, function_map, current_table_oid)
+        }
+        Some(SubqueryType::InPredicate(in_predicate)) => {
+            create_in_predicate_as_subplan(in_predicate, function_map, current_table_oid)
+        }
+        Some(SubqueryType::SetPredicate(set_predicate)) => {
+            create_set_predicate_as_subplan(set_predicate, function_map, current_table_oid)
+        }
+        Some(SubqueryType::SetComparison(_)) => {
+            Err("Set comparison subqueries not yet supported".into())
+        }
+        None => Err("Subquery missing subquery_type".into()),
+    }
+}
+
+/// Create SubPlan for scalar subquery.
+unsafe fn create_scalar_subquery_as_subplan(
+    scalar_subquery: &substrait::proto::expression::subquery::Scalar,
+    function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    if scalar_subquery.input.is_none() {
+        return Err("Scalar subquery missing input relation".into());
+    }
+
+    // Push the current outer schema onto the stack before converting the subquery.
+    // This schema represents what the subquery can reference via OuterReference.
+    if let Some(outer_schema) = get_current_outer_schema() {
+        pgrx::info!(
+            "DEBUG: Pushing outer schema with {} columns for scalar subquery",
+            outer_schema.column_count()
+        );
+        push_outer_schema(outer_schema);
+    }
+
+    // Each subplan uses its own 1-based scanrelid sequence and own range table.
+    // Scanrelids are adjusted when merging range tables in executor.
+    let rel = scalar_subquery.input.as_ref().unwrap();
+    let result = convert_rel_to_plan_tree_with_context(rel, function_map, current_table_oid);
+
+    // Pop the outer schema after subquery conversion (even on error).
+    pop_outer_schema();
+
+    let (plan_tree, range_table, schema) = result?;
+
+    // Take the parameter entries that were registered during subquery conversion.
+    // These are outer references that need to be passed from the outer query.
+    let param_entries = take_param_entries();
+    eprintln!(
+        "DEBUG: Collected {} parameter entries for scalar subquery",
+        param_entries.len()
+    );
+
+    let plan_id =
+        register_subplan_if_active(plan_tree, range_table).ok_or("No active subplan collector")?;
+
+    let subplan = PgBox::<pg_sys::SubPlan>::alloc0();
+    let subplan = subplan.into_pg();
+    (*subplan).xpr.type_ = pg_sys::NodeTag::T_SubPlan;
+    (*subplan).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK;
+    (*subplan).plan_id = plan_id;
+
+    let plan_name = format!("SubPlan {}", plan_id);
+    (*subplan).plan_name = create_cstring(&plan_name);
+
+    if !schema.columns.is_empty() {
+        let first_col = &schema.columns[0];
+        (*subplan).firstColType = first_col.type_oid;
+        (*subplan).firstColTypmod = first_col.typmod;
+        (*subplan).firstColCollation = first_col.collid;
+        pgrx::info!(
+            "DEBUG: SubPlan firstColType={} (from schema with {} columns)",
+            first_col.type_oid.to_u32(),
+            schema.columns.len()
+        );
+    } else {
+        (*subplan).firstColType = pg_sys::INT4OID;
+        (*subplan).firstColTypmod = -1;
+        (*subplan).firstColCollation = pg_sys::InvalidOid;
+        pgrx::info!("DEBUG: SubPlan firstColType=INT4OID (empty schema fallback)");
+    }
+
+    (*subplan).testexpr = std::ptr::null_mut();
+
+    // Build parParam and args lists from collected parameter entries.
+    // parParam contains the parameter IDs, args contains expressions that
+    // evaluate the outer references (Var nodes referencing the outer query).
+    if !param_entries.is_empty() {
+        let mut par_param_list: *mut pg_sys::List = std::ptr::null_mut();
+        let mut args_list: *mut pg_sys::List = std::ptr::null_mut();
+
+        for entry in &param_entries {
+            // Add param_id to parParam list.
+            par_param_list = pg_sys::lappend_int(par_param_list, entry.param_id);
+
+            // Create a Var node that references the outer query's column.
+            // Use OUTER_VAR (-2) as varno since we're referencing the outer tuple slot.
+            let mut var = PgBox::<pg_sys::Var>::alloc0();
+            var.xpr.type_ = pg_sys::NodeTag::T_Var;
+            var.varno = OUTER_VAR;
+            var.varattno = (entry.field_index + 1) as pg_sys::AttrNumber; // 1-based
+            var.vartype = entry.type_oid;
+            var.vartypmod = entry.typmod;
+            var.varcollid = entry.collid;
+            var.varlevelsup = 0;
+            var.varnosyn = 0;
+            var.varattnosyn = 0;
+            var.location = -1;
+            let var_node = var.into_pg();
+
+            args_list = pg_sys::lappend(args_list, var_node as *mut std::ffi::c_void);
+
+            eprintln!(
+                "DEBUG: Added param_id={} to parParam, created Var for field {} as arg",
+                entry.param_id, entry.field_index
+            );
+        }
+
+        (*subplan).parParam = par_param_list;
+        (*subplan).args = args_list;
+
+        pgrx::info!(
+            "DEBUG: SubPlan has {} parameters (correlated subquery)",
+            param_entries.len()
+        );
+    } else {
+        (*subplan).parParam = std::ptr::null_mut();
+        (*subplan).args = std::ptr::null_mut();
+    }
+
+    (*subplan).setParam = std::ptr::null_mut();
+    (*subplan).useHashTable = false;
+    (*subplan).unknownEqFalse = false;
+    (*subplan).parallel_safe = false;
+    (*subplan).startup_cost = 0.0;
+    (*subplan).per_call_cost = 10.0;
+
+    Ok(subplan as *mut pg_sys::Node)
+}
+
+/// Create SubPlan for IN predicate.
+unsafe fn create_in_predicate_as_subplan(
+    in_predicate: &substrait::proto::expression::subquery::InPredicate,
+    function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("DEBUG: create_in_predicate_as_subplan called");
+
+    if in_predicate.haystack.is_none() {
+        return Err("IN predicate missing haystack relation".into());
+    }
+
+    if in_predicate.needles.is_empty() {
+        return Err("IN predicate missing needles expression".into());
+    }
+
+    // Each subplan uses its own 1-based scanrelid sequence and own range table.
+    // Scanrelids are adjusted when merging range tables in executor.
+    let haystack_rel = in_predicate.haystack.as_ref().unwrap();
+    let (plan_tree, range_table, schema) =
+        convert_rel_to_plan_tree_with_context(haystack_rel, function_map, current_table_oid)?;
+
+    let plan_id =
+        register_subplan_if_active(plan_tree, range_table).ok_or("No active subplan collector")?;
+
+    let subplan = PgBox::<pg_sys::SubPlan>::alloc0();
+    let subplan = subplan.into_pg();
+    (*subplan).xpr.type_ = pg_sys::NodeTag::T_SubPlan;
+    // Use EXISTS_SUBLINK for now since ANY_SUBLINK requires complex PARAM_EXEC setup
+    // EXISTS checks if subquery returns any rows - semantically different but avoids crash
+    // TODO: Implement proper ANY_SUBLINK with PARAM_EXEC for correct IN predicate semantics
+    (*subplan).subLinkType = pg_sys::SubLinkType::EXISTS_SUBLINK;
+    (*subplan).plan_id = plan_id;
+
+    let plan_name = format!("SubPlan {}", plan_id);
+    (*subplan).plan_name = create_cstring(&plan_name);
+
+    // For EXISTS_SUBLINK, firstCol* fields are not used but set them anyway
+    if !schema.columns.is_empty() {
+        let first_col = &schema.columns[0];
+        (*subplan).firstColType = first_col.type_oid;
+        (*subplan).firstColTypmod = first_col.typmod;
+        (*subplan).firstColCollation = first_col.collid;
+    } else {
+        (*subplan).firstColType = pg_sys::BOOLOID;
+        (*subplan).firstColTypmod = -1;
+        (*subplan).firstColCollation = pg_sys::InvalidOid;
+    }
+
+    (*subplan).parParam = std::ptr::null_mut();
+    (*subplan).setParam = std::ptr::null_mut();
+    (*subplan).args = std::ptr::null_mut();
+    (*subplan).useHashTable = false;
+    (*subplan).unknownEqFalse = false;
+    (*subplan).parallel_safe = false;
+    (*subplan).startup_cost = 0.0;
+    (*subplan).per_call_cost = 10.0;
+
+    // For EXISTS_SUBLINK, testexpr should be NULL
+    // EXISTS just checks if subquery returns any rows
+    (*subplan).testexpr = std::ptr::null_mut();
+
+    eprintln!(
+        "DEBUG: Created SubPlan for IN predicate (as EXISTS) with plan_id={}",
+        plan_id
+    );
+    Ok(subplan as *mut pg_sys::Node)
+}
+
+/// Create SubPlan for EXISTS/UNIQUE set predicate.
+unsafe fn create_set_predicate_as_subplan(
+    set_predicate: &substrait::proto::expression::subquery::SetPredicate,
+    function_map: &HashMap<u32, String>,
+    current_table_oid: Option<pg_sys::Oid>,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::set_predicate::PredicateOp;
+
+    let tuples_rel = set_predicate
+        .tuples
+        .as_ref()
+        .ok_or("SetPredicate missing tuples relation")?;
+
+    // Push the current outer schema onto the stack before converting the subquery.
+    // This allows the subquery to reference columns from the outer query via OuterReference.
+    if let Some(outer_schema) = get_current_outer_schema() {
+        pgrx::info!(
+            "DEBUG: Pushing outer schema with {} columns for EXISTS subquery",
+            outer_schema.column_count()
+        );
+        push_outer_schema(outer_schema);
+    }
+
+    // Each subplan uses its own 1-based scanrelid sequence and own range table.
+    // Scanrelids are adjusted when merging range tables in executor.
+    let result = convert_rel_to_plan_tree_with_context(tuples_rel, function_map, current_table_oid);
+
+    // Pop the outer schema after subquery conversion (even on error).
+    pop_outer_schema();
+
+    let (plan_tree, range_table, schema) = result?;
+
+    let plan_id =
+        register_subplan_if_active(plan_tree, range_table).ok_or("No active subplan collector")?;
+
+    let subplan = PgBox::<pg_sys::SubPlan>::alloc0();
+    let subplan = subplan.into_pg();
+    (*subplan).xpr.type_ = pg_sys::NodeTag::T_SubPlan;
+    (*subplan).plan_id = plan_id;
+
+    match PredicateOp::try_from(set_predicate.predicate_op) {
+        Ok(PredicateOp::Exists) => {
+            (*subplan).subLinkType = pg_sys::SubLinkType::EXISTS_SUBLINK;
+        }
+        Ok(PredicateOp::Unique) => {
+            (*subplan).subLinkType = pg_sys::SubLinkType::ROWCOMPARE_SUBLINK;
+        }
+        _ => return Err("Unsupported set predicate operation".into()),
+    }
+
+    let plan_name = format!("SubPlan {}", plan_id);
+    (*subplan).plan_name = create_cstring(&plan_name);
+
+    if !schema.columns.is_empty() {
+        let first_col = &schema.columns[0];
+        (*subplan).firstColType = first_col.type_oid;
+        (*subplan).firstColTypmod = first_col.typmod;
+        (*subplan).firstColCollation = first_col.collid;
+    } else {
+        (*subplan).firstColType = pg_sys::BOOLOID;
+        (*subplan).firstColTypmod = -1;
+        (*subplan).firstColCollation = pg_sys::InvalidOid;
+    }
+
+    (*subplan).testexpr = std::ptr::null_mut();
+    (*subplan).parParam = std::ptr::null_mut();
+    (*subplan).setParam = std::ptr::null_mut();
+    (*subplan).args = std::ptr::null_mut();
+    (*subplan).useHashTable = false;
+    (*subplan).unknownEqFalse = false;
+    (*subplan).parallel_safe = false;
+    (*subplan).startup_cost = 0.0;
+    (*subplan).per_call_cost = 1.0;
+
+    eprintln!(
+        "DEBUG: Created SubPlan for set predicate with plan_id={}",
+        plan_id
+    );
+    Ok(subplan as *mut pg_sys::Node)
 }
 
 /// Create a PostgreSQL scalar subquery expression
@@ -1022,6 +1885,223 @@ unsafe fn create_set_predicate_expr(
     (*sublink).subselect = query as *mut pg_sys::Node;
 
     Ok(sublink as *mut pg_sys::Node)
+}
+
+/// Create a PostgreSQL SubPlan for an IN predicate expression.
+/// This creates a SubPlan node suitable for execution, not a SubLink.
+pub unsafe fn create_in_predicate_subplan(
+    in_predicate: &substrait::proto::expression::subquery::InPredicate,
+    ctx: &ConversionContext,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    eprintln!("DEBUG: create_in_predicate_subplan called");
+
+    if in_predicate.haystack.is_none() {
+        return Err("IN predicate missing haystack relation".into());
+    }
+
+    if in_predicate.needles.is_empty() {
+        return Err("IN predicate missing needles expression".into());
+    }
+
+    // Translate the haystack (subquery relation)
+    let haystack_rel = in_predicate.haystack.as_ref().unwrap();
+    let (plan_tree, range_table, schema) = convert_rel_to_plan_tree_with_context(
+        haystack_rel,
+        ctx.function_map,
+        ctx.current_table_oid,
+    )?;
+
+    // Register this subplan and get its ID
+    let plan_id = ctx.register_subplan(plan_tree, range_table);
+    eprintln!("DEBUG: Registered subplan with plan_id={}", plan_id);
+
+    // Create SubPlan node
+    let subplan = PgBox::<pg_sys::SubPlan>::alloc0();
+    let subplan = subplan.into_pg();
+    (*subplan).xpr.type_ = pg_sys::NodeTag::T_SubPlan;
+    (*subplan).subLinkType = pg_sys::SubLinkType::ANY_SUBLINK;
+    (*subplan).plan_id = plan_id;
+
+    // Create plan name for debugging
+    let plan_name = format!("SubPlan {}", plan_id);
+    (*subplan).plan_name = create_cstring(&plan_name);
+
+    // Get type info from the first column of the subquery result
+    if !schema.columns.is_empty() {
+        let first_col = &schema.columns[0];
+        (*subplan).firstColType = first_col.type_oid;
+        (*subplan).firstColTypmod = first_col.typmod;
+        (*subplan).firstColCollation = first_col.collid;
+    } else {
+        (*subplan).firstColType = pg_sys::INT4OID;
+        (*subplan).firstColTypmod = -1;
+        (*subplan).firstColCollation = pg_sys::InvalidOid;
+    }
+
+    // NOT a correlated subplan for simple IN predicates
+    (*subplan).parParam = std::ptr::null_mut();
+    (*subplan).setParam = std::ptr::null_mut();
+    (*subplan).args = std::ptr::null_mut();
+
+    // Use hash table for ANY_SUBLINK for efficiency
+    (*subplan).useHashTable = true;
+    (*subplan).unknownEqFalse = true;
+    (*subplan).parallel_safe = false;
+
+    // Cost estimates
+    (*subplan).startup_cost = 0.0;
+    (*subplan).per_call_cost = 10.0;
+
+    // Translate the needles (expressions to check against the subquery result)
+    // For IN predicate, the test expression compares needle value against subquery result
+    if !in_predicate.needles.is_empty() {
+        let needle_expr = &in_predicate.needles[0];
+        let pg_needle = convert_expression_to_postgres_with_context(
+            needle_expr,
+            ctx.function_map,
+            ctx.current_table_oid,
+        )?;
+        (*subplan).testexpr = pg_needle as *mut pg_sys::Node;
+    }
+
+    eprintln!(
+        "DEBUG: SubPlan created successfully with plan_id={}",
+        plan_id
+    );
+    Ok(subplan as *mut pg_sys::Node)
+}
+
+/// Create a PostgreSQL subquery expression using SubPlan when context available.
+pub unsafe fn create_subquery_expr_with_ctx(
+    subquery: &substrait::proto::expression::Subquery,
+    ctx: &ConversionContext,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::SubqueryType;
+
+    match &subquery.subquery_type {
+        Some(SubqueryType::Scalar(scalar_subquery)) => {
+            // For scalar subqueries, create a SubPlan with EXPR_SUBLINK
+            create_scalar_subquery_subplan(scalar_subquery, ctx)
+        }
+        Some(SubqueryType::InPredicate(in_predicate)) => {
+            create_in_predicate_subplan(in_predicate, ctx)
+        }
+        Some(SubqueryType::SetPredicate(set_predicate)) => {
+            // EXISTS/UNIQUE subqueries
+            create_set_predicate_subplan(set_predicate, ctx)
+        }
+        Some(SubqueryType::SetComparison(_)) => {
+            Err("Set comparison subqueries not yet supported".into())
+        }
+        None => Err("Subquery missing subquery_type".into()),
+    }
+}
+
+/// Create a SubPlan for scalar subquery
+unsafe fn create_scalar_subquery_subplan(
+    scalar_subquery: &substrait::proto::expression::subquery::Scalar,
+    ctx: &ConversionContext,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    if scalar_subquery.input.is_none() {
+        return Err("Scalar subquery missing input relation".into());
+    }
+
+    let rel = scalar_subquery.input.as_ref().unwrap();
+    let (plan_tree, range_table, schema) =
+        convert_rel_to_plan_tree_with_context(rel, ctx.function_map, ctx.current_table_oid)?;
+
+    let plan_id = ctx.register_subplan(plan_tree, range_table);
+
+    let subplan = PgBox::<pg_sys::SubPlan>::alloc0();
+    let subplan = subplan.into_pg();
+    (*subplan).xpr.type_ = pg_sys::NodeTag::T_SubPlan;
+    (*subplan).subLinkType = pg_sys::SubLinkType::EXPR_SUBLINK;
+    (*subplan).plan_id = plan_id;
+
+    let plan_name = format!("SubPlan {}", plan_id);
+    (*subplan).plan_name = create_cstring(&plan_name);
+
+    if !schema.columns.is_empty() {
+        let first_col = &schema.columns[0];
+        (*subplan).firstColType = first_col.type_oid;
+        (*subplan).firstColTypmod = first_col.typmod;
+        (*subplan).firstColCollation = first_col.collid;
+    } else {
+        (*subplan).firstColType = pg_sys::INT4OID;
+        (*subplan).firstColTypmod = -1;
+        (*subplan).firstColCollation = pg_sys::InvalidOid;
+    }
+
+    (*subplan).testexpr = std::ptr::null_mut();
+    (*subplan).parParam = std::ptr::null_mut();
+    (*subplan).setParam = std::ptr::null_mut();
+    (*subplan).args = std::ptr::null_mut();
+    (*subplan).useHashTable = false;
+    (*subplan).unknownEqFalse = false;
+    (*subplan).parallel_safe = false;
+    (*subplan).startup_cost = 0.0;
+    (*subplan).per_call_cost = 10.0;
+
+    Ok(subplan as *mut pg_sys::Node)
+}
+
+/// Create a SubPlan for EXISTS/UNIQUE set predicate
+unsafe fn create_set_predicate_subplan(
+    set_predicate: &substrait::proto::expression::subquery::SetPredicate,
+    ctx: &ConversionContext,
+) -> Result<*mut pg_sys::Node, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::set_predicate::PredicateOp;
+
+    let tuples_rel = set_predicate
+        .tuples
+        .as_ref()
+        .ok_or("SetPredicate missing tuples relation")?;
+
+    let (plan_tree, range_table, schema) =
+        convert_rel_to_plan_tree_with_context(tuples_rel, ctx.function_map, ctx.current_table_oid)?;
+
+    let plan_id = ctx.register_subplan(plan_tree, range_table);
+
+    let subplan = PgBox::<pg_sys::SubPlan>::alloc0();
+    let subplan = subplan.into_pg();
+    (*subplan).xpr.type_ = pg_sys::NodeTag::T_SubPlan;
+    (*subplan).plan_id = plan_id;
+
+    match PredicateOp::try_from(set_predicate.predicate_op) {
+        Ok(PredicateOp::Exists) => {
+            (*subplan).subLinkType = pg_sys::SubLinkType::EXISTS_SUBLINK;
+        }
+        Ok(PredicateOp::Unique) => {
+            (*subplan).subLinkType = pg_sys::SubLinkType::ROWCOMPARE_SUBLINK;
+        }
+        _ => return Err("Unsupported set predicate operation".into()),
+    }
+
+    let plan_name = format!("SubPlan {}", plan_id);
+    (*subplan).plan_name = create_cstring(&plan_name);
+
+    if !schema.columns.is_empty() {
+        let first_col = &schema.columns[0];
+        (*subplan).firstColType = first_col.type_oid;
+        (*subplan).firstColTypmod = first_col.typmod;
+        (*subplan).firstColCollation = first_col.collid;
+    } else {
+        (*subplan).firstColType = pg_sys::BOOLOID;
+        (*subplan).firstColTypmod = -1;
+        (*subplan).firstColCollation = pg_sys::InvalidOid;
+    }
+
+    (*subplan).testexpr = std::ptr::null_mut();
+    (*subplan).parParam = std::ptr::null_mut();
+    (*subplan).setParam = std::ptr::null_mut();
+    (*subplan).args = std::ptr::null_mut();
+    (*subplan).useHashTable = false;
+    (*subplan).unknownEqFalse = false;
+    (*subplan).parallel_safe = false;
+    (*subplan).startup_cost = 0.0;
+    (*subplan).per_call_cost = 1.0;
+
+    Ok(subplan as *mut pg_sys::Node)
 }
 
 /// Convert expressions to target list with function context
@@ -1265,7 +2345,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "equal:any_any" => {
-            // Handle equality comparison function
+            // Handle equality comparison function.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
@@ -1273,8 +2353,9 @@ pub unsafe fn create_scalar_function_expr_with_context(
                 let right_arg = pg_args[1];
 
                 let left_type = get_expr_type_oid(left_arg)?;
-                let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("eq", &[left_type, right_type])?;
+                // Use get_comparison_func_name to get type-specific function (e.g. int4eq, texteq).
+                let func_name = get_comparison_func_name(left_type, "eq");
+                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(
@@ -1284,17 +2365,63 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "multiply:fp64_fp64" => {
-            // Handle floating point multiplication.
-            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
+            // Handle multiplication with type-appropriate function.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let func_oid =
-                    lookup_function_oid("float8mul", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+                // Get actual argument types and use appropriate multiply function.
+                let left_type = pg_sys::exprType(left_arg as *const pg_sys::Node);
+                let right_type = pg_sys::exprType(right_arg as *const pg_sys::Node);
+
+                pgrx::info!(
+                    "DEBUG: multiply:fp64_fp64 - left_type={}, right_type={}",
+                    left_type.to_u32(),
+                    right_type.to_u32()
+                );
+
+                // Use type-appropriate multiply function.
+                // For NUMERIC, always use hardcoded NUMERICOID to ensure match.
+                let (func_name, result_type, arg1_type, arg2_type) =
+                    if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                        (
+                            "numeric_mul",
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                        )
+                    } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                        (
+                            "float8mul",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    } else if left_type == pg_sys::FLOAT4OID || right_type == pg_sys::FLOAT4OID {
+                        (
+                            "float4mul",
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                        )
+                    } else if left_type == pg_sys::INT8OID || right_type == pg_sys::INT8OID {
+                        ("int8mul", pg_sys::INT8OID, pg_sys::INT8OID, pg_sys::INT8OID)
+                    } else if left_type == pg_sys::INT4OID || right_type == pg_sys::INT4OID {
+                        ("int4mul", pg_sys::INT4OID, pg_sys::INT4OID, pg_sys::INT4OID)
+                    } else {
+                        // Default to float8 for fp64 type hint.
+                        (
+                            "float8mul",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    };
+
+                let func_oid = lookup_function_oid(func_name, &[arg1_type, arg2_type])?;
+                create_function_call_expr(func_oid, result_type, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "multiply:fp64_fp64 function expects 2 arguments, got {argument_count}"
@@ -1303,17 +2430,56 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "subtract:fp64_fp64" => {
-            // Handle floating point subtraction.
-            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
+            // Handle subtraction with type-appropriate function.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let func_oid =
-                    lookup_function_oid("float8mi", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+                // Get actual argument types and use appropriate subtract function.
+                let left_type = pg_sys::exprType(left_arg as *const pg_sys::Node);
+                let right_type = pg_sys::exprType(right_arg as *const pg_sys::Node);
+
+                // Use type-appropriate subtract function.
+                let (func_name, result_type, arg1_type, arg2_type) =
+                    if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                        (
+                            "numeric_sub",
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                        )
+                    } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                        (
+                            "float8mi",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    } else if left_type == pg_sys::FLOAT4OID || right_type == pg_sys::FLOAT4OID {
+                        (
+                            "float4mi",
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                        )
+                    } else if left_type == pg_sys::INT8OID || right_type == pg_sys::INT8OID {
+                        ("int8mi", pg_sys::INT8OID, pg_sys::INT8OID, pg_sys::INT8OID)
+                    } else if left_type == pg_sys::INT4OID || right_type == pg_sys::INT4OID {
+                        ("int4mi", pg_sys::INT4OID, pg_sys::INT4OID, pg_sys::INT4OID)
+                    } else {
+                        // Default to float8 for fp64 type hint.
+                        (
+                            "float8mi",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    };
+
+                let func_oid = lookup_function_oid(func_name, &[arg1_type, arg2_type])?;
+                create_function_call_expr(func_oid, result_type, &[left_arg, right_arg])
             } else {
                 Err(format!(
                     "subtract:fp64_fp64 function expects 2 arguments, got {argument_count}"
@@ -1322,17 +2488,56 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "add:fp64_fp64" => {
-            // Handle floating point addition.
-            // Use FLOAT8OID explicitly since Substrait guarantees fp64 types.
+            // Handle addition with type-appropriate function.
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
 
-                let func_oid =
-                    lookup_function_oid("float8pl", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+                // Get actual argument types and use appropriate add function.
+                let left_type = pg_sys::exprType(left_arg as *const pg_sys::Node);
+                let right_type = pg_sys::exprType(right_arg as *const pg_sys::Node);
+
+                // Use type-appropriate add function.
+                let (func_name, result_type, arg1_type, arg2_type) =
+                    if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                        (
+                            "numeric_add",
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                        )
+                    } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                        (
+                            "float8pl",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    } else if left_type == pg_sys::FLOAT4OID || right_type == pg_sys::FLOAT4OID {
+                        (
+                            "float4pl",
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                        )
+                    } else if left_type == pg_sys::INT8OID || right_type == pg_sys::INT8OID {
+                        ("int8pl", pg_sys::INT8OID, pg_sys::INT8OID, pg_sys::INT8OID)
+                    } else if left_type == pg_sys::INT4OID || right_type == pg_sys::INT4OID {
+                        ("int4pl", pg_sys::INT4OID, pg_sys::INT4OID, pg_sys::INT4OID)
+                    } else {
+                        // Default to float8 for fp64 type hint.
+                        (
+                            "float8pl",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    };
+
+                let func_oid = lookup_function_oid(func_name, &[arg1_type, arg2_type])?;
+                create_function_call_expr(func_oid, result_type, &[left_arg, right_arg])
             } else {
                 Err(
                     format!("add:fp64_fp64 function expects 2 arguments, got {argument_count}")
@@ -1350,7 +2555,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 let left_type = get_expr_type_oid(left_arg)?;
                 let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
+                let func_oid = lookup_function_oid("textlike", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(
@@ -1386,7 +2591,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "lt:any_any" => {
-            // Handle less-than comparison function
+            // Handle less-than comparison function with type-aware coercion
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
@@ -1395,8 +2600,45 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 let left_type = get_expr_type_oid(left_arg)?;
                 let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("lt", &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    // Prefer NUMERIC - coerce non-NUMERIC arg
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    // Prefer FLOAT8
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    // Fallback: coerce right to left type
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "lt");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(format!("lt:any_any function expects 2 arguments, got {argument_count}").into())
             }
@@ -1464,7 +2706,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 let left_type = get_expr_type_oid(left_arg)?;
                 let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("text_like", &[left_type, right_type])?;
+                let func_oid = lookup_function_oid("textlike", &[left_type, right_type])?;
                 create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
             } else {
                 Err(
@@ -1531,7 +2773,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "gt:any_any" => {
-            // Handle greater-than comparison function
+            // Handle greater-than comparison function with type-aware coercion
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
@@ -1540,8 +2782,45 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 let left_type = get_expr_type_oid(left_arg)?;
                 let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("gt", &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    // Prefer NUMERIC - coerce non-NUMERIC arg
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    // Prefer FLOAT8
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    // Fallback: coerce right to left type
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "gt");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(format!("gt:any_any function expects 2 arguments, got {argument_count}").into())
             }
@@ -1567,7 +2846,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "gte:any_any" => {
-            // Handle greater-than-or-equal comparison function
+            // Handle greater-than-or-equal comparison function with type-aware coercion
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
@@ -1576,8 +2855,45 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 let left_type = get_expr_type_oid(left_arg)?;
                 let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("ge", &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    // Prefer NUMERIC - coerce non-NUMERIC arg
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    // Prefer FLOAT8
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    // Fallback: coerce right to left type
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "ge");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(
                     format!("gte:any_any function expects 2 arguments, got {argument_count}")
@@ -1586,7 +2902,7 @@ pub unsafe fn create_scalar_function_expr_with_context(
             }
         }
         "lte:any_any" => {
-            // Handle less-than-or-equal comparison function
+            // Handle less-than-or-equal comparison function with type-aware coercion
             if func.arguments.len() == 2 {
                 let pg_args =
                     extract_function_arguments(&func.arguments, function_map, current_table_oid)?;
@@ -1595,8 +2911,45 @@ pub unsafe fn create_scalar_function_expr_with_context(
 
                 let left_type = get_expr_type_oid(left_arg)?;
                 let right_type = get_expr_type_oid(right_arg)?;
-                let func_oid = lookup_function_oid("le", &[left_type, right_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    // Prefer NUMERIC - coerce non-NUMERIC arg
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    // Prefer FLOAT8
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    // Fallback: coerce right to left type
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "le");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(
                     format!("lte:any_any function expects 2 arguments, got {argument_count}")
@@ -1938,6 +3291,26 @@ unsafe fn convert_expression_to_target_entry_for_child_output(
 
             Ok((target_entry, column_info))
         }
+        Some(RexType::IfThen(if_then)) => {
+            // Handle CASE WHEN expressions using OUTER_VAR for all Var nodes.
+            let case_expr =
+                create_case_expr_with_varno(if_then, function_map, input_schema, OUTER_VAR)?;
+
+            // Get the result type from the created expression.
+            let result_type = pg_sys::exprType(case_expr as *const pg_sys::Node);
+            let column_info = ColumnInfo::with_type(result_type);
+
+            // Create TargetEntry.
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = case_expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
         _ => {
             // For unsupported expression types, return an error.
             Err(
@@ -2064,8 +3437,25 @@ unsafe fn convert_expression_to_target_entry_with_schema(
 
             Ok((target_entry, column_info))
         }
+        Some(RexType::Subquery(subquery)) => {
+            // Handle subquery expressions.
+            let subquery_expr = create_subquery_expr(subquery, function_map)?;
+            let result_type = pg_sys::exprType(subquery_expr as *const pg_sys::Node);
+            let column_info = ColumnInfo::with_type(result_type);
+
+            // Create TargetEntry.
+            let mut target_entry = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+            target_entry.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+            target_entry.expr = subquery_expr as *mut pg_sys::Expr;
+            target_entry.resno = (index + 1) as pg_sys::AttrNumber;
+            target_entry.resname = create_cstring(&format!("column_{}", index + 1));
+            target_entry.resjunk = false;
+            let target_entry = target_entry.into_pg();
+
+            Ok((target_entry, column_info))
+        }
         _ => {
-            // For unsupported expression types, return an error
+            // For unsupported expression types, return an error.
             Err(
                 format!("Unsupported expression type at index {index} in schema-based conversion")
                     .into(),
@@ -2097,6 +3487,82 @@ unsafe fn convert_selection_to_postgres_with_schema_and_varno(
     input_schema: &RelationSchema,
     varno: i32,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    // Check if this is an outer reference (correlated subquery reference).
+    // Outer references require special handling with Param nodes.
+    if let Some(root_type) = &selection.root_type {
+        use substrait::proto::expression::field_reference::RootType;
+        match root_type {
+            RootType::OuterReference(outer_ref) => {
+                // This is a reference to an outer query's column (correlated subquery).
+                // We need to create a Param node and register it for later setup in SubPlan.
+                let steps_out = outer_ref.steps_out;
+
+                // Get the field index from the direct reference.
+                let field_index = if let Some(ref_type) = &selection.reference_type {
+                    if let substrait::proto::expression::field_reference::ReferenceType::DirectReference(direct_ref) = ref_type {
+                        if let Some(struct_field) = &direct_ref.reference_type {
+                            if let substrait::proto::expression::reference_segment::ReferenceType::StructField(field) = struct_field {
+                                field.field as usize
+                            } else {
+                                return Err("OuterReference with unsupported reference type".into());
+                            }
+                        } else {
+                            return Err("OuterReference missing struct field".into());
+                        }
+                    } else {
+                        return Err("OuterReference with non-direct reference".into());
+                    }
+                } else {
+                    return Err("OuterReference missing reference_type".into());
+                };
+
+                // Get the outer schema at the specified level.
+                let outer_schema = get_outer_schema(steps_out).ok_or_else(|| {
+                    format!(
+                        "No outer schema available at steps_out={} (are we in a subquery?)",
+                        steps_out
+                    )
+                })?;
+
+                // Look up the column info from the outer schema.
+                let column_info = outer_schema.get_column(field_index).ok_or_else(|| {
+                    format!(
+                        "Field index {} out of bounds for outer schema with {} columns",
+                        field_index,
+                        outer_schema.column_count()
+                    )
+                })?;
+
+                // Register the parameter with the collector.
+                let param_id = register_outer_param(
+                    field_index,
+                    column_info.type_oid,
+                    column_info.typmod,
+                    column_info.collid,
+                )
+                .ok_or("No active subplan collector for outer reference")?;
+
+                // Create a Param node (PARAM_EXEC type).
+                let param_node = create_param_node(
+                    param_id,
+                    column_info.type_oid,
+                    column_info.typmod,
+                    column_info.collid,
+                )?;
+                return Ok(param_node);
+            }
+            RootType::RootReference(_) => {
+                // Normal reference to current relation's schema - proceed below.
+            }
+            RootType::Expression(_) => {
+                // Reference is relative to an expression's output.
+                eprintln!(
+                    "DEBUG: Expression root type in selection - treating as normal reference"
+                );
+            }
+        }
+    }
+
     if let Some(ref_type) = &selection.reference_type {
         match ref_type {
             substrait::proto::expression::field_reference::ReferenceType::DirectReference(
@@ -2111,7 +3577,11 @@ unsafe fn convert_selection_to_postgres_with_schema_and_varno(
                             if let Some(column_info) = input_schema.get_column(field_index) {
                                 eprintln!(
                                     "DEBUG: Schema-based Selection field {} resolves to type OID {}, using varno={}",
-                                    field_index, column_info.type_oid, varno
+                                    field_index, column_info.type_oid.to_u32(), varno
+                                );
+                                pgrx::info!(
+                                    "DEBUG: Creating Var - field={} varattno={} type={} varno={}",
+                                    field_index, field.field + 1, column_info.type_oid.to_u32(), varno
                                 );
 
                                 create_var_node_with_varno(
@@ -2139,6 +3609,30 @@ unsafe fn convert_selection_to_postgres_with_schema_and_varno(
     } else {
         Err("Missing reference type in selection".into())
     }
+}
+
+/// Create a PostgreSQL Param node for executor parameters (used in correlated subqueries).
+unsafe fn create_param_node(
+    param_id: i32,
+    param_type: pg_sys::Oid,
+    typmod: i32,
+    collid: pg_sys::Oid,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let mut param = PgBox::<pg_sys::Param>::alloc0();
+    param.xpr.type_ = pg_sys::NodeTag::T_Param;
+    param.paramkind = pg_sys::ParamKind::PARAM_EXEC;
+    param.paramid = param_id;
+    param.paramtype = param_type;
+    param.paramtypmod = typmod;
+    param.paramcollid = collid;
+    param.location = -1;
+
+    eprintln!(
+        "DEBUG: Created Param node: paramid={}, paramtype={}, paramkind=PARAM_EXEC",
+        param_id, param_type
+    );
+
+    Ok(param.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Convert expression to PostgreSQL with schema-based type resolution
@@ -2282,6 +3776,14 @@ pub unsafe fn convert_expression_to_postgres_with_varno(
                 Err("Cast expression missing type".into())
             }
         }
+        Some(RexType::Subquery(subquery)) => {
+            // Subqueries are independent queries - they don't use the parent's varno.
+            create_subquery_expr(subquery, function_map).map(|node| node as *mut pg_sys::Expr)
+        }
+        Some(RexType::IfThen(if_then)) => {
+            // Convert CASE WHEN expression to PostgreSQL CaseExpr.
+            create_case_expr_with_varno(if_then, function_map, input_schema, varno)
+        }
         Some(rex_type) => {
             let type_name = get_expression_type_name(rex_type);
             Err(
@@ -2301,7 +3803,7 @@ unsafe fn extract_function_arguments_with_varno(
     varno: i32,
 ) -> Result<Vec<*mut pg_sys::Expr>, Box<dyn std::error::Error + Send + Sync>> {
     let mut pg_args = Vec::with_capacity(func_arguments.len());
-    for arg in func_arguments {
+    for arg in func_arguments.iter() {
         if let Some(value) = &arg.arg_type {
             match value {
                 substrait::proto::function_argument::ArgType::Value(expr) => {
@@ -2398,9 +3900,55 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
-                let func_oid =
-                    lookup_function_oid("float8mul", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+
+                // Get actual argument types and use appropriate multiply function.
+                let left_type = pg_sys::exprType(left_arg as *const pg_sys::Node);
+                let right_type = pg_sys::exprType(right_arg as *const pg_sys::Node);
+
+                // Use type-appropriate multiply function.
+                // Capture arg types for lookup to ensure exact match.
+                let (func_name, result_type, arg1_type, arg2_type) =
+                    if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                        (
+                            "numeric_mul",
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                        )
+                    } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                        (
+                            "float8mul",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    } else if left_type == pg_sys::FLOAT4OID || right_type == pg_sys::FLOAT4OID {
+                        (
+                            "float4mul",
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                        )
+                    } else if left_type == pg_sys::INT8OID || right_type == pg_sys::INT8OID {
+                        ("int8mul", pg_sys::INT8OID, pg_sys::INT8OID, pg_sys::INT8OID)
+                    } else if left_type == pg_sys::INT4OID || right_type == pg_sys::INT4OID {
+                        ("int4mul", pg_sys::INT4OID, pg_sys::INT4OID, pg_sys::INT4OID)
+                    } else {
+                        // Default to float8 for fp64 type hint.
+                        (
+                            "float8mul",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    };
+
+                // Coerce arguments to expected types to avoid type mismatch crashes.
+                let left_coerced = coerce_arg_to_type(left_arg, arg1_type)?;
+                let right_coerced = coerce_arg_to_type(right_arg, arg2_type)?;
+
+                let func_oid = lookup_function_oid(func_name, &[arg1_type, arg2_type])?;
+                create_function_call_expr(func_oid, result_type, &[left_coerced, right_coerced])
             } else {
                 Err(format!(
                     "multiply:fp64_fp64 function expects 2 arguments, got {argument_count}"
@@ -2418,9 +3966,54 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
-                let func_oid =
-                    lookup_function_oid("float8mi", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+
+                // Get actual argument types and use appropriate subtract function.
+                let left_type = pg_sys::exprType(left_arg as *const pg_sys::Node);
+                let right_type = pg_sys::exprType(right_arg as *const pg_sys::Node);
+
+                // Use type-appropriate subtract function.
+                let (func_name, result_type, arg1_type, arg2_type) =
+                    if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                        (
+                            "numeric_sub",
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                        )
+                    } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                        (
+                            "float8mi",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    } else if left_type == pg_sys::FLOAT4OID || right_type == pg_sys::FLOAT4OID {
+                        (
+                            "float4mi",
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                        )
+                    } else if left_type == pg_sys::INT8OID || right_type == pg_sys::INT8OID {
+                        ("int8mi", pg_sys::INT8OID, pg_sys::INT8OID, pg_sys::INT8OID)
+                    } else if left_type == pg_sys::INT4OID || right_type == pg_sys::INT4OID {
+                        ("int4mi", pg_sys::INT4OID, pg_sys::INT4OID, pg_sys::INT4OID)
+                    } else {
+                        // Default to float8 for fp64 type hint.
+                        (
+                            "float8mi",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    };
+
+                // Coerce arguments to expected types to avoid type mismatch crashes.
+                let left_coerced = coerce_arg_to_type(left_arg, arg1_type)?;
+                let right_coerced = coerce_arg_to_type(right_arg, arg2_type)?;
+
+                let func_oid = lookup_function_oid(func_name, &[arg1_type, arg2_type])?;
+                create_function_call_expr(func_oid, result_type, &[left_coerced, right_coerced])
             } else {
                 Err(format!(
                     "subtract:fp64_fp64 function expects 2 arguments, got {argument_count}"
@@ -2438,9 +4031,54 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 )?;
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
-                let func_oid =
-                    lookup_function_oid("float8pl", &[pg_sys::FLOAT8OID, pg_sys::FLOAT8OID])?;
-                create_function_call_expr(func_oid, pg_sys::FLOAT8OID, &[left_arg, right_arg])
+
+                // Get actual argument types and use appropriate add function.
+                let left_type = pg_sys::exprType(left_arg as *const pg_sys::Node);
+                let right_type = pg_sys::exprType(right_arg as *const pg_sys::Node);
+
+                // Use type-appropriate add function.
+                let (func_name, result_type, arg1_type, arg2_type) =
+                    if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                        (
+                            "numeric_add",
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                            pg_sys::NUMERICOID,
+                        )
+                    } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                        (
+                            "float8pl",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    } else if left_type == pg_sys::FLOAT4OID || right_type == pg_sys::FLOAT4OID {
+                        (
+                            "float4pl",
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                            pg_sys::FLOAT4OID,
+                        )
+                    } else if left_type == pg_sys::INT8OID || right_type == pg_sys::INT8OID {
+                        ("int8pl", pg_sys::INT8OID, pg_sys::INT8OID, pg_sys::INT8OID)
+                    } else if left_type == pg_sys::INT4OID || right_type == pg_sys::INT4OID {
+                        ("int4pl", pg_sys::INT4OID, pg_sys::INT4OID, pg_sys::INT4OID)
+                    } else {
+                        // Default to float8 for fp64 type hint.
+                        (
+                            "float8pl",
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                            pg_sys::FLOAT8OID,
+                        )
+                    };
+
+                // Coerce arguments to expected types to avoid type mismatch crashes.
+                let left_coerced = coerce_arg_to_type(left_arg, arg1_type)?;
+                let right_coerced = coerce_arg_to_type(right_arg, arg2_type)?;
+
+                let func_oid = lookup_function_oid(func_name, &[arg1_type, arg2_type])?;
+                create_function_call_expr(func_oid, result_type, &[left_coerced, right_coerced])
             } else {
                 Err(
                     format!("add:fp64_fp64 function expects 2 arguments, got {argument_count}")
@@ -2484,9 +4122,43 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
                 let left_type = get_expr_type_oid(left_arg)?;
-                let func_name = get_comparison_func_name(left_type, "eq");
-                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "eq");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(
                     format!("equal:any_any function expects 2 arguments, got {argument_count}")
@@ -2505,9 +4177,43 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
                 let left_type = get_expr_type_oid(left_arg)?;
-                let func_name = get_comparison_func_name(left_type, "ne");
-                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "ne");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(
                     format!("not_equal:any_any function expects 2 arguments, got {argument_count}")
@@ -2526,9 +4232,43 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
                 let left_type = get_expr_type_oid(left_arg)?;
-                let func_name = get_comparison_func_name(left_type, "lt");
-                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "lt");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(format!("lt:any_any function expects 2 arguments, got {argument_count}").into())
             }
@@ -2544,9 +4284,43 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
                 let left_type = get_expr_type_oid(left_arg)?;
-                let func_name = get_comparison_func_name(left_type, "gt");
-                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "gt");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(format!("gt:any_any function expects 2 arguments, got {argument_count}").into())
             }
@@ -2562,9 +4336,62 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
                 let left_type = get_expr_type_oid(left_arg)?;
-                let func_name = get_comparison_func_name(left_type, "ge");
-                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                eprintln!(
+                    "DEBUG: gte:any_any varno handler - left_type={}, right_type={}",
+                    left_type.to_u32(),
+                    right_type.to_u32()
+                );
+                pgrx::info!(
+                    "DEBUG: gte:any_any varno handler - left_type={}, right_type={}",
+                    left_type.to_u32(),
+                    right_type.to_u32()
+                );
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    eprintln!("DEBUG: gte:any_any - types match, no coercion needed");
+                    pgrx::info!("DEBUG: gte:any_any - types match, no coercion needed");
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    eprintln!("DEBUG: gte:any_any - coercing to NUMERIC");
+                    pgrx::info!("DEBUG: gte:any_any - coercing to NUMERIC");
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    eprintln!("DEBUG: gte:any_any - coercing to FLOAT8");
+                    pgrx::info!("DEBUG: gte:any_any - coercing to FLOAT8");
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    eprintln!("DEBUG: gte:any_any - fallback coercion to left_type");
+                    pgrx::info!("DEBUG: gte:any_any - fallback coercion to left_type");
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "ge");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(
                     format!("gte:any_any function expects 2 arguments, got {argument_count}")
@@ -2583,9 +4410,43 @@ pub unsafe fn create_scalar_function_expr_with_varno(
                 let left_arg = pg_args[0];
                 let right_arg = pg_args[1];
                 let left_type = get_expr_type_oid(left_arg)?;
-                let func_name = get_comparison_func_name(left_type, "le");
-                let func_oid = lookup_function_oid(&func_name, &[left_type, left_type])?;
-                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[left_arg, right_arg])
+                let right_type = get_expr_type_oid(right_arg)?;
+
+                // Determine common type and coerce if needed
+                let (common_type, coerced_left, coerced_right) = if left_type == right_type {
+                    (left_type, left_arg, right_arg)
+                } else if left_type == pg_sys::NUMERICOID || right_type == pg_sys::NUMERICOID {
+                    let l = if left_type != pg_sys::NUMERICOID {
+                        create_cast_expr(left_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::NUMERICOID {
+                        create_cast_expr(right_arg, pg_sys::NUMERICOID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::NUMERICOID, l, r)
+                } else if left_type == pg_sys::FLOAT8OID || right_type == pg_sys::FLOAT8OID {
+                    let l = if left_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(left_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        left_arg
+                    };
+                    let r = if right_type != pg_sys::FLOAT8OID {
+                        create_cast_expr(right_arg, pg_sys::FLOAT8OID)?
+                    } else {
+                        right_arg
+                    };
+                    (pg_sys::FLOAT8OID, l, r)
+                } else {
+                    let r = create_cast_expr(right_arg, left_type)?;
+                    (left_type, left_arg, r)
+                };
+
+                let func_name = get_comparison_func_name(common_type, "le");
+                let func_oid = lookup_function_oid(&func_name, &[common_type, common_type])?;
+                create_function_call_expr(func_oid, pg_sys::BOOLOID, &[coerced_left, coerced_right])
             } else {
                 Err(
                     format!("lte:any_any function expects 2 arguments, got {argument_count}")

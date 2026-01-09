@@ -21,6 +21,7 @@
 4. The whole point is dynamic schema inference from Substrait plans
 5. Don't add external functions beyond `from_substrait()` and `from_substrait_json()`
 6. **DO NOT** remove functionality to make tests pass.
+7. **DO NOT** return errors as a shortcut to avoid implementing requested functionality - implement the feature properly.
 
 ## Technical Notes
 - Use manual `ExecInitNode` initialization instead of `ExecutorStart` when constructing plans programmatically.

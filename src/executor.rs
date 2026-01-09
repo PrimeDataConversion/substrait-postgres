@@ -3,6 +3,163 @@ use pgrx::pg_sys;
 
 use crate::plan_translator::{ColumnInfo, ExecutionResult};
 
+/// Debug helper to recursively dump expression node structure
+unsafe fn debug_dump_expr(node: *mut pg_sys::Node, depth: usize) {
+    let indent = "  ".repeat(depth);
+    if node.is_null() {
+        return;
+    }
+
+    let node_type = (*node).type_;
+    match node_type {
+        pg_sys::NodeTag::T_Var => {
+            let var = node as *mut pg_sys::Var;
+            pgrx::info!(
+                "{}Var: varno={} varattno={} vartype={}",
+                indent,
+                (*var).varno,
+                (*var).varattno,
+                (*var).vartype.to_u32()
+            );
+        }
+        pg_sys::NodeTag::T_Const => {
+            let c = node as *mut pg_sys::Const;
+            pgrx::info!(
+                "{}Const: consttype={} constisnull={}",
+                indent,
+                (*c).consttype.to_u32(),
+                (*c).constisnull
+            );
+        }
+        pg_sys::NodeTag::T_OpExpr => {
+            let op = node as *mut pg_sys::OpExpr;
+            let nargs = if (*op).args.is_null() {
+                0
+            } else {
+                (*(*op).args).length
+            };
+            pgrx::info!(
+                "{}OpExpr: opno={} opfuncid={} nargs={}",
+                indent,
+                (*op).opno.to_u32(),
+                (*op).opfuncid.to_u32(),
+                nargs
+            );
+            if !(*op).args.is_null() {
+                for i in 0..nargs.min(4) {
+                    let arg = pg_sys::list_nth((*op).args, i) as *mut pg_sys::Node;
+                    debug_dump_expr(arg, depth + 1);
+                }
+            }
+        }
+        pg_sys::NodeTag::T_BoolExpr => {
+            let be = node as *mut pg_sys::BoolExpr;
+            let nargs = if (*be).args.is_null() {
+                0
+            } else {
+                (*(*be).args).length
+            };
+            pgrx::info!(
+                "{}BoolExpr: boolop={:?} nargs={}",
+                indent,
+                (*be).boolop,
+                nargs
+            );
+            if !(*be).args.is_null() {
+                for i in 0..nargs.min(6) {
+                    let arg = pg_sys::list_nth((*be).args, i) as *mut pg_sys::Node;
+                    debug_dump_expr(arg, depth + 1);
+                }
+            }
+        }
+        pg_sys::NodeTag::T_FuncExpr => {
+            let fe = node as *mut pg_sys::FuncExpr;
+            let nargs = if (*fe).args.is_null() {
+                0
+            } else {
+                (*(*fe).args).length
+            };
+            pgrx::info!(
+                "{}FuncExpr: funcid={} nargs={}",
+                indent,
+                (*fe).funcid.to_u32(),
+                nargs
+            );
+            if !(*fe).args.is_null() {
+                for i in 0..nargs.min(4) {
+                    let arg = pg_sys::list_nth((*fe).args, i) as *mut pg_sys::Node;
+                    debug_dump_expr(arg, depth + 1);
+                }
+            }
+        }
+        pg_sys::NodeTag::T_SubPlan => {
+            let sp = node as *mut pg_sys::SubPlan;
+            pgrx::info!(
+                "{}SubPlan: plan_id={} plan_name={:p} subLinkType={:?}",
+                indent,
+                (*sp).plan_id,
+                (*sp).plan_name,
+                (*sp).subLinkType
+            );
+        }
+        pg_sys::NodeTag::T_Param => {
+            let p = node as *mut pg_sys::Param;
+            pgrx::info!(
+                "{}Param: paramkind={:?} paramid={} paramtype={}",
+                indent,
+                (*p).paramkind,
+                (*p).paramid,
+                (*p).paramtype.to_u32()
+            );
+        }
+        pg_sys::NodeTag::T_Aggref => {
+            let ar = node as *mut pg_sys::Aggref;
+            pgrx::info!(
+                "{}Aggref: aggfnoid={} aggtype={}",
+                indent,
+                (*ar).aggfnoid.to_u32(),
+                (*ar).aggtype.to_u32()
+            );
+        }
+        pg_sys::NodeTag::T_TargetEntry => {
+            let te = node as *mut pg_sys::TargetEntry;
+            pgrx::info!(
+                "{}TargetEntry: resno={} resjunk={}",
+                indent,
+                (*te).resno,
+                (*te).resjunk
+            );
+            debug_dump_expr((*te).expr as *mut pg_sys::Node, depth + 1);
+        }
+        pg_sys::NodeTag::T_RelabelType => {
+            let rt = node as *mut pg_sys::RelabelType;
+            pgrx::info!(
+                "{}RelabelType: resulttype={}",
+                indent,
+                (*rt).resulttype.to_u32()
+            );
+            debug_dump_expr((*rt).arg as *mut pg_sys::Node, depth + 1);
+        }
+        pg_sys::NodeTag::T_CoerceViaIO => {
+            let cvi = node as *mut pg_sys::CoerceViaIO;
+            pgrx::info!(
+                "{}CoerceViaIO: resulttype={}",
+                indent,
+                (*cvi).resulttype.to_u32()
+            );
+            debug_dump_expr((*cvi).arg as *mut pg_sys::Node, depth + 1);
+        }
+        pg_sys::NodeTag::T_NullTest => {
+            let nt = node as *mut pg_sys::NullTest;
+            pgrx::info!("{}NullTest: nulltesttype={:?}", indent, (*nt).nulltesttype);
+            debug_dump_expr((*nt).arg as *mut pg_sys::Node, depth + 1);
+        }
+        _ => {
+            pgrx::info!("{}Other: type={:?}", indent, node_type);
+        }
+    }
+}
+
 /// Debug helper to dump plan tree structure before ExecInitNode
 unsafe fn debug_dump_plan_tree(plan: *mut pg_sys::Plan, depth: usize) {
     let indent = "  ".repeat(depth);
@@ -31,6 +188,100 @@ unsafe fn debug_dump_plan_tree(plan: *mut pg_sys::Plan, depth: usize) {
         (*plan).lefttree,
         (*plan).righttree
     );
+    // Check initPlan, extParam, allParam - these affect subplan initialization
+    pgrx::info!(
+        "{}  initPlan={:p} extParam={:p} allParam={:p}",
+        indent,
+        (*plan).initPlan,
+        (*plan).extParam,
+        (*plan).allParam
+    );
+
+    // Debug plan.qual expression structure (filter conditions)
+    if !(*plan).qual.is_null() {
+        let qual_list = (*plan).qual;
+        pgrx::info!("{}  qual list length={}", indent, (*qual_list).length);
+        for qual_idx in 0..(*qual_list).length.min(5) {
+            let node = pg_sys::list_nth(qual_list, qual_idx) as *mut pg_sys::Node;
+            if !node.is_null() {
+                let node_type = (*node).type_;
+                pgrx::info!("{}  qual[{}] type={:?}", indent, qual_idx, node_type);
+                // Check for Var nodes that might have invalid references
+                if node_type == pg_sys::NodeTag::T_FuncExpr {
+                    let func_expr = node as *mut pg_sys::FuncExpr;
+                    pgrx::info!(
+                        "{}    FuncExpr funcid={} args.len={}",
+                        indent,
+                        (*func_expr).funcid.to_u32(),
+                        if (*func_expr).args.is_null() {
+                            0
+                        } else {
+                            (*(*func_expr).args).length
+                        }
+                    );
+                } else if node_type == pg_sys::NodeTag::T_BoolExpr {
+                    let bool_expr = node as *mut pg_sys::BoolExpr;
+                    let args_len = if (*bool_expr).args.is_null() {
+                        0
+                    } else {
+                        (*(*bool_expr).args).length
+                    };
+                    pgrx::info!(
+                        "{}    BoolExpr boolop={:?} args.len={}",
+                        indent,
+                        (*bool_expr).boolop,
+                        args_len
+                    );
+                    // Dump each argument of the BoolExpr
+                    if !(*bool_expr).args.is_null() {
+                        for arg_idx in 0..args_len.min(10) {
+                            let arg_node =
+                                pg_sys::list_nth((*bool_expr).args, arg_idx) as *mut pg_sys::Node;
+                            if !arg_node.is_null() {
+                                let arg_type = (*arg_node).type_;
+                                if arg_type == pg_sys::NodeTag::T_FuncExpr {
+                                    let func = arg_node as *mut pg_sys::FuncExpr;
+                                    pgrx::info!(
+                                        "{}      arg[{}] FuncExpr funcid={}",
+                                        indent,
+                                        arg_idx,
+                                        (*func).funcid.to_u32()
+                                    );
+                                    // Inspect Var arguments of the function
+                                    if !(*func).args.is_null() {
+                                        for func_arg_idx in 0..(*(*func).args).length.min(4) {
+                                            let func_arg =
+                                                pg_sys::list_nth((*func).args, func_arg_idx)
+                                                    as *mut pg_sys::Node;
+                                            if !func_arg.is_null()
+                                                && (*func_arg).type_ == pg_sys::NodeTag::T_Var
+                                            {
+                                                let var = func_arg as *mut pg_sys::Var;
+                                                pgrx::info!(
+                                                    "{}        Var varno={} varattno={} vartype={}",
+                                                    indent,
+                                                    (*var).varno,
+                                                    (*var).varattno,
+                                                    (*var).vartype.to_u32()
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    pgrx::info!(
+                                        "{}      arg[{}] type={:?}",
+                                        indent,
+                                        arg_idx,
+                                        arg_type
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Agg-specific debug
     if node_tag == pg_sys::NodeTag::T_Agg {
@@ -90,17 +341,86 @@ unsafe fn debug_dump_plan_tree(plan: *mut pg_sys::Plan, depth: usize) {
         let sort = plan as *mut pg_sys::Sort;
         pgrx::info!("{}  SORT: numCols={}", indent, (*sort).numCols);
         pgrx::info!(
-            "{}  SORT: sortColIdx={:p} sortOperators={:p}",
+            "{}  SORT: sortColIdx={:p} sortOperators={:p} collations={:p} nullsFirst={:p}",
             indent,
             (*sort).sortColIdx,
-            (*sort).sortOperators
+            (*sort).sortOperators,
+            (*sort).collations,
+            (*sort).nullsFirst
         );
+        // Dump actual array values
+        if (*sort).numCols > 0 && !(*sort).sortColIdx.is_null() {
+            for i in 0..(*sort).numCols.min(10) {
+                let col_idx = *(*sort).sortColIdx.offset(i as isize);
+                let op = if !(*sort).sortOperators.is_null() {
+                    *(*sort).sortOperators.offset(i as isize)
+                } else {
+                    pg_sys::InvalidOid
+                };
+                let coll = if !(*sort).collations.is_null() {
+                    *(*sort).collations.offset(i as isize)
+                } else {
+                    pg_sys::InvalidOid
+                };
+                let nulls_first = if !(*sort).nullsFirst.is_null() {
+                    *(*sort).nullsFirst.offset(i as isize)
+                } else {
+                    false
+                };
+                pgrx::info!(
+                    "{}    sortCol[{}]: idx={} op={} coll={} nullsFirst={}",
+                    indent,
+                    i,
+                    col_idx,
+                    op.to_u32(),
+                    coll.to_u32(),
+                    nulls_first
+                );
+            }
+        }
     }
 
     // SeqScan-specific debug
     if node_tag == pg_sys::NodeTag::T_SeqScan {
         let scan = plan as *mut pg_sys::SeqScan;
         pgrx::info!("{}  SEQSCAN: scanrelid={}", indent, (*scan).scan.scanrelid);
+        // Dump targetlist for SeqScan to compare with Result's OUTER_VAR refs
+        if !(*plan).targetlist.is_null() {
+            let targetlist = (*plan).targetlist;
+            let len = (*targetlist).length;
+            pgrx::info!("{}  SEQSCAN targetlist has {} entries:", indent, len);
+            for i in 0..len.min(20) {
+                let te = pg_sys::list_nth(targetlist, i) as *mut pg_sys::TargetEntry;
+                if !te.is_null() {
+                    let expr = (*te).expr;
+                    let expr_type = if !expr.is_null() {
+                        (*(expr as *mut pg_sys::Node)).type_
+                    } else {
+                        pg_sys::NodeTag::T_Invalid
+                    };
+                    if expr_type == pg_sys::NodeTag::T_Var {
+                        let var = expr as *mut pg_sys::Var;
+                        pgrx::info!(
+                            "{}    TE[{}]: resno={} Var varno={} varattno={} vartype={}",
+                            indent,
+                            i,
+                            (*te).resno,
+                            (*var).varno,
+                            (*var).varattno,
+                            (*var).vartype.to_u32()
+                        );
+                    } else {
+                        pgrx::info!(
+                            "{}    TE[{}]: resno={} expr_type={:?}",
+                            indent,
+                            i,
+                            (*te).resno,
+                            expr_type
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // Result-specific debug
@@ -110,6 +430,67 @@ unsafe fn debug_dump_plan_tree(plan: *mut pg_sys::Plan, depth: usize) {
             "{}  RESULT: resconstantqual={:p}",
             indent,
             (*result).resconstantqual
+        );
+        // Dump targetlist for Result node to debug Project expressions
+        if !(*plan).targetlist.is_null() {
+            let targetlist = (*plan).targetlist;
+            let len = (*targetlist).length;
+            pgrx::info!("{}  RESULT targetlist has {} entries:", indent, len);
+            for i in 0..len.min(10) {
+                let te = pg_sys::list_nth(targetlist, i) as *mut pg_sys::TargetEntry;
+                if !te.is_null() {
+                    let expr = (*te).expr;
+                    let expr_type = if !expr.is_null() {
+                        (*(expr as *mut pg_sys::Node)).type_
+                    } else {
+                        pg_sys::NodeTag::T_Invalid
+                    };
+                    pgrx::info!(
+                        "{}    TE[{}]: resno={} resname={:p} expr_type={:?}",
+                        indent,
+                        i,
+                        (*te).resno,
+                        (*te).resname,
+                        expr_type
+                    );
+                    // If it's a Var, show details
+                    if expr_type == pg_sys::NodeTag::T_Var {
+                        let var = expr as *mut pg_sys::Var;
+                        pgrx::info!(
+                            "{}      Var: varno={} varattno={} vartype={}",
+                            indent,
+                            (*var).varno,
+                            (*var).varattno,
+                            (*var).vartype.to_u32()
+                        );
+                    } else if expr_type == pg_sys::NodeTag::T_FuncExpr {
+                        let fe = expr as *mut pg_sys::FuncExpr;
+                        pgrx::info!(
+                            "{}      FuncExpr: funcid={} funcresulttype={}",
+                            indent,
+                            (*fe).funcid.to_u32(),
+                            (*fe).funcresulttype.to_u32()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // NestLoop-specific debug
+    if node_tag == pg_sys::NodeTag::T_NestLoop {
+        let nestloop = plan as *mut pg_sys::NestLoop;
+        pgrx::info!(
+            "{}  NESTLOOP: jointype={:?} joinqual={:p} nestParams={:p}",
+            indent,
+            (*nestloop).join.jointype,
+            (*nestloop).join.joinqual,
+            (*nestloop).nestParams
+        );
+        pgrx::info!(
+            "{}  NESTLOOP: inner_unique={}",
+            indent,
+            (*nestloop).join.inner_unique
         );
     }
 
@@ -122,6 +503,142 @@ unsafe fn debug_dump_plan_tree(plan: *mut pg_sys::Plan, depth: usize) {
     }
 }
 
+/// Adjust varno values in an expression node by adding an offset.
+/// This recursively walks expression trees to find Var nodes.
+unsafe fn adjust_varnos_in_expr(node: *mut pg_sys::Node, offset: u32) {
+    if node.is_null() {
+        return;
+    }
+
+    let node_tag = (*node).type_;
+
+    match node_tag {
+        pg_sys::NodeTag::T_Var => {
+            let var = node as *mut pg_sys::Var;
+            // Only adjust positive varnos (not INNER_VAR=-1, OUTER_VAR=-2, etc.)
+            if (*var).varno > 0 {
+                let old_varno = (*var).varno;
+                (*var).varno += offset as i32;
+                // Also adjust varnosyn if it's positive (varnosyn is u32)
+                if (*var).varnosyn > 0 {
+                    (*var).varnosyn += offset;
+                }
+                pgrx::info!(
+                    "DEBUG: Adjusting Var.varno from {} to {}",
+                    old_varno,
+                    (*var).varno
+                );
+            }
+        }
+        pg_sys::NodeTag::T_OpExpr => {
+            let op = node as *mut pg_sys::OpExpr;
+            adjust_varnos_in_list((*op).args, offset);
+        }
+        pg_sys::NodeTag::T_FuncExpr => {
+            let func = node as *mut pg_sys::FuncExpr;
+            adjust_varnos_in_list((*func).args, offset);
+        }
+        pg_sys::NodeTag::T_BoolExpr => {
+            let bool_expr = node as *mut pg_sys::BoolExpr;
+            adjust_varnos_in_list((*bool_expr).args, offset);
+        }
+        pg_sys::NodeTag::T_TargetEntry => {
+            let te = node as *mut pg_sys::TargetEntry;
+            adjust_varnos_in_expr((*te).expr as *mut pg_sys::Node, offset);
+        }
+        pg_sys::NodeTag::T_Aggref => {
+            let aggref = node as *mut pg_sys::Aggref;
+            adjust_varnos_in_list((*aggref).args, offset);
+            adjust_varnos_in_list((*aggref).aggdirectargs, offset);
+            adjust_varnos_in_expr((*aggref).aggfilter as *mut pg_sys::Node, offset);
+        }
+        pg_sys::NodeTag::T_NullTest => {
+            let nt = node as *mut pg_sys::NullTest;
+            adjust_varnos_in_expr((*nt).arg as *mut pg_sys::Node, offset);
+        }
+        pg_sys::NodeTag::T_CoalesceExpr => {
+            let ce = node as *mut pg_sys::CoalesceExpr;
+            adjust_varnos_in_list((*ce).args, offset);
+        }
+        pg_sys::NodeTag::T_CaseExpr => {
+            let case = node as *mut pg_sys::CaseExpr;
+            adjust_varnos_in_expr((*case).arg as *mut pg_sys::Node, offset);
+            adjust_varnos_in_list((*case).args, offset);
+            adjust_varnos_in_expr((*case).defresult as *mut pg_sys::Node, offset);
+        }
+        pg_sys::NodeTag::T_CaseWhen => {
+            let when = node as *mut pg_sys::CaseWhen;
+            adjust_varnos_in_expr((*when).expr as *mut pg_sys::Node, offset);
+            adjust_varnos_in_expr((*when).result as *mut pg_sys::Node, offset);
+        }
+        pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+            let saop = node as *mut pg_sys::ScalarArrayOpExpr;
+            adjust_varnos_in_list((*saop).args, offset);
+        }
+        _ => {
+            // For other node types, we don't recurse (Const, Param, etc. don't have Vars)
+        }
+    }
+}
+
+/// Adjust varnos in a list of expression nodes.
+unsafe fn adjust_varnos_in_list(list: *mut pg_sys::List, offset: u32) {
+    if list.is_null() {
+        return;
+    }
+
+    let length = (*list).length;
+    for i in 0..length {
+        let node = pg_sys::list_nth(list, i) as *mut pg_sys::Node;
+        adjust_varnos_in_expr(node, offset);
+    }
+}
+
+/// Adjust scanrelid values in a plan tree by adding an offset.
+/// This is needed when merging subplan range tables into the main range table.
+/// Also adjusts varno values in expressions (targetlist, qual).
+unsafe fn adjust_scanrelids_in_plan(plan: *mut pg_sys::Plan, offset: u32) {
+    if plan.is_null() {
+        return;
+    }
+
+    let node_tag = (*plan).type_;
+
+    // Adjust scanrelid for scan nodes
+    match node_tag {
+        pg_sys::NodeTag::T_SeqScan
+        | pg_sys::NodeTag::T_IndexScan
+        | pg_sys::NodeTag::T_IndexOnlyScan
+        | pg_sys::NodeTag::T_BitmapHeapScan
+        | pg_sys::NodeTag::T_TidScan
+        | pg_sys::NodeTag::T_ForeignScan
+        | pg_sys::NodeTag::T_CustomScan => {
+            let scan = plan as *mut pg_sys::Scan;
+            if (*scan).scanrelid > 0 {
+                pgrx::info!(
+                    "DEBUG: Adjusting scanrelid from {} to {}",
+                    (*scan).scanrelid,
+                    (*scan).scanrelid + offset
+                );
+                (*scan).scanrelid += offset;
+            }
+        }
+        _ => {}
+    }
+
+    // Adjust varno values in targetlist and qual expressions
+    adjust_varnos_in_list((*plan).targetlist, offset);
+    adjust_varnos_in_list((*plan).qual, offset);
+
+    // Recurse into children
+    if !(*plan).lefttree.is_null() {
+        adjust_scanrelids_in_plan((*plan).lefttree, offset);
+    }
+    if !(*plan).righttree.is_null() {
+        adjust_scanrelids_in_plan((*plan).righttree, offset);
+    }
+}
+
 /// Executes a PostgreSQL plan tree from a raw pointer without creating invalid references
 /// This is the safe version that avoids memory corruption issues.
 pub unsafe fn execute_plan_directly_from_ptr(
@@ -129,6 +646,7 @@ pub unsafe fn execute_plan_directly_from_ptr(
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
     expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
 ) -> Result<
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
@@ -143,7 +661,13 @@ pub unsafe fn execute_plan_directly_from_ptr(
     eprintln!("DEBUG: Calling execute_plan_directly_raw with raw pointers");
     pgrx::info!("DEBUG: Calling execute_plan_directly_raw with raw pointers");
 
-    let result = execute_plan_directly_raw(plan_tree, column_names, range_table, expected_tupdesc);
+    let result = execute_plan_directly_raw(
+        plan_tree,
+        column_names,
+        range_table,
+        expected_tupdesc,
+        subplans,
+    );
 
     eprintln!("DEBUG: execute_plan_directly_raw returned");
     pgrx::info!("DEBUG: execute_plan_directly_raw returned");
@@ -158,6 +682,7 @@ pub unsafe fn execute_plan_directly_raw(
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
     _expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
 ) -> Result<
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
@@ -270,6 +795,131 @@ pub unsafe fn execute_plan_directly_raw(
     planned_stmt.utilityStmt = std::ptr::null_mut();
     planned_stmt.stmt_location = 0;
     planned_stmt.stmt_len = 0;
+
+    // Convert subplans vec to pg_sys::List and merge range tables
+    if !subplans.is_empty() {
+        eprintln!(
+            "DEBUG: execute_plan_directly_raw - Adding {} subplans to PlannedStmt",
+            subplans.len()
+        );
+        pgrx::info!(
+            "DEBUG: execute_plan_directly_raw - Adding {} subplans to PlannedStmt",
+            subplans.len()
+        );
+
+        // Get the current length of the main range table
+        let main_rt_len = if range_table.is_null() {
+            0
+        } else {
+            (*range_table).length
+        };
+
+        let mut subplan_list: *mut pg_sys::List = std::ptr::null_mut();
+        let mut merged_range_table = range_table as *mut pg_sys::List;
+
+        for (i, subplan_entry) in subplans.iter().enumerate() {
+            eprintln!("DEBUG: Adding subplan {} at {:p}", i, subplan_entry.plan);
+
+            // Merge subplan's range table into main range table and adjust scanrelids
+            if !subplan_entry.range_table.is_null() {
+                let subplan_rt = subplan_entry.range_table;
+                let subplan_rt_len = (*subplan_rt).length;
+                eprintln!(
+                    "DEBUG: Subplan {} has {} range table entries",
+                    i, subplan_rt_len
+                );
+
+                // Calculate offset for this subplan's range table entries
+                let offset = if merged_range_table.is_null() {
+                    0
+                } else {
+                    (*merged_range_table).length
+                };
+
+                // Append subplan's range table entries to merged range table
+                for j in 0..subplan_rt_len {
+                    let rte = pg_sys::list_nth(subplan_rt, j) as *mut pg_sys::RangeTblEntry;
+                    merged_range_table =
+                        pg_sys::lappend(merged_range_table, rte as *mut std::ffi::c_void);
+                }
+
+                // Adjust scanrelid values in the subplan's plan tree
+                if offset > 0 {
+                    adjust_scanrelids_in_plan(subplan_entry.plan, offset as u32);
+                }
+            }
+
+            subplan_list =
+                pg_sys::lappend(subplan_list, subplan_entry.plan as *mut std::ffi::c_void);
+        }
+
+        planned_stmt.subplans = subplan_list;
+        planned_stmt.rtable = merged_range_table;
+
+        // Debug: Verify the subplan list is properly set
+        let subplan_count = if subplan_list.is_null() {
+            0
+        } else {
+            (*subplan_list).length
+        };
+        let merged_rt_count = if merged_range_table.is_null() {
+            0
+        } else {
+            (*merged_range_table).length
+        };
+        pgrx::info!(
+            "DEBUG: PlannedStmt.subplans list has {} entries, merged rtable has {} entries",
+            subplan_count,
+            merged_rt_count
+        );
+        if subplan_count > 0 {
+            let first_subplan_ptr = pg_sys::list_nth(subplan_list, 0) as *mut pg_sys::Plan;
+            pgrx::info!(
+                "DEBUG: First subplan in list at {:p}, type={:?}",
+                first_subplan_ptr,
+                (*first_subplan_ptr).type_
+            );
+
+            // Walk the subplan tree to check scanrelid values
+            fn check_scanrelids(plan: *mut pg_sys::Plan, depth: i32, rt_size: i32) {
+                unsafe {
+                    if plan.is_null() {
+                        return;
+                    }
+                    let node_type = (*plan).type_;
+                    match node_type {
+                        pg_sys::NodeTag::T_SeqScan | pg_sys::NodeTag::T_IndexScan => {
+                            let scan = plan as *mut pg_sys::Scan;
+                            let scanrelid = (*scan).scanrelid;
+                            if scanrelid as i32 > rt_size || scanrelid == 0 {
+                                pgrx::warning!(
+                                    "SUBPLAN ISSUE: scanrelid {} out of range (rt_size={})",
+                                    scanrelid,
+                                    rt_size
+                                );
+                            } else {
+                                pgrx::info!(
+                                    "DEBUG: SUBPLAN depth={} {:?} scanrelid={}",
+                                    depth,
+                                    node_type,
+                                    scanrelid
+                                );
+                            }
+                        }
+                        _ => {
+                            pgrx::info!("DEBUG: SUBPLAN depth={} {:?}", depth, node_type);
+                        }
+                    }
+                    check_scanrelids((*plan).lefttree, depth + 1, rt_size);
+                    check_scanrelids((*plan).righttree, depth + 1, rt_size);
+                }
+            }
+            check_scanrelids(first_subplan_ptr, 0, merged_rt_count);
+        }
+    } else {
+        planned_stmt.subplans = std::ptr::null_mut();
+    }
+
     let planned_stmt_ptr = planned_stmt.into_pg();
     pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt_ptr);
 
@@ -301,11 +951,17 @@ pub unsafe fn execute_plan_directly_raw(
         return Err("Failed to create executor state".into());
     }
 
+    // Use ExecInitRangeTable to properly initialize range table and related arrays.
+    // IMPORTANT: Use the range table from planned_stmt, which includes merged subplan RTEs
+    // Pass empty permInfos list - we bypass permission checks for Substrait plans.
+    let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
+    let actual_range_table = (*planned_stmt_ptr).rtable;
+
     // Debug the range table before passing it
-    let rt_len = if range_table.is_null() {
+    let rt_len = if actual_range_table.is_null() {
         0
     } else {
-        (*(range_table as *mut pg_sys::List)).length
+        (*actual_range_table).length
     };
     pgrx::info!(
         "DEBUG: Range table length before ExecInitRangeTable: {}",
@@ -313,8 +969,8 @@ pub unsafe fn execute_plan_directly_raw(
     );
 
     // If range table exists, debug its contents
-    if !range_table.is_null() && rt_len > 0 {
-        let rte_ptr = pg_sys::list_nth(range_table as *mut pg_sys::List, 0);
+    if !actual_range_table.is_null() && rt_len > 0 {
+        let rte_ptr = pg_sys::list_nth(actual_range_table, 0);
         let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
         if !rte.is_null() {
             pgrx::info!(
@@ -325,11 +981,7 @@ pub unsafe fn execute_plan_directly_raw(
             );
         }
     }
-
-    // Use ExecInitRangeTable to properly initialize range table and related arrays.
-    // Pass empty permInfos list - we bypass permission checks for Substrait plans.
-    let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
-    pg_sys::ExecInitRangeTable(estate, range_table as *mut pg_sys::List, empty_perminfos);
+    pg_sys::ExecInitRangeTable(estate, actual_range_table, empty_perminfos);
     pgrx::info!("DEBUG: ExecInitRangeTable completed");
 
     // Debug estate fields after ExecInitRangeTable
@@ -339,20 +991,29 @@ pub unsafe fn execute_plan_directly_raw(
         (*estate).es_relations
     );
 
-    // Lock all tables in the range table before execution.
-    // PostgreSQL requires locks on relations before they can be opened.
-    if !range_table.is_null() {
-        let rt_list = range_table as *mut pg_sys::List;
+    // Open all tables in the MERGED range table before execution.
+    // This includes both main plan tables and subplan tables.
+    // Store the relation handles in es_relations for scan nodes to use.
+    if !actual_range_table.is_null() {
+        let rt_list = actual_range_table as *mut pg_sys::List;
+        pgrx::info!(
+            "DEBUG: Opening {} relations from merged range table",
+            (*rt_list).length
+        );
         for i in 0..(*rt_list).length {
             let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
             let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
             if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                 pgrx::info!(
-                    "DEBUG: Locking relation OID {} with AccessShareLock",
-                    (*rte).relid
+                    "DEBUG: Opening relation OID {} (RTE #{}) with AccessShareLock",
+                    (*rte).relid,
+                    i + 1
                 );
-                pg_sys::LockRelationOid((*rte).relid, pg_sys::AccessShareLock as i32);
-                pgrx::info!("DEBUG: Lock acquired for relation OID {}", (*rte).relid);
+                // Open the relation and store it in es_relations
+                let rel = pg_sys::table_open((*rte).relid, pg_sys::AccessShareLock as i32);
+                pgrx::info!("DEBUG: Relation opened: {:p}", rel);
+                // Store in es_relations at 0-based index
+                *(*estate).es_relations.offset(i as isize) = rel;
             }
         }
     }
@@ -360,13 +1021,270 @@ pub unsafe fn execute_plan_directly_raw(
     // Set the planned statement reference on estate.
     (*estate).es_plannedstmt = planned_stmt_ptr;
 
+    // IMPORTANT: Set EState fields BEFORE subplan initialization - ExecInitNode needs these!
     (*estate).es_output_cid = 0;
     (*estate).es_snapshot = (*query_desc_ptr).snapshot;
     (*estate).es_crosscheck_snapshot = (*query_desc_ptr).crosscheck_snapshot;
     (*estate).es_instrument = 0;
     (*estate).es_top_eflags = 0;
     (*estate).es_processed = 0;
-    // es_lastoid doesn't exist in PostgreSQL 17
+    pgrx::info!(
+        "DEBUG: Set EState fields before subplan init, es_snapshot={:p}",
+        (*estate).es_snapshot
+    );
+
+    // Initialize es_param_exec_vals BEFORE subplans - they may need it during initialization.
+    // PostgreSQL 17 uses paramExecTypes (List) instead of nParamExec (int)
+    {
+        let param_exec_types = (*planned_stmt_ptr).paramExecTypes;
+        let n_param_exec = if !param_exec_types.is_null() {
+            (*param_exec_types).length as usize
+        } else {
+            0
+        };
+        if n_param_exec > 0 {
+            let param_exec_size = n_param_exec * std::mem::size_of::<pg_sys::ParamExecData>();
+            (*estate).es_param_exec_vals =
+                pg_sys::palloc0(param_exec_size) as *mut pg_sys::ParamExecData;
+            pgrx::info!(
+                "DEBUG: Allocated es_param_exec_vals for {} params (before subplans)",
+                n_param_exec
+            );
+        } else {
+            // Even with 0 params, allocate a minimal array to avoid NULL pointer issues
+            (*estate).es_param_exec_vals =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::ParamExecData>())
+                    as *mut pg_sys::ParamExecData;
+            pgrx::info!("DEBUG: Allocated minimal es_param_exec_vals (paramExecTypes empty/null)");
+        }
+    }
+
+    // Initialize es_subplanstates by pre-initializing all subplans.
+    // This is critical: PostgreSQL's ExecInitSubPlan expects the subplan's PlanState
+    // to already exist in es_subplanstates when it encounters a SubPlan expression.
+    // This mimics the InitPlan() function in PostgreSQL's execMain.c.
+    let subplan_list = (*planned_stmt_ptr).subplans;
+    if !subplan_list.is_null() && (*subplan_list).length > 0 {
+        let num_subplans = (*subplan_list).length;
+        pgrx::info!(
+            "DEBUG: Pre-initializing {} subplans before main plan",
+            num_subplans
+        );
+
+        // Initialize es_subplanstates as empty list first
+        (*estate).es_subplanstates = std::ptr::null_mut();
+
+        // Initialize each subplan and add its PlanState to es_subplanstates
+        for i in 0..num_subplans {
+            let subplan_ptr = pg_sys::list_nth(subplan_list, i) as *mut pg_sys::Plan;
+            pgrx::info!(
+                "DEBUG: Initializing subplan {} at {:p}, type={:?}",
+                i,
+                subplan_ptr,
+                (*subplan_ptr).type_
+            );
+
+            // Debug the subplan tree
+            debug_dump_plan_tree(subplan_ptr, 0);
+
+            // Debug: Check es_relations array before init
+            pgrx::info!(
+                "DEBUG: es_relations={:p}, es_range_table_size={}",
+                (*estate).es_relations,
+                (*estate).es_range_table_size
+            );
+            if !(*estate).es_relations.is_null() {
+                for rel_idx in 0..(*estate).es_range_table_size.min(10) as isize {
+                    let rel = *(*estate).es_relations.offset(rel_idx);
+                    pgrx::info!("DEBUG: es_relations[{}]={:p}", rel_idx, rel);
+                }
+            }
+
+            // Debug: Dump Agg targetlist if this is an Agg node
+            if (*subplan_ptr).type_ == pg_sys::NodeTag::T_Agg {
+                let agg = subplan_ptr as *mut pg_sys::Agg;
+                let tl = (*agg).plan.targetlist;
+                if !tl.is_null() {
+                    pgrx::info!("DEBUG: Agg targetlist has {} entries", (*tl).length);
+                    for te_idx in 0..(*tl).length {
+                        let te = pg_sys::list_nth(tl, te_idx) as *mut pg_sys::TargetEntry;
+                        if !te.is_null() && !(*te).expr.is_null() {
+                            let expr_type = (*(*te).expr).type_;
+                            pgrx::info!(
+                                "DEBUG: Agg targetlist[{}]: resno={} expr_type={:?}",
+                                te_idx,
+                                (*te).resno,
+                                expr_type
+                            );
+                            if expr_type == pg_sys::NodeTag::T_Aggref {
+                                let aggref = (*te).expr as *mut pg_sys::Aggref;
+                                pgrx::info!(
+                                    "DEBUG:   Aggref: aggfnoid={} aggtype={} aggtranstype={}",
+                                    (*aggref).aggfnoid.to_u32(),
+                                    (*aggref).aggtype.to_u32(),
+                                    (*aggref).aggtranstype.to_u32()
+                                );
+                                pgrx::info!("DEBUG:   Aggref: aggstar={} aggsplit={:?} aggno={} aggtransno={}",
+                                    (*aggref).aggstar, (*aggref).aggsplit, (*aggref).aggno, (*aggref).aggtransno);
+                                if !(*aggref).args.is_null() {
+                                    let args_count = (*(*aggref).args).length;
+                                    pgrx::info!("DEBUG:   Aggref args count={}", args_count);
+                                    // Dump each arg
+                                    for arg_idx in 0..args_count {
+                                        let arg = pg_sys::list_nth((*aggref).args, arg_idx)
+                                            as *mut pg_sys::TargetEntry;
+                                        if !arg.is_null() {
+                                            pgrx::info!(
+                                                "DEBUG:   Aggref arg[{}]: TargetEntry resno={}",
+                                                arg_idx,
+                                                (*arg).resno
+                                            );
+                                            if !(*arg).expr.is_null() {
+                                                let expr_type = (*(*arg).expr).type_;
+                                                pgrx::info!(
+                                                    "DEBUG:   Aggref arg[{}] expr type={:?}",
+                                                    arg_idx,
+                                                    expr_type
+                                                );
+                                                if expr_type == pg_sys::NodeTag::T_Var {
+                                                    let var = (*arg).expr as *mut pg_sys::Var;
+                                                    pgrx::info!("DEBUG:   Var: varno={} varattno={} vartype={}",
+                                                        (*var).varno, (*var).varattno, (*var).vartype.to_u32());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Verify subplan structure with nodeToString before ExecInitNode
+            pgrx::info!("DEBUG: Verifying subplan {} with nodeToString", i);
+            let plan_str = pg_sys::nodeToString(subplan_ptr as *const std::ffi::c_void);
+            if plan_str.is_null() {
+                pgrx::warning!("DEBUG: nodeToString returned NULL for subplan {}", i);
+            } else {
+                let plan_str_len = std::ffi::CStr::from_ptr(plan_str).to_bytes().len();
+                pgrx::info!(
+                    "DEBUG: nodeToString succeeded for subplan {}, length={}",
+                    i,
+                    plan_str_len
+                );
+                pg_sys::pfree(plan_str as *mut std::ffi::c_void);
+            }
+
+            // Check Aggref.aggargtypes if this is an Agg node
+            if (*subplan_ptr).type_ == pg_sys::NodeTag::T_Agg {
+                let agg = subplan_ptr as *mut pg_sys::Agg;
+                let tl = (*agg).plan.targetlist;
+                if !tl.is_null() && (*tl).length > 0 {
+                    let te = pg_sys::list_nth(tl, 0) as *mut pg_sys::TargetEntry;
+                    if !te.is_null() && !(*te).expr.is_null() {
+                        let expr_type = (*(*te).expr).type_;
+                        if expr_type == pg_sys::NodeTag::T_Aggref {
+                            let aggref = (*te).expr as *mut pg_sys::Aggref;
+                            let aggargtypes = (*aggref).aggargtypes;
+                            if aggargtypes.is_null() {
+                                pgrx::info!("DEBUG: Aggref.aggargtypes is NULL");
+                            } else {
+                                pgrx::info!(
+                                    "DEBUG: Aggref.aggargtypes has {} entries",
+                                    (*aggargtypes).length
+                                );
+                                for oid_idx in 0..(*aggargtypes).length {
+                                    let oid_val = pg_sys::list_nth_oid(aggargtypes, oid_idx);
+                                    pgrx::info!("DEBUG: aggargtypes[{}] = {}", oid_idx, oid_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Debug: Walk the plan tree and dump all qual expressions
+            fn dump_all_quals(plan: *mut pg_sys::Plan, depth: i32) {
+                unsafe {
+                    if plan.is_null() {
+                        return;
+                    }
+                    let node_type = (*plan).type_;
+                    pgrx::info!("QUAL_DUMP depth={} {:?}", depth, node_type);
+                    // Dump targetlist too
+                    if !(*plan).targetlist.is_null() {
+                        let tl = (*plan).targetlist;
+                        pgrx::info!("TL_DUMP: targetlist len={}", (*tl).length);
+                        for idx in 0..(*tl).length.min(5) {
+                            let te = pg_sys::list_nth(tl, idx) as *mut pg_sys::TargetEntry;
+                            if !te.is_null() {
+                                pgrx::info!("TL_DUMP[{}]: resno={}", idx, (*te).resno);
+                                debug_dump_expr(
+                                    (*te).expr as *mut pg_sys::Node,
+                                    (depth + 2) as usize,
+                                );
+                            }
+                        }
+                    }
+                    if !(*plan).qual.is_null() {
+                        let qual = (*plan).qual;
+                        pgrx::info!("QUAL_DUMP: qual list at {:p} len={}", qual, (*qual).length);
+                        for idx in 0..(*qual).length {
+                            let node = pg_sys::list_nth(qual, idx) as *mut pg_sys::Node;
+                            debug_dump_expr(node, (depth + 1) as usize);
+                        }
+                    }
+                    // For Result nodes, also check resconstantqual
+                    if node_type == pg_sys::NodeTag::T_Result {
+                        let result = plan as *mut pg_sys::Result;
+                        if !(*result).resconstantqual.is_null() {
+                            pgrx::info!(
+                                "QUAL_DUMP: Result.resconstantqual at {:p}",
+                                (*result).resconstantqual
+                            );
+                            debug_dump_expr(
+                                (*result).resconstantqual as *mut pg_sys::Node,
+                                (depth + 1) as usize,
+                            );
+                        }
+                    }
+                    dump_all_quals((*plan).lefttree, depth + 1);
+                    dump_all_quals((*plan).righttree, depth + 1);
+                }
+            }
+            pgrx::info!(
+                "DEBUG: Dumping all quals in subplan {} before ExecInitNode",
+                i
+            );
+            dump_all_quals(subplan_ptr, 0);
+
+            // Initialize the subplan with ExecInitNode
+            pgrx::info!("DEBUG: About to call ExecInitNode for subplan {}", i);
+            let subplan_state = pg_sys::ExecInitNode(subplan_ptr, estate, 0);
+            pgrx::info!(
+                "DEBUG: Subplan {} initialized, PlanState={:p}",
+                i,
+                subplan_state
+            );
+
+            if subplan_state.is_null() {
+                pgrx::warning!("DEBUG: Subplan {} failed to initialize!", i);
+            }
+
+            // Append the PlanState to es_subplanstates
+            (*estate).es_subplanstates = pg_sys::lappend(
+                (*estate).es_subplanstates,
+                subplan_state as *mut std::ffi::c_void,
+            );
+        }
+
+        pgrx::info!("DEBUG: All {} subplans initialized", num_subplans);
+    } else {
+        (*estate).es_subplanstates = std::ptr::null_mut();
+    }
+
+    // Note: es_output_cid, es_snapshot, etc. are initialized earlier, before subplan initialization
 
     (*query_desc_ptr).estate = estate;
 
@@ -376,21 +1294,115 @@ pub unsafe fn execute_plan_directly_raw(
         estate
     );
 
+    // Verify es_subplanstates before main plan init
+    let subplan_states = (*estate).es_subplanstates;
+    if !subplan_states.is_null() {
+        let n_states = (*subplan_states).length;
+        pgrx::info!("DEBUG: es_subplanstates has {} entries", n_states);
+        for i in 0..n_states {
+            let ps = pg_sys::list_nth(subplan_states, i) as *mut pg_sys::PlanState;
+            pgrx::info!(
+                "DEBUG:   es_subplanstates[{}] = {:p}, type={:?}",
+                i,
+                ps,
+                if !ps.is_null() {
+                    (*ps).type_
+                } else {
+                    pg_sys::NodeTag::T_Invalid
+                }
+            );
+        }
+    } else {
+        pgrx::info!("DEBUG: es_subplanstates is NULL");
+    }
+
     // Debug: dump plan tree structure before ExecInitNode
     debug_dump_plan_tree(plan_tree, 0);
 
-    // Now initialize the plan node
+    // Final verification - check es_relations array
+    pgrx::info!("DEBUG: Final verification before ExecInitNode:");
+    pgrx::info!(
+        "DEBUG:   es_range_table_size={}",
+        (*estate).es_range_table_size
+    );
+    for i in 0..(*estate).es_range_table_size as isize {
+        let rel = *(*estate).es_relations.offset(i);
+        pgrx::info!("DEBUG:   es_relations[{}]={:p}", i, rel);
+    }
+
+    pgrx::info!("DEBUG: Calling ExecInitNode NOW for main plan...");
+
+    // Now initialize the main plan node (subplans already initialized above)
     let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
 
-    pgrx::info!("DEBUG: ExecInitNode returned: {:p}", plan_state);
+    pgrx::info!(
+        "DEBUG: ExecInitNode returned successfully: {:p}",
+        plan_state
+    );
 
     if plan_state.is_null() {
         return Err("ExecInitNode failed".into());
     }
 
+    // Debug: Walk plan state tree to verify qual initialization on each node
+    fn debug_dump_plan_state(ps: *mut pg_sys::PlanState, depth: i32) {
+        unsafe {
+            if ps.is_null() {
+                return;
+            }
+            let indent = "  ".repeat(depth as usize);
+            let node_type = (*ps).type_;
+            let qual_ptr = (*ps).qual;
+            pgrx::info!(
+                "{}PLANSTATE: type={:?} qual={:p}",
+                indent,
+                node_type,
+                qual_ptr
+            );
+
+            // Check if this is a Result node and dump additional info
+            if node_type == pg_sys::NodeTag::T_ResultState {
+                let result_state = ps as *mut pg_sys::ResultState;
+                pgrx::info!(
+                    "{}  ResultState: resconstantqual={:p} rs_checkqual={}",
+                    indent,
+                    (*result_state).resconstantqual,
+                    (*result_state).rs_checkqual
+                );
+            }
+
+            // Check the plan node's qual (different from the initialized ExprState qual)
+            let plan = (*ps).plan;
+            if !plan.is_null() {
+                let plan_qual = (*plan).qual;
+                pgrx::info!(
+                    "{}  Plan.qual={:p} (len={})",
+                    indent,
+                    plan_qual,
+                    if plan_qual.is_null() {
+                        0
+                    } else {
+                        (*plan_qual).length
+                    }
+                );
+            }
+
+            // Recurse to children
+            if !(*ps).lefttree.is_null() {
+                debug_dump_plan_state((*ps).lefttree, depth + 1);
+            }
+            if !(*ps).righttree.is_null() {
+                debug_dump_plan_state((*ps).righttree, depth + 1);
+            }
+        }
+    }
+
+    pgrx::info!("DEBUG: Dumping PlanState tree after ExecInitNode:");
+    debug_dump_plan_state(plan_state, 0);
+
     (*query_desc_ptr).planstate = plan_state;
 
-    pgrx::info!("DEBUG: Manual initialization succeeded!");
+    pgrx::info!("DEBUG: Manual initialization succeeded (execute_plan_directly_raw)!");
 
     // Get the plan state - we called ExecInitNode above.
     let plan_state = (*query_desc_ptr).planstate;
@@ -400,10 +1412,121 @@ pub unsafe fn execute_plan_directly_raw(
         return Err("ExecInitNode failed to create plan state".into());
     }
 
-    pgrx::info!("DEBUG: Plan state from ExecutorStart: {:p}", plan_state);
+    pgrx::info!("DEBUG: Plan state from ExecInitNode: {:p}", plan_state);
+
+    // Debug SortState details if this is a Sort node
+    if (*plan_state).type_ == pg_sys::NodeTag::T_SortState {
+        let sort_state = plan_state as *mut pg_sys::SortState;
+        pgrx::info!("DEBUG: SortState details before execution:");
+        pgrx::info!(
+            "DEBUG:   ss_ScanTupleSlot={:p}",
+            (*sort_state).ss.ss_ScanTupleSlot
+        );
+        pgrx::info!(
+            "DEBUG:   ps_ResultTupleSlot={:p}",
+            (*sort_state).ss.ps.ps_ResultTupleSlot
+        );
+        pgrx::info!(
+            "DEBUG:   lefttree (child state)={:p}",
+            (*sort_state).ss.ps.lefttree
+        );
+        pgrx::info!("DEBUG:   plan={:p}", (*sort_state).ss.ps.plan);
+        pgrx::info!(
+            "DEBUG:   tuplesortstate={:p}",
+            (*sort_state).tuplesortstate as *const std::ffi::c_void
+        );
+        pgrx::info!("DEBUG:   randomAccess={}", (*sort_state).randomAccess);
+        pgrx::info!("DEBUG:   bounded={}", (*sort_state).bounded);
+        pgrx::info!("DEBUG:   bound={}", (*sort_state).bound);
+        pgrx::info!("DEBUG:   sort_Done={}", (*sort_state).sort_Done);
+        pgrx::info!("DEBUG:   bounded_Done={}", (*sort_state).bounded_Done);
+        pgrx::info!("DEBUG:   bound_Done={}", (*sort_state).bound_Done);
+        // Check the child plan state
+        let child_state = (*sort_state).ss.ps.lefttree;
+        if !child_state.is_null() {
+            pgrx::info!("DEBUG:   child state type={:?}", (*child_state).type_);
+        }
+
+        // Check the ScanTupleSlot's TupleDesc
+        let scan_slot = (*sort_state).ss.ss_ScanTupleSlot;
+        if !scan_slot.is_null() {
+            let scan_tupdesc = (*scan_slot).tts_tupleDescriptor;
+            pgrx::info!(
+                "DEBUG:   ss_ScanTupleSlot.tts_tupleDescriptor={:p}",
+                scan_tupdesc
+            );
+            if !scan_tupdesc.is_null() {
+                pgrx::info!(
+                    "DEBUG:   ss_ScanTupleSlot TupleDesc natts={}",
+                    (*scan_tupdesc).natts
+                );
+            }
+        }
+
+        // Check ps_ResultTupleSlot's TupleDesc
+        let result_slot = (*sort_state).ss.ps.ps_ResultTupleSlot;
+        if !result_slot.is_null() {
+            let result_tupdesc = (*result_slot).tts_tupleDescriptor;
+            pgrx::info!(
+                "DEBUG:   ps_ResultTupleSlot.tts_tupleDescriptor={:p}",
+                result_tupdesc
+            );
+            if !result_tupdesc.is_null() {
+                pgrx::info!(
+                    "DEBUG:   ps_ResultTupleSlot TupleDesc natts={}",
+                    (*result_tupdesc).natts
+                );
+            }
+        }
+
+        // Check the Sort plan's targetlist
+        let sort_plan = (*sort_state).ss.ps.plan as *mut pg_sys::Sort;
+        let targetlist = (*sort_plan).plan.targetlist;
+        pgrx::info!("DEBUG:   Sort plan targetlist={:p}", targetlist);
+        if !targetlist.is_null() {
+            let list_len = (*targetlist).length;
+            pgrx::info!("DEBUG:   Sort plan targetlist length={}", list_len);
+
+            // Examine first few target entries
+            for i in 0..list_len.min(5) {
+                let te = pg_sys::list_nth(targetlist, i) as *mut pg_sys::TargetEntry;
+                if !te.is_null() {
+                    let expr = (*te).expr;
+                    let resno = (*te).resno;
+                    let resname = (*te).resname;
+                    pgrx::info!(
+                        "DEBUG:   TargetEntry[{}]: resno={}, expr={:p}, expr.type={:?}",
+                        i,
+                        resno,
+                        expr,
+                        if !expr.is_null() {
+                            (*expr).type_
+                        } else {
+                            pg_sys::NodeTag::T_Invalid
+                        }
+                    );
+                    if !resname.is_null() {
+                        let name_str = std::ffi::CStr::from_ptr(resname).to_string_lossy();
+                        pgrx::info!("DEBUG:     resname={}", name_str);
+                    }
+                    // Check if expression is a Var and dump its details
+                    if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
+                        let var = expr as *mut pg_sys::Var;
+                        pgrx::info!(
+                            "DEBUG:     Var: varno={} varattno={} vartype={}",
+                            (*var).varno,
+                            (*var).varattno,
+                            (*var).vartype.to_u32()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Execute the plan and collect tuples into tuplestore with error handling
     let mut tuple_count = 0u64;
+
     loop {
         pgrx::info!("DEBUG: Calling ExecProcNode (tuple_count: {})", tuple_count);
         // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
@@ -462,6 +1585,34 @@ pub unsafe fn execute_plan_directly(
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
     expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
+) -> Result<
+    (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    eprintln!("DEBUG: execute_plan_directly delegating to execute_plan_directly_raw");
+    pgrx::info!("DEBUG: execute_plan_directly delegating to execute_plan_directly_raw");
+
+    // Convert reference to pointer and delegate to the raw version
+    let plan_tree = plan_tree_ref as *const pg_sys::Plan as *mut pg_sys::Plan;
+
+    execute_plan_directly_raw(
+        plan_tree,
+        column_names,
+        range_table,
+        expected_tupdesc,
+        subplans,
+    )
+}
+
+/// Old execute_plan_directly implementation - keeping for reference but not used
+#[allow(dead_code)]
+unsafe fn _execute_plan_directly_old(
+    plan_tree_ref: &pg_sys::Plan,
+    column_names: Vec<String>,
+    range_table: *const pg_sys::List,
+    expected_tupdesc: Option<*mut pg_sys::TupleDescData>,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
 ) -> Result<
     (*mut pg_sys::TupleDescData, *mut pg_sys::Tuplestorestate),
     Box<dyn std::error::Error + Send + Sync>,
@@ -772,6 +1923,124 @@ pub unsafe fn execute_plan_directly(
     planned_stmt.utilityStmt = std::ptr::null_mut();
     planned_stmt.stmt_location = 0;
     planned_stmt.stmt_len = 0;
+
+    // Convert subplans vec to pg_sys::List and merge range tables
+    if !subplans.is_empty() {
+        eprintln!(
+            "DEBUG: execute_plan_directly - Adding {} subplans to PlannedStmt",
+            subplans.len()
+        );
+        pgrx::info!(
+            "DEBUG: execute_plan_directly - Adding {} subplans to PlannedStmt",
+            subplans.len()
+        );
+
+        let mut subplan_list: *mut pg_sys::List = std::ptr::null_mut();
+        let mut merged_range_table = range_table as *mut pg_sys::List;
+
+        for (i, subplan_entry) in subplans.iter().enumerate() {
+            eprintln!("DEBUG: Adding subplan {} at {:p}", i, subplan_entry.plan);
+
+            // Merge subplan's range table into main range table and adjust scanrelids
+            if !subplan_entry.range_table.is_null() {
+                let subplan_rt = subplan_entry.range_table;
+                let subplan_rt_len = (*subplan_rt).length;
+                eprintln!(
+                    "DEBUG: Subplan {} has {} range table entries",
+                    i, subplan_rt_len
+                );
+
+                // Calculate offset for this subplan's range table entries
+                let offset = if merged_range_table.is_null() {
+                    0
+                } else {
+                    (*merged_range_table).length
+                };
+
+                // Append subplan's range table entries to merged range table
+                for j in 0..subplan_rt_len {
+                    let rte = pg_sys::list_nth(subplan_rt, j) as *mut pg_sys::RangeTblEntry;
+                    merged_range_table =
+                        pg_sys::lappend(merged_range_table, rte as *mut std::ffi::c_void);
+                }
+
+                // Adjust scanrelid values in the subplan's plan tree
+                if offset > 0 {
+                    adjust_scanrelids_in_plan(subplan_entry.plan, offset as u32);
+                }
+            }
+
+            subplan_list =
+                pg_sys::lappend(subplan_list, subplan_entry.plan as *mut std::ffi::c_void);
+        }
+
+        planned_stmt.subplans = subplan_list;
+        planned_stmt.rtable = merged_range_table;
+
+        // Debug: Verify the subplan list is properly set
+        let subplan_count = if subplan_list.is_null() {
+            0
+        } else {
+            (*subplan_list).length
+        };
+        let merged_rt_count = if merged_range_table.is_null() {
+            0
+        } else {
+            (*merged_range_table).length
+        };
+        pgrx::info!(
+            "DEBUG: PlannedStmt.subplans list has {} entries, merged rtable has {} entries",
+            subplan_count,
+            merged_rt_count
+        );
+        if subplan_count > 0 {
+            let first_subplan_ptr = pg_sys::list_nth(subplan_list, 0) as *mut pg_sys::Plan;
+            pgrx::info!(
+                "DEBUG: First subplan in list at {:p}, type={:?}",
+                first_subplan_ptr,
+                (*first_subplan_ptr).type_
+            );
+
+            // Walk the subplan tree to check scanrelid values
+            fn check_scanrelids(plan: *mut pg_sys::Plan, depth: i32, rt_size: i32) {
+                unsafe {
+                    if plan.is_null() {
+                        return;
+                    }
+                    let node_type = (*plan).type_;
+                    match node_type {
+                        pg_sys::NodeTag::T_SeqScan | pg_sys::NodeTag::T_IndexScan => {
+                            let scan = plan as *mut pg_sys::Scan;
+                            let scanrelid = (*scan).scanrelid;
+                            if scanrelid as i32 > rt_size || scanrelid == 0 {
+                                pgrx::warning!(
+                                    "SUBPLAN ISSUE: scanrelid {} out of range (rt_size={})",
+                                    scanrelid,
+                                    rt_size
+                                );
+                            } else {
+                                pgrx::info!(
+                                    "DEBUG: SUBPLAN depth={} {:?} scanrelid={}",
+                                    depth,
+                                    node_type,
+                                    scanrelid
+                                );
+                            }
+                        }
+                        _ => {
+                            pgrx::info!("DEBUG: SUBPLAN depth={} {:?}", depth, node_type);
+                        }
+                    }
+                    check_scanrelids((*plan).lefttree, depth + 1, rt_size);
+                    check_scanrelids((*plan).righttree, depth + 1, rt_size);
+                }
+            }
+            check_scanrelids(first_subplan_ptr, 0, merged_rt_count);
+        }
+    } else {
+        planned_stmt.subplans = std::ptr::null_mut();
+    }
+
     let planned_stmt_ptr = planned_stmt.into_pg();
     pgrx::info!("DEBUG: PlannedStmt created: {:p}", planned_stmt_ptr);
 
@@ -803,11 +2072,17 @@ pub unsafe fn execute_plan_directly(
         return Err("Failed to create executor state".into());
     }
 
+    // Use ExecInitRangeTable to properly initialize range table and related arrays.
+    // IMPORTANT: Use the range table from planned_stmt, which includes merged subplan RTEs
+    // Pass empty permInfos list - we bypass permission checks for Substrait plans.
+    let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
+    let actual_range_table = (*planned_stmt_ptr).rtable;
+
     // Debug the range table before passing it
-    let rt_len = if range_table.is_null() {
+    let rt_len = if actual_range_table.is_null() {
         0
     } else {
-        (*(range_table as *mut pg_sys::List)).length
+        (*actual_range_table).length
     };
     pgrx::info!(
         "DEBUG: Range table length before ExecInitRangeTable: {}",
@@ -815,8 +2090,8 @@ pub unsafe fn execute_plan_directly(
     );
 
     // If range table exists, debug its contents
-    if !range_table.is_null() && rt_len > 0 {
-        let rte_ptr = pg_sys::list_nth(range_table as *mut pg_sys::List, 0);
+    if !actual_range_table.is_null() && rt_len > 0 {
+        let rte_ptr = pg_sys::list_nth(actual_range_table, 0);
         let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
         if !rte.is_null() {
             pgrx::info!(
@@ -827,11 +2102,7 @@ pub unsafe fn execute_plan_directly(
             );
         }
     }
-
-    // Use ExecInitRangeTable to properly initialize range table and related arrays.
-    // Pass empty permInfos list - we bypass permission checks for Substrait plans.
-    let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
-    pg_sys::ExecInitRangeTable(estate, range_table as *mut pg_sys::List, empty_perminfos);
+    pg_sys::ExecInitRangeTable(estate, actual_range_table, empty_perminfos);
     pgrx::info!("DEBUG: ExecInitRangeTable completed");
 
     // Debug estate fields after ExecInitRangeTable
@@ -841,20 +2112,29 @@ pub unsafe fn execute_plan_directly(
         (*estate).es_relations
     );
 
-    // Lock all tables in the range table before execution.
-    // PostgreSQL requires locks on relations before they can be opened.
-    if !range_table.is_null() {
-        let rt_list = range_table as *mut pg_sys::List;
+    // Open all tables in the MERGED range table before execution.
+    // This includes both main plan tables and subplan tables.
+    // Store the relation handles in es_relations for scan nodes to use.
+    if !actual_range_table.is_null() {
+        let rt_list = actual_range_table as *mut pg_sys::List;
+        pgrx::info!(
+            "DEBUG: Opening {} relations from merged range table",
+            (*rt_list).length
+        );
         for i in 0..(*rt_list).length {
             let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
             let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
             if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                 pgrx::info!(
-                    "DEBUG: Locking relation OID {} with AccessShareLock",
-                    (*rte).relid
+                    "DEBUG: Opening relation OID {} (RTE #{}) with AccessShareLock",
+                    (*rte).relid,
+                    i + 1
                 );
-                pg_sys::LockRelationOid((*rte).relid, pg_sys::AccessShareLock as i32);
-                pgrx::info!("DEBUG: Lock acquired for relation OID {}", (*rte).relid);
+                // Open the relation and store it in es_relations
+                let rel = pg_sys::table_open((*rte).relid, pg_sys::AccessShareLock as i32);
+                pgrx::info!("DEBUG: Relation opened: {:p}", rel);
+                // Store in es_relations at 0-based index
+                *(*estate).es_relations.offset(i as isize) = rel;
             }
         }
     }
@@ -862,13 +2142,270 @@ pub unsafe fn execute_plan_directly(
     // Set the planned statement reference on estate.
     (*estate).es_plannedstmt = planned_stmt_ptr;
 
+    // IMPORTANT: Set EState fields BEFORE subplan initialization - ExecInitNode needs these!
     (*estate).es_output_cid = 0;
     (*estate).es_snapshot = (*query_desc_ptr).snapshot;
     (*estate).es_crosscheck_snapshot = (*query_desc_ptr).crosscheck_snapshot;
     (*estate).es_instrument = 0;
     (*estate).es_top_eflags = 0;
     (*estate).es_processed = 0;
-    // es_lastoid doesn't exist in PostgreSQL 17
+    pgrx::info!(
+        "DEBUG: Set EState fields before subplan init, es_snapshot={:p}",
+        (*estate).es_snapshot
+    );
+
+    // Initialize es_param_exec_vals BEFORE subplans - they may need it during initialization.
+    // PostgreSQL 17 uses paramExecTypes (List) instead of nParamExec (int)
+    {
+        let param_exec_types = (*planned_stmt_ptr).paramExecTypes;
+        let n_param_exec = if !param_exec_types.is_null() {
+            (*param_exec_types).length as usize
+        } else {
+            0
+        };
+        if n_param_exec > 0 {
+            let param_exec_size = n_param_exec * std::mem::size_of::<pg_sys::ParamExecData>();
+            (*estate).es_param_exec_vals =
+                pg_sys::palloc0(param_exec_size) as *mut pg_sys::ParamExecData;
+            pgrx::info!(
+                "DEBUG: Allocated es_param_exec_vals for {} params (before subplans)",
+                n_param_exec
+            );
+        } else {
+            // Even with 0 params, allocate a minimal array to avoid NULL pointer issues
+            (*estate).es_param_exec_vals =
+                pg_sys::palloc0(std::mem::size_of::<pg_sys::ParamExecData>())
+                    as *mut pg_sys::ParamExecData;
+            pgrx::info!("DEBUG: Allocated minimal es_param_exec_vals (paramExecTypes empty/null)");
+        }
+    }
+
+    // Initialize es_subplanstates by pre-initializing all subplans.
+    // This is critical: PostgreSQL's ExecInitSubPlan expects the subplan's PlanState
+    // to already exist in es_subplanstates when it encounters a SubPlan expression.
+    // This mimics the InitPlan() function in PostgreSQL's execMain.c.
+    let subplan_list = (*planned_stmt_ptr).subplans;
+    if !subplan_list.is_null() && (*subplan_list).length > 0 {
+        let num_subplans = (*subplan_list).length;
+        pgrx::info!(
+            "DEBUG: Pre-initializing {} subplans before main plan",
+            num_subplans
+        );
+
+        // Initialize es_subplanstates as empty list first
+        (*estate).es_subplanstates = std::ptr::null_mut();
+
+        // Initialize each subplan and add its PlanState to es_subplanstates
+        for i in 0..num_subplans {
+            let subplan_ptr = pg_sys::list_nth(subplan_list, i) as *mut pg_sys::Plan;
+            pgrx::info!(
+                "DEBUG: Initializing subplan {} at {:p}, type={:?}",
+                i,
+                subplan_ptr,
+                (*subplan_ptr).type_
+            );
+
+            // Debug the subplan tree
+            debug_dump_plan_tree(subplan_ptr, 0);
+
+            // Debug: Check es_relations array before init
+            pgrx::info!(
+                "DEBUG: es_relations={:p}, es_range_table_size={}",
+                (*estate).es_relations,
+                (*estate).es_range_table_size
+            );
+            if !(*estate).es_relations.is_null() {
+                for rel_idx in 0..(*estate).es_range_table_size.min(10) as isize {
+                    let rel = *(*estate).es_relations.offset(rel_idx);
+                    pgrx::info!("DEBUG: es_relations[{}]={:p}", rel_idx, rel);
+                }
+            }
+
+            // Debug: Dump Agg targetlist if this is an Agg node
+            if (*subplan_ptr).type_ == pg_sys::NodeTag::T_Agg {
+                let agg = subplan_ptr as *mut pg_sys::Agg;
+                let tl = (*agg).plan.targetlist;
+                if !tl.is_null() {
+                    pgrx::info!("DEBUG: Agg targetlist has {} entries", (*tl).length);
+                    for te_idx in 0..(*tl).length {
+                        let te = pg_sys::list_nth(tl, te_idx) as *mut pg_sys::TargetEntry;
+                        if !te.is_null() && !(*te).expr.is_null() {
+                            let expr_type = (*(*te).expr).type_;
+                            pgrx::info!(
+                                "DEBUG: Agg targetlist[{}]: resno={} expr_type={:?}",
+                                te_idx,
+                                (*te).resno,
+                                expr_type
+                            );
+                            if expr_type == pg_sys::NodeTag::T_Aggref {
+                                let aggref = (*te).expr as *mut pg_sys::Aggref;
+                                pgrx::info!(
+                                    "DEBUG:   Aggref: aggfnoid={} aggtype={} aggtranstype={}",
+                                    (*aggref).aggfnoid.to_u32(),
+                                    (*aggref).aggtype.to_u32(),
+                                    (*aggref).aggtranstype.to_u32()
+                                );
+                                pgrx::info!("DEBUG:   Aggref: aggstar={} aggsplit={:?} aggno={} aggtransno={}",
+                                    (*aggref).aggstar, (*aggref).aggsplit, (*aggref).aggno, (*aggref).aggtransno);
+                                if !(*aggref).args.is_null() {
+                                    let args_count = (*(*aggref).args).length;
+                                    pgrx::info!("DEBUG:   Aggref args count={}", args_count);
+                                    // Dump each arg
+                                    for arg_idx in 0..args_count {
+                                        let arg = pg_sys::list_nth((*aggref).args, arg_idx)
+                                            as *mut pg_sys::TargetEntry;
+                                        if !arg.is_null() {
+                                            pgrx::info!(
+                                                "DEBUG:   Aggref arg[{}]: TargetEntry resno={}",
+                                                arg_idx,
+                                                (*arg).resno
+                                            );
+                                            if !(*arg).expr.is_null() {
+                                                let expr_type = (*(*arg).expr).type_;
+                                                pgrx::info!(
+                                                    "DEBUG:   Aggref arg[{}] expr type={:?}",
+                                                    arg_idx,
+                                                    expr_type
+                                                );
+                                                if expr_type == pg_sys::NodeTag::T_Var {
+                                                    let var = (*arg).expr as *mut pg_sys::Var;
+                                                    pgrx::info!("DEBUG:   Var: varno={} varattno={} vartype={}",
+                                                        (*var).varno, (*var).varattno, (*var).vartype.to_u32());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Verify subplan structure with nodeToString before ExecInitNode
+            pgrx::info!("DEBUG: Verifying subplan {} with nodeToString", i);
+            let plan_str = pg_sys::nodeToString(subplan_ptr as *const std::ffi::c_void);
+            if plan_str.is_null() {
+                pgrx::warning!("DEBUG: nodeToString returned NULL for subplan {}", i);
+            } else {
+                let plan_str_len = std::ffi::CStr::from_ptr(plan_str).to_bytes().len();
+                pgrx::info!(
+                    "DEBUG: nodeToString succeeded for subplan {}, length={}",
+                    i,
+                    plan_str_len
+                );
+                pg_sys::pfree(plan_str as *mut std::ffi::c_void);
+            }
+
+            // Check Aggref.aggargtypes if this is an Agg node
+            if (*subplan_ptr).type_ == pg_sys::NodeTag::T_Agg {
+                let agg = subplan_ptr as *mut pg_sys::Agg;
+                let tl = (*agg).plan.targetlist;
+                if !tl.is_null() && (*tl).length > 0 {
+                    let te = pg_sys::list_nth(tl, 0) as *mut pg_sys::TargetEntry;
+                    if !te.is_null() && !(*te).expr.is_null() {
+                        let expr_type = (*(*te).expr).type_;
+                        if expr_type == pg_sys::NodeTag::T_Aggref {
+                            let aggref = (*te).expr as *mut pg_sys::Aggref;
+                            let aggargtypes = (*aggref).aggargtypes;
+                            if aggargtypes.is_null() {
+                                pgrx::info!("DEBUG: Aggref.aggargtypes is NULL");
+                            } else {
+                                pgrx::info!(
+                                    "DEBUG: Aggref.aggargtypes has {} entries",
+                                    (*aggargtypes).length
+                                );
+                                for oid_idx in 0..(*aggargtypes).length {
+                                    let oid_val = pg_sys::list_nth_oid(aggargtypes, oid_idx);
+                                    pgrx::info!("DEBUG: aggargtypes[{}] = {}", oid_idx, oid_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Debug: Walk the plan tree and dump all qual expressions
+            fn dump_all_quals(plan: *mut pg_sys::Plan, depth: i32) {
+                unsafe {
+                    if plan.is_null() {
+                        return;
+                    }
+                    let node_type = (*plan).type_;
+                    pgrx::info!("QUAL_DUMP depth={} {:?}", depth, node_type);
+                    // Dump targetlist too
+                    if !(*plan).targetlist.is_null() {
+                        let tl = (*plan).targetlist;
+                        pgrx::info!("TL_DUMP: targetlist len={}", (*tl).length);
+                        for idx in 0..(*tl).length.min(5) {
+                            let te = pg_sys::list_nth(tl, idx) as *mut pg_sys::TargetEntry;
+                            if !te.is_null() {
+                                pgrx::info!("TL_DUMP[{}]: resno={}", idx, (*te).resno);
+                                debug_dump_expr(
+                                    (*te).expr as *mut pg_sys::Node,
+                                    (depth + 2) as usize,
+                                );
+                            }
+                        }
+                    }
+                    if !(*plan).qual.is_null() {
+                        let qual = (*plan).qual;
+                        pgrx::info!("QUAL_DUMP: qual list at {:p} len={}", qual, (*qual).length);
+                        for idx in 0..(*qual).length {
+                            let node = pg_sys::list_nth(qual, idx) as *mut pg_sys::Node;
+                            debug_dump_expr(node, (depth + 1) as usize);
+                        }
+                    }
+                    // For Result nodes, also check resconstantqual
+                    if node_type == pg_sys::NodeTag::T_Result {
+                        let result = plan as *mut pg_sys::Result;
+                        if !(*result).resconstantqual.is_null() {
+                            pgrx::info!(
+                                "QUAL_DUMP: Result.resconstantqual at {:p}",
+                                (*result).resconstantqual
+                            );
+                            debug_dump_expr(
+                                (*result).resconstantqual as *mut pg_sys::Node,
+                                (depth + 1) as usize,
+                            );
+                        }
+                    }
+                    dump_all_quals((*plan).lefttree, depth + 1);
+                    dump_all_quals((*plan).righttree, depth + 1);
+                }
+            }
+            pgrx::info!(
+                "DEBUG: Dumping all quals in subplan {} before ExecInitNode",
+                i
+            );
+            dump_all_quals(subplan_ptr, 0);
+
+            // Initialize the subplan with ExecInitNode
+            pgrx::info!("DEBUG: About to call ExecInitNode for subplan {}", i);
+            let subplan_state = pg_sys::ExecInitNode(subplan_ptr, estate, 0);
+            pgrx::info!(
+                "DEBUG: Subplan {} initialized, PlanState={:p}",
+                i,
+                subplan_state
+            );
+
+            if subplan_state.is_null() {
+                pgrx::warning!("DEBUG: Subplan {} failed to initialize!", i);
+            }
+
+            // Append the PlanState to es_subplanstates
+            (*estate).es_subplanstates = pg_sys::lappend(
+                (*estate).es_subplanstates,
+                subplan_state as *mut std::ffi::c_void,
+            );
+        }
+
+        pgrx::info!("DEBUG: All {} subplans initialized", num_subplans);
+    } else {
+        (*estate).es_subplanstates = std::ptr::null_mut();
+    }
+
+    // Note: es_output_cid, es_snapshot, etc. are initialized earlier, before subplan initialization
 
     (*query_desc_ptr).estate = estate;
 
@@ -878,10 +2415,32 @@ pub unsafe fn execute_plan_directly(
         estate
     );
 
+    // Verify es_subplanstates before main plan init
+    let subplan_states = (*estate).es_subplanstates;
+    if !subplan_states.is_null() {
+        let n_states = (*subplan_states).length;
+        pgrx::info!("DEBUG: es_subplanstates has {} entries", n_states);
+        for i in 0..n_states {
+            let ps = pg_sys::list_nth(subplan_states, i) as *mut pg_sys::PlanState;
+            pgrx::info!(
+                "DEBUG:   es_subplanstates[{}] = {:p}, type={:?}",
+                i,
+                ps,
+                if !ps.is_null() {
+                    (*ps).type_
+                } else {
+                    pg_sys::NodeTag::T_Invalid
+                }
+            );
+        }
+    } else {
+        pgrx::info!("DEBUG: es_subplanstates is NULL");
+    }
+
     // Debug: dump plan tree structure before ExecInitNode
     debug_dump_plan_tree(plan_tree, 0);
 
-    // Now initialize the plan node
+    // Now initialize the main plan node (subplans already initialized above)
     let plan_state = pg_sys::ExecInitNode(plan_tree, estate, 0);
 
     pgrx::info!("DEBUG: ExecInitNode returned: {:p}", plan_state);
@@ -930,15 +2489,48 @@ pub unsafe fn execute_plan_directly(
 
     // Execute the plan and collect tuples into tuplestore with error handling
     let mut tuple_count = 0u64;
-    eprintln!("DEBUG: Starting plan execution loop");
+
     pgrx::info!("DEBUG: Starting plan execution loop");
+
+    // Debug plan state structure before execution
+    pgrx::info!(
+        "DEBUG: plan_state={:p}, type={:?}",
+        plan_state,
+        (*plan_state).type_
+    );
+
+    // Check if this is a Sort state and dump its child state
+    if (*plan_state).type_ == pg_sys::NodeTag::T_SortState {
+        let sort_state = plan_state as *mut pg_sys::SortState;
+        pgrx::info!("DEBUG: SortState details:");
+        pgrx::info!(
+            "DEBUG:   ss_ScanTupleSlot={:p}",
+            (*sort_state).ss.ss_ScanTupleSlot
+        );
+        pgrx::info!(
+            "DEBUG:   ps_ResultTupleSlot={:p}",
+            (*sort_state).ss.ps.ps_ResultTupleSlot
+        );
+        pgrx::info!(
+            "DEBUG:   lefttree (child state)={:p}",
+            (*sort_state).ss.ps.lefttree
+        );
+
+        // Check the child plan state (should be AggState)
+        let child_state = (*sort_state).ss.ps.lefttree;
+        if !child_state.is_null() {
+            pgrx::info!("DEBUG:   child state type={:?}", (*child_state).type_);
+        }
+
+        // Check tuplesortstate
+        pgrx::info!("DEBUG:   tuplesortstate={:p}", (*sort_state).tuplesortstate);
+    }
+
     loop {
-        eprintln!("DEBUG: Calling ExecProcNode (iteration {tuple_count})");
         pgrx::info!("DEBUG: Calling ExecProcNode (iteration {})", tuple_count);
 
         // Use PostgreSQL's PG_TRY/PG_CATCH mechanism for error handling
         let slot = pg_sys::ExecProcNode(plan_state);
-        eprintln!("DEBUG: ExecProcNode returned slot: {slot:p}");
         pgrx::info!("DEBUG: ExecProcNode returned slot: {:p}", slot);
 
         if slot.is_null() {
@@ -1012,6 +2604,7 @@ pub unsafe fn execute_postgres_plan(
     plan_tree: *mut pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *const pg_sys::List,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
 ) -> Result<ExecutionResult, Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("DEBUG: execute_postgres_plan ENTRY - plan_tree={plan_tree:p}");
     pgrx::info!(
@@ -1051,12 +2644,11 @@ pub unsafe fn execute_postgres_plan(
     validate_plan_tree_node_types(plan_tree);
 
     let (tupdesc, tuplestore) =
-        execute_plan_directly_from_ptr(plan_tree, column_names, range_table, None).map_err(
-            |e| {
+        execute_plan_directly_from_ptr(plan_tree, column_names, range_table, None, subplans)
+            .map_err(|e| {
                 eprintln!("DEBUG: Plan execution failed: {e}");
                 e
-            },
-        )?;
+            })?;
 
     eprintln!("DEBUG: Plan executed successfully, converting results");
 
@@ -1173,6 +2765,7 @@ pub unsafe fn execute_postgres_plan_as_srf(
     plan_tree: *mut pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *mut pg_sys::List,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
 ) -> pg_sys::Datum {
     // IMMEDIATE DEBUG - FIRST LINE OF FUNCTION EXECUTION
     eprintln!("IMMEDIATE: execute_postgres_plan_as_srf ENTERED - BEFORE ANY OPERATIONS");
@@ -1183,7 +2776,7 @@ pub unsafe fn execute_postgres_plan_as_srf(
         eprintln!("DEBUG: execute_postgres_plan_as_srf ENTRY - INSIDE PANIC HANDLER");
         pgrx::info!("DEBUG: execute_postgres_plan_as_srf ENTRY - INSIDE PANIC HANDLER");
 
-        execute_postgres_plan_as_srf_inner(fcinfo, plan_tree, column_names, range_table)
+        execute_postgres_plan_as_srf_inner(fcinfo, plan_tree, column_names, range_table, subplans)
     });
 
     match result {
@@ -1192,8 +2785,16 @@ pub unsafe fn execute_postgres_plan_as_srf(
             datum
         }
         Err(panic_info) => {
-            eprintln!("PANIC: execute_postgres_plan_as_srf panicked: {panic_info:?}");
-            pgrx::error!("Function panicked during execution");
+            // Try to extract the panic message
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                format!("{:?}", panic_info)
+            };
+            eprintln!("PANIC: execute_postgres_plan_as_srf panicked: {msg}");
+            pgrx::error!("Function panicked: {}", msg);
         }
     }
 }
@@ -1203,6 +2804,7 @@ unsafe fn execute_postgres_plan_as_srf_inner(
     plan_tree: *mut pg_sys::Plan,
     column_names: Vec<String>,
     range_table: *mut pg_sys::List,
+    subplans: Vec<crate::plan_translator::expressions::SubplanEntry>,
 ) -> pg_sys::Datum {
     eprintln!(
         "DEBUG: execute_postgres_plan_as_srf_inner ENTRY - using pgrx-compatible SRF pattern"
@@ -1248,6 +2850,7 @@ unsafe fn execute_postgres_plan_as_srf_inner(
             column_names,
             range_table,
             Some(result_tuple_desc),
+            subplans,
         );
         let (_generated_tupdesc, tuplestore) = execution_result.unwrap_or_else(|e| {
             pg_sys::MemoryContextSwitchTo(oldcontext);
