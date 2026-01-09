@@ -397,13 +397,27 @@ fn select_common_type(left: pg_sys::Oid, right: pg_sys::Oid) -> pg_sys::Oid {
     const INT8: pg_sys::Oid = pg_sys::Oid::from_u32(20); // int8
     const INT4: pg_sys::Oid = pg_sys::Oid::from_u32(23); // int4
     const INT2: pg_sys::Oid = pg_sys::Oid::from_u32(21); // int2
+    const TEXT: pg_sys::Oid = pg_sys::Oid::from_u32(25); // text
+    const BPCHAR: pg_sys::Oid = pg_sys::Oid::from_u32(1042); // bpchar (char(n))
+    const VARCHAR: pg_sys::Oid = pg_sys::Oid::from_u32(1043); // varchar
 
-    // If same type, use it
+    // String types - text is the common type for all string comparisons
+    // This handles varchar ~~ varchar, bpchar = text, etc.
+    // Must be checked before the same-type shortcut below
+    let left_is_string = left == TEXT || left == BPCHAR || left == VARCHAR;
+    let right_is_string = right == TEXT || right == BPCHAR || right == VARCHAR;
+    if left_is_string && right_is_string {
+        // For any string type combination, use text as the common type
+        // This ensures operators like ~~ (LIKE) work correctly
+        return TEXT;
+    }
+
+    // If same type, use it (for non-string types)
     if left == right {
         return left;
     }
 
-    // Float8 dominates all
+    // Float8 dominates all numeric types
     if left == FLOAT8 || right == FLOAT8 {
         return FLOAT8;
     }
