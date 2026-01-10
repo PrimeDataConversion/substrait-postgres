@@ -115,6 +115,19 @@ unsafe fn convert_literal(
             pgrx::info!("DEBUG: varchar const created");
             Ok(c as *mut pg_sys::Expr)
         }
+        Some(LiteralType::IntervalYearToMonth(interval)) => {
+            pgrx::info!(
+                "DEBUG: Creating interval const: {} years, {} months",
+                interval.years,
+                interval.months
+            );
+            // Convert years and months to total months
+            let total_months = interval.years * 12 + interval.months;
+            // Create an interval constant - PostgreSQL interval is stored as months + days + microseconds
+            let c = create_interval_const(total_months, 0, 0)?;
+            pgrx::info!("DEBUG: interval const created");
+            Ok(c as *mut pg_sys::Expr)
+        }
         other => Err(format!("Unsupported literal type: {:?}", other).into()),
     }
 }
@@ -204,16 +217,29 @@ unsafe fn convert_scalar_function(
         .get(&func.function_reference)
         .ok_or_else(|| format!("Unknown function reference: {}", func.function_reference))?;
 
-    // Convert arguments
+    // Convert arguments - handle both Value and Enum types
     let mut args: Vec<*mut pg_sys::Expr> = Vec::new();
     for arg in &func.arguments {
-        if let Some(substrait::proto::function_argument::ArgType::Value(expr)) = &arg.arg_type {
-            let pg_expr = convert_expression_for_query(expr, available_columns, ctx)?;
-            args.push(pg_expr);
+        match &arg.arg_type {
+            Some(substrait::proto::function_argument::ArgType::Value(expr)) => {
+                let pg_expr = convert_expression_for_query(expr, available_columns, ctx)?;
+                args.push(pg_expr);
+            }
+            Some(substrait::proto::function_argument::ArgType::Enum(enum_val)) => {
+                // Convert enum to text constant (e.g., "YEAR" for extract function)
+                let text_const = create_text_const(&enum_val.to_lowercase())?;
+                args.push(text_const as *mut pg_sys::Expr);
+            }
+            _ => {}
         }
     }
 
     // Map function name to PostgreSQL operator/function
+    pgrx::info!(
+        "DEBUG: create_function_expr for '{}' with {} args",
+        func_name,
+        args.len()
+    );
     create_function_expr(func_name, &args)
 }
 
@@ -258,6 +284,15 @@ unsafe fn create_function_expr(
         "like" => create_op_expr("~~", args),
         "concat" => create_func_call("concat", args),
         "substring" => create_func_call("substring", args),
+
+        // Date/time functions - extract uses date_part with args (field_name, date)
+        // The field name comes from an enum argument, already converted to text
+        "extract" => create_func_call("date_part", args),
+        name if name.starts_with("extract:") => {
+            // extract:req_date, extract:req_timestamp etc.
+            // Args already contain [field_text, date_value] from enum conversion
+            create_func_call("date_part", args)
+        }
 
         // NULL checks
         "is_null" => create_null_test(args, true),
@@ -466,13 +501,28 @@ unsafe fn create_func_call(
     func_name: &str,
     args: &[*mut pg_sys::Expr],
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    const TEXT: pg_sys::Oid = pg_sys::Oid::from_u32(25);
+    const BPCHAR: pg_sys::Oid = pg_sys::Oid::from_u32(1042);
+    const VARCHAR: pg_sys::Oid = pg_sys::Oid::from_u32(1043);
+
     // Look up the function
     let func_cstr = std::ffi::CString::new(func_name)?;
 
-    // Build argument type array
+    // Build argument type array, coercing string types to text for better matching
     let mut arg_types: Vec<pg_sys::Oid> = Vec::new();
+    let mut coerced_args: Vec<*mut pg_sys::Expr> = Vec::new();
+
     for arg in args {
-        arg_types.push(pg_sys::exprType(*arg as *const pg_sys::Node));
+        let arg_type = pg_sys::exprType(*arg as *const pg_sys::Node);
+
+        // Coerce varchar/bpchar to text for function lookups
+        if arg_type == BPCHAR || arg_type == VARCHAR {
+            coerced_args.push(coerce_to_type(*arg, arg_type, TEXT));
+            arg_types.push(TEXT);
+        } else {
+            coerced_args.push(*arg);
+            arg_types.push(arg_type);
+        }
     }
 
     // Build function name list manually (list_make1 is a macro)
@@ -489,8 +539,18 @@ unsafe fn create_func_call(
     );
 
     if func_oid == pg_sys::InvalidOid {
-        return Err(format!("Function '{}' not found", func_name).into());
+        // Debug: show what types we're looking for
+        let type_strs: Vec<String> = arg_types.iter().map(|t| t.to_u32().to_string()).collect();
+        return Err(format!(
+            "Function '{}' not found with arg types [{}]",
+            func_name,
+            type_strs.join(", ")
+        )
+        .into());
     }
+
+    // Use coerced_args instead of original args
+    let args = &coerced_args;
 
     // Get function return type
     let func_tuple = pg_sys::SearchSysCache1(
@@ -788,6 +848,32 @@ unsafe fn create_date_const(
     c.constbyval = true;
     c.constisnull = false;
     c.constvalue = pg_sys::Datum::from(pg_days);
+    c.location = -1;
+    Ok(c.into_pg())
+}
+
+unsafe fn create_interval_const(
+    months: i32,
+    days: i32,
+    microseconds: i64,
+) -> Result<*mut pg_sys::Const, Box<dyn std::error::Error + Send + Sync>> {
+    // PostgreSQL interval is stored as (months, days, time in microseconds)
+    // Allocate an Interval struct
+    let interval_ptr =
+        pg_sys::palloc(std::mem::size_of::<pg_sys::Interval>()) as *mut pg_sys::Interval;
+    (*interval_ptr).month = months;
+    (*interval_ptr).day = days;
+    (*interval_ptr).time = microseconds;
+
+    let mut c = pgrx::PgBox::<pg_sys::Const>::alloc0();
+    c.xpr.type_ = pg_sys::NodeTag::T_Const;
+    c.consttype = pg_sys::INTERVALOID;
+    c.consttypmod = -1;
+    c.constcollid = pg_sys::InvalidOid;
+    c.constlen = std::mem::size_of::<pg_sys::Interval>() as i32;
+    c.constbyval = false;
+    c.constisnull = false;
+    c.constvalue = pg_sys::Datum::from(interval_ptr);
     c.location = -1;
     Ok(c.into_pg())
 }

@@ -648,21 +648,36 @@ unsafe fn convert_aggregate_to_query_parts(
                         if field_index < parts.available_columns.len() {
                             let col = &parts.available_columns[field_index];
 
-                            // Create Var for this grouping column
-                            let mut var = pgrx::PgBox::<pg_sys::Var>::alloc0();
-                            var.xpr.type_ = pg_sys::NodeTag::T_Var;
-                            var.varno = col.varno;
-                            var.varattno = col.varattno;
-                            var.vartype = col.type_oid;
-                            var.vartypmod = col.typmod;
-                            var.varcollid = col.collation;
-                            var.varlevelsup = 0;
-                            var.varnosyn = col.varno as u32;
-                            var.varattnosyn = col.varattno;
-                            var.location = -1;
+                            // For computed columns (varno=0), use the stored expression
+                            // For table columns, create a Var node
+                            let var_expr = if col.varno == 0 {
+                                if let Some(computed) = col.computed_expr {
+                                    // Copy the expression to avoid sharing pointers
+                                    pg_sys::copyObjectImpl(computed as *const std::ffi::c_void)
+                                        as *mut pg_sys::Expr
+                                } else {
+                                    return Err(format!(
+                                        "Grouping column '{}' has varno=0 but no computed expression",
+                                        col.name
+                                    )
+                                    .into());
+                                }
+                            } else {
+                                // Create Var for this grouping column
+                                let mut var = pgrx::PgBox::<pg_sys::Var>::alloc0();
+                                var.xpr.type_ = pg_sys::NodeTag::T_Var;
+                                var.varno = col.varno;
+                                var.varattno = col.varattno;
+                                var.vartype = col.type_oid;
+                                var.vartypmod = col.typmod;
+                                var.varcollid = col.collation;
+                                var.varlevelsup = 0;
+                                var.varnosyn = col.varno as u32;
+                                var.varattnosyn = col.varattno;
+                                var.location = -1;
+                                var.into_pg() as *mut pg_sys::Expr
+                            };
 
-                            // Convert Var to raw pointer
-                            let var_expr = var.into_pg() as *mut pg_sys::Expr;
                             // Make a copy for AvailableColumn so we don't share pointers
                             let var_expr_copy =
                                 pg_sys::copyObjectImpl(var_expr as *const std::ffi::c_void)
@@ -948,24 +963,39 @@ unsafe fn build_select_star_target_list(
     let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
 
     for (i, col) in columns.iter().enumerate() {
-        // Create Var node
-        let mut var = pgrx::PgBox::<pg_sys::Var>::alloc0();
-        var.xpr.type_ = pg_sys::NodeTag::T_Var;
-        var.varno = col.varno;
-        var.varattno = col.varattno;
-        var.vartype = col.type_oid;
-        var.vartypmod = col.typmod;
-        var.varcollid = col.collation;
-        var.varlevelsup = 0;
-        // PG17 fields
-        var.varnosyn = col.varno as u32;
-        var.varattnosyn = col.varattno;
-        let var = var.into_pg();
+        // For computed columns (varno=0), use the stored expression
+        // For table columns, create a Var node
+        let expr = if col.varno == 0 {
+            if let Some(computed) = col.computed_expr {
+                // Copy the expression to avoid sharing pointers
+                pg_sys::copyObjectImpl(computed as *const std::ffi::c_void) as *mut pg_sys::Expr
+            } else {
+                return Err(format!(
+                    "Column '{}' has varno=0 but no computed expression",
+                    col.name
+                )
+                .into());
+            }
+        } else {
+            // Create Var node for table columns
+            let mut var = pgrx::PgBox::<pg_sys::Var>::alloc0();
+            var.xpr.type_ = pg_sys::NodeTag::T_Var;
+            var.varno = col.varno;
+            var.varattno = col.varattno;
+            var.vartype = col.type_oid;
+            var.vartypmod = col.typmod;
+            var.varcollid = col.collation;
+            var.varlevelsup = 0;
+            // PG17 fields
+            var.varnosyn = col.varno as u32;
+            var.varattnosyn = col.varattno;
+            var.into_pg() as *mut pg_sys::Expr
+        };
 
         // Create TargetEntry
         let mut te = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
         te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-        te.expr = var as *mut pg_sys::Expr;
+        te.expr = expr;
         te.resno = (i + 1) as i16;
         te.resname = create_cstring(&col.name);
         te.resjunk = false;
