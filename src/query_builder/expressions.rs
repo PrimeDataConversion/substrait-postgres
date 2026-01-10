@@ -413,7 +413,25 @@ unsafe fn create_op_expr(
     op_expr.opresulttype = result_type;
     op_expr.opretset = false;
     op_expr.opcollid = pg_sys::InvalidOid;
-    op_expr.inputcollid = pg_sys::InvalidOid;
+
+    // Set inputcollid for string comparisons
+    // Check if either operand is a collatable type
+    let left_coll = pg_sys::exprCollation(coerced_left as *const pg_sys::Node);
+    let right_coll = pg_sys::exprCollation(coerced_right as *const pg_sys::Node);
+    if left_coll != pg_sys::InvalidOid {
+        op_expr.inputcollid = left_coll;
+    } else if right_coll != pg_sys::InvalidOid {
+        op_expr.inputcollid = right_coll;
+    } else {
+        // Check if types are collatable and need default collation
+        let left_type_collatable = pg_sys::type_is_collatable(actual_left_type);
+        let right_type_collatable = pg_sys::type_is_collatable(actual_right_type);
+        if left_type_collatable || right_type_collatable {
+            op_expr.inputcollid = pg_sys::DEFAULT_COLLATION_OID;
+        } else {
+            op_expr.inputcollid = pg_sys::InvalidOid;
+        }
+    }
 
     let mut arg_list: *mut pg_sys::List = std::ptr::null_mut();
     arg_list = pg_sys::lappend(arg_list, coerced_left as *mut std::ffi::c_void);
@@ -575,7 +593,26 @@ unsafe fn create_func_call(
     func_expr.funcvariadic = false;
     func_expr.funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
     func_expr.funccollid = pg_sys::InvalidOid;
-    func_expr.inputcollid = pg_sys::InvalidOid;
+
+    // Set inputcollid from arguments if any are collatable
+    let mut input_coll = pg_sys::InvalidOid;
+    for arg in args {
+        let arg_coll = pg_sys::exprCollation(*arg as *const pg_sys::Node);
+        if arg_coll != pg_sys::InvalidOid {
+            input_coll = arg_coll;
+            break;
+        }
+    }
+    // If no explicit collation found, check if any arg types are collatable
+    if input_coll == pg_sys::InvalidOid {
+        for arg_type in &arg_types {
+            if pg_sys::type_is_collatable(*arg_type) {
+                input_coll = pg_sys::DEFAULT_COLLATION_OID;
+                break;
+            }
+        }
+    }
+    func_expr.inputcollid = input_coll;
 
     let mut arg_list: *mut pg_sys::List = std::ptr::null_mut();
     for arg in args {

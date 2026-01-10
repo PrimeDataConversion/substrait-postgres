@@ -479,13 +479,18 @@ unsafe fn convert_project_to_query_parts(
             };
 
         let expr_type = pg_sys::exprType(pg_expr as *const pg_sys::Node);
+        // Get collation from the expression, or use default for collatable types
+        let mut expr_coll = pg_sys::exprCollation(pg_expr as *const pg_sys::Node);
+        if expr_coll == pg_sys::InvalidOid && pg_sys::type_is_collatable(expr_type) {
+            expr_coll = pg_sys::DEFAULT_COLLATION_OID;
+        }
         new_available_columns.push(AvailableColumn {
             varno,
             varattno,
             name: col_name,
             type_oid: expr_type,
             typmod: -1,
-            collation: pg_sys::InvalidOid,
+            collation: expr_coll,
             computed_expr,
         });
     }
