@@ -1802,7 +1802,13 @@ mod tests {
         if upper.starts_with("SUM_") || upper.starts_with("AVG_") {
             return "numeric";
         }
-        if upper.starts_with("COUNT") {
+        // COUNT columns - can be prefixed (COUNT_*) or suffixed (*_COUNT, *_CNT)
+        if upper.starts_with("COUNT")
+            || upper.ends_with("_COUNT")
+            || upper.ends_with("COUNT")
+            || upper.ends_with("_CNT")
+            || upper.ends_with("DIST")
+        {
             return "bigint";
         }
 
@@ -1819,6 +1825,12 @@ mod tests {
             || upper.contains("TAX")
             || upper.contains("BALANCE")
             || upper.contains("ACCTBAL")
+            || upper.contains("REVENUE")
+            || upper.contains("AMOUNT")
+            || upper.contains("TOTAL")
+            || upper.contains("PROFIT")
+            || upper.contains("PROMO")
+            || upper.contains("VALUE")
         {
             return "numeric";
         }

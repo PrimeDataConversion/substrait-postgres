@@ -173,6 +173,7 @@ unsafe fn convert_read_to_query_parts(
             typmod: c.typmod,
             collation: c.collation,
             computed_expr: None, // Table columns are not computed
+            ressortgroupref: 0,
         })
         .collect();
     pgrx::info!("DEBUG: Built {} available_columns", available_columns.len());
@@ -484,6 +485,38 @@ unsafe fn convert_project_to_query_parts(
         if expr_coll == pg_sys::InvalidOid && pg_sys::type_is_collatable(expr_type) {
             expr_coll = pg_sys::DEFAULT_COLLATION_OID;
         }
+
+        // For field references, preserve ressortgroupref from source column
+        let ressortgroupref =
+            if let Some(substrait::proto::expression::RexType::Selection(sel)) = &expr.rex_type {
+                if let Some(
+                    substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                        direct,
+                    ),
+                ) = &sel.reference_type
+                {
+                    if let Some(
+                        substrait::proto::expression::reference_segment::ReferenceType::StructField(
+                            field,
+                        ),
+                    ) = &direct.reference_type
+                    {
+                        let field_idx = field.field as usize;
+                        if field_idx < parts.available_columns.len() {
+                            parts.available_columns[field_idx].ressortgroupref
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
         new_available_columns.push(AvailableColumn {
             varno,
             varattno,
@@ -492,6 +525,7 @@ unsafe fn convert_project_to_query_parts(
             typmod: -1,
             collation: expr_coll,
             computed_expr,
+            ressortgroupref,
         });
     }
 
@@ -753,6 +787,7 @@ unsafe fn convert_aggregate_to_query_parts(
                                 typmod: col.typmod,
                                 collation: col.collation,
                                 computed_expr: Some(var_expr_copy),
+                                ressortgroupref: sort_group_ref, // Track grouping column ref
                             });
 
                             resno += 1;
@@ -801,6 +836,7 @@ unsafe fn convert_aggregate_to_query_parts(
             typmod: -1,
             collation: pg_sys::InvalidOid,
             computed_expr: Some(aggref_copy),
+            ressortgroupref: 0, // Aggregates are not grouping columns
         });
 
         resno += 1;

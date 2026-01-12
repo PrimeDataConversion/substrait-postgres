@@ -199,6 +199,8 @@ pub struct AvailableColumn {
     /// For computed columns (varno=0), the actual expression to inline.
     /// This is a raw pointer that should be copyExpr'd when used.
     pub computed_expr: Option<*mut pg_sys::Expr>,
+    /// Sort/group reference for GROUP BY columns. 0 means not a grouping column.
+    pub ressortgroupref: u32,
 }
 
 impl QueryParts {
