@@ -3501,7 +3501,13 @@ mod tests {
     }
 
     /// Sets up TPC-H database if needed (checks if LINEITEM table exists)
+    /// Uses an advisory lock to prevent race conditions when tests run in parallel.
     fn setup_tpch_database_if_needed() {
+        // Use advisory lock to prevent parallel setup attempts.
+        // Lock ID 12345 is arbitrary but must be consistent across all test backends.
+        // pg_advisory_lock returns void, so we just run it.
+        Spi::run("SELECT pg_advisory_lock(12345)").expect("Failed to acquire advisory lock");
+
         // Check if LINEITEM table already exists (uppercase to match Substrait)
         let table_exists = Spi::get_one::<bool>(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'LINEITEM')",
@@ -3511,6 +3517,8 @@ mod tests {
 
         if table_exists {
             pgrx::info!("TPC-H LINEITEM table already exists, skipping setup");
+            // Release the advisory lock before returning.
+            let _ = Spi::run("SELECT pg_advisory_unlock(12345)");
             return;
         }
 
@@ -3586,6 +3594,9 @@ mod tests {
         ).unwrap_or(Some("no tables found".to_string())).unwrap_or("query failed".to_string());
 
         pgrx::info!("All tables in public schema: {}", table_list);
+
+        // Release the advisory lock after setup completes.
+        let _ = Spi::run("SELECT pg_advisory_unlock(12345)");
     }
 
     /// Get the connection information for the current pgrx test database
