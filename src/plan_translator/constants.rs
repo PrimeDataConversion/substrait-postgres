@@ -44,5 +44,7 @@ pub fn get_expression_type_name(rex_type: &substrait::proto::expression::RexType
         RexType::Nested(_) => "Nested",
         RexType::Enum(_) => "Enum",
         RexType::DynamicParameter(_) => "DynamicParameter",
+        RexType::Lambda(_) => "Lambda",
+        RexType::LambdaInvocation(_) => "LambdaInvocation",
     }
 }
