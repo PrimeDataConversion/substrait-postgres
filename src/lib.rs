@@ -3601,29 +3601,28 @@ mod tests {
 
     /// Get the connection information for the current pgrx test database
     fn get_test_db_connection_info() -> (String, u16, String, String) {
-        // These values match what pgrx uses internally for test databases
+        // This code runs inside the test server backend, so ask the server
+        // directly rather than replicating pgrx's internal conventions
+        // (pgrx 0.19+ picks an ephemeral port per test binary).
 
         // Host is always localhost for pgrx tests
         let host = "localhost".to_string();
 
-        // Database name is always "pgrx_tests" for pgrx tests
-        let database = "pgrx_tests".to_string();
+        let port = Spi::get_one::<String>("SHOW port")
+            .ok()
+            .flatten()
+            .and_then(|p| p.parse::<u16>().ok())
+            .expect("unable to determine test server port");
 
-        // Get the PostgreSQL major version to calculate the test port
-        // pgrx uses BASE_POSTGRES_TESTING_PORT_NO (32200) + major_version
-        let pg_major_version = (pgrx::pg_sys::PG_VERSION_NUM / 10000) as u16;
-        let port = 32200 + pg_major_version; // This matches BASE_POSTGRES_TESTING_PORT_NO from pgrx
+        let database = Spi::get_one::<String>("SELECT current_database()::text")
+            .ok()
+            .flatten()
+            .expect("unable to determine current database");
 
-        // Get the user from environment variables (matches pgrx's get_pg_user logic)
-        let user = std::env::var("CARGO_PGRX_TEST_RUNAS")
-            .or_else(|_| {
-                #[cfg(target_family = "unix")]
-                let varname = "USER";
-                #[cfg(target_os = "windows")]
-                let varname = "USERNAME";
-                std::env::var(varname)
-            })
-            .unwrap_or_else(|_| "postgres".to_string());
+        let user = Spi::get_one::<String>("SELECT current_user::text")
+            .ok()
+            .flatten()
+            .expect("unable to determine current user");
 
         (host, port, database, user)
     }

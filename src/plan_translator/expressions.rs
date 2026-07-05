@@ -3560,6 +3560,9 @@ unsafe fn convert_selection_to_postgres_with_schema_and_varno(
                     "DEBUG: Expression root type in selection - treating as normal reference"
                 );
             }
+            RootType::LambdaParameterReference(_) => {
+                return Err("Lambda parameter references are not supported".into());
+            }
         }
     }
 
