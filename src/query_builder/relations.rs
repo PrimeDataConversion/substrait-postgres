@@ -184,7 +184,7 @@ unsafe fn convert_read_to_query_parts(
     pgrx::info!("DEBUG: Got {} columns", columns.len());
 
     pgrx::info!("DEBUG: Building available_columns Vec");
-    let available_columns: Vec<AvailableColumn> = columns
+    let mut available_columns: Vec<AvailableColumn> = columns
         .iter()
         .map(|c| AvailableColumn {
             varno: rtindex,
@@ -197,6 +197,29 @@ unsafe fn convert_read_to_query_parts(
             ressortgroupref: 0,
         })
         .collect();
+
+    // Apply the read's column projection (mask expression), if present.
+    // Downstream field indices then refer to the projected columns.
+    if let Some(projection) = &read.projection {
+        if let Some(select) = &projection.select {
+            available_columns = select
+                .struct_items
+                .iter()
+                .map(|item| {
+                    available_columns
+                        .get(item.field as usize)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "Read projection field {} out of range ({} columns)",
+                                item.field,
+                                available_columns.len()
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
     pgrx::info!("DEBUG: Built {} available_columns", available_columns.len());
 
     pgrx::info!("DEBUG: Setting columns in context");
@@ -432,7 +455,21 @@ unsafe fn convert_project_to_query_parts(
             false
         });
 
-        if is_simple_passthrough && project.expressions.len() == parts.available_columns.len() {
+        // The shortcut is only valid if the emit mapping selects exactly the
+        // appended expressions in order (i.e. the project is an identity).
+        let n_input = parts.available_columns.len();
+        let n_exprs = project.expressions.len();
+        let emit_is_expressions_in_order =
+            match project.common.as_ref().and_then(|c| c.emit_kind.as_ref()) {
+                Some(substrait::proto::rel_common::EmitKind::Emit(emit)) => emit
+                    .output_mapping
+                    .iter()
+                    .map(|&i| i as usize)
+                    .eq(n_input..n_input + n_exprs),
+                _ => false,
+            };
+
+        if is_simple_passthrough && emit_is_expressions_in_order && n_exprs == n_input {
             pgrx::info!(
                 "DEBUG: Project is simple passthrough - using child's target list directly"
             );
@@ -441,9 +478,9 @@ unsafe fn convert_project_to_query_parts(
         }
     }
 
-    // Build target list from project expressions
-    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
-    let mut new_available_columns = Vec::new();
+    // Convert the projection expressions, tracking source-column metadata
+    // for simple field references.
+    let mut expr_outputs: Vec<(*mut pg_sys::Expr, AvailableColumn)> = Vec::new();
 
     for (i, expr) in project.expressions.iter().enumerate() {
         let pg_expr = convert_expression_for_query(expr, &parts.available_columns, ctx)?;
@@ -480,18 +517,6 @@ unsafe fn convert_project_to_query_parts(
             } else {
                 0
             };
-
-        // Create TargetEntry
-        let mut te = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
-        te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
-        te.expr = pg_expr;
-        te.resno = (i + 1) as i16;
-        te.resname = create_cstring(&format!("col{}", i + 1));
-        te.ressortgroupref = ressortgroupref;
-        te.resjunk = false;
-        let te = te.into_pg();
-
-        target_list = pg_sys::lappend(target_list, te as *mut std::ffi::c_void);
 
         // Track available columns for parent relations
         // If the expression is a simple field reference, preserve the varno from input
@@ -553,16 +578,94 @@ unsafe fn convert_project_to_query_parts(
             expr_coll = pg_sys::DEFAULT_COLLATION_OID;
         }
 
-        new_available_columns.push(AvailableColumn {
-            varno,
-            varattno,
-            name: col_name,
-            type_oid: expr_type,
-            typmod: -1,
-            collation: expr_coll,
-            computed_expr,
-            ressortgroupref,
-        });
+        expr_outputs.push((
+            pg_expr,
+            AvailableColumn {
+                varno,
+                varattno,
+                name: col_name,
+                type_oid: expr_type,
+                typmod: -1,
+                collation: expr_coll,
+                computed_expr,
+                ressortgroupref,
+            },
+        ));
+    }
+
+    // Substrait Project output is input columns ++ expressions; the optional
+    // emit mapping then selects and reorders that combined list.
+    let n_input = parts.available_columns.len();
+    let n_total = n_input + expr_outputs.len();
+    let output_indices: Vec<usize> =
+        match project.common.as_ref().and_then(|c| c.emit_kind.as_ref()) {
+            Some(substrait::proto::rel_common::EmitKind::Emit(emit)) => {
+                emit.output_mapping.iter().map(|&i| i as usize).collect()
+            }
+            _ => (0..n_total).collect(),
+        };
+
+    let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
+    let mut new_available_columns = Vec::new();
+    let mut expr_used = vec![false; expr_outputs.len()];
+
+    for (out_pos, &idx) in output_indices.iter().enumerate() {
+        let (te_expr, col) = if idx < n_input {
+            // Pass-through input column.
+            let col = parts.available_columns[idx].clone();
+            let e = if col.varno == 0 {
+                let computed = col.computed_expr.ok_or_else(|| {
+                    format!(
+                        "Column '{}' has varno=0 but no computed expression stored",
+                        col.name
+                    )
+                })?;
+                pg_sys::copyObjectImpl(computed as *const std::ffi::c_void) as *mut pg_sys::Expr
+            } else {
+                let mut var = pgrx::PgBox::<pg_sys::Var>::alloc0();
+                var.xpr.type_ = pg_sys::NodeTag::T_Var;
+                var.varno = col.varno;
+                var.varattno = col.varattno;
+                var.vartype = col.type_oid;
+                var.vartypmod = col.typmod;
+                var.varcollid = col.collation;
+                var.varlevelsup = 0;
+                var.varnosyn = col.varno as u32;
+                var.varattnosyn = col.varattno;
+                var.location = -1;
+                var.into_pg() as *mut pg_sys::Expr
+            };
+            (e, col)
+        } else {
+            let j = idx - n_input;
+            if j >= expr_outputs.len() {
+                return Err(format!(
+                    "Project emit index {} out of range ({} outputs)",
+                    idx, n_total
+                )
+                .into());
+            }
+            let (e0, col) = &expr_outputs[j];
+            // Copy if the emit mapping references this expression again.
+            let e = if expr_used[j] {
+                pg_sys::copyObjectImpl(*e0 as *const std::ffi::c_void) as *mut pg_sys::Expr
+            } else {
+                expr_used[j] = true;
+                *e0
+            };
+            (e, col.clone())
+        };
+
+        let mut te = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
+        te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
+        te.expr = te_expr;
+        te.resno = (out_pos + 1) as i16;
+        te.resname = create_cstring(&col.name);
+        te.ressortgroupref = col.ressortgroupref;
+        te.resjunk = false;
+        target_list = pg_sys::lappend(target_list, te.into_pg() as *mut std::ffi::c_void);
+
+        new_available_columns.push(col);
     }
 
     // Grouping/sorting columns the projection dropped must stay in the
@@ -611,6 +714,20 @@ unsafe fn convert_project_to_query_parts(
     Ok(parts)
 }
 
+/// Convert a join input, wrapping aggregated subtrees as derived tables.
+/// An Aggregate cannot be flattened into the joining Query level: its
+/// Aggrefs would end up evaluated in scan nodes.
+unsafe fn convert_join_input(
+    rel: &Rel,
+    ctx: &mut QueryBuildContext,
+) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
+    if rel_contains_aggregate(rel) {
+        convert_rel_as_subquery_rte(rel, ctx)
+    } else {
+        convert_rel_to_query_parts(rel, ctx)
+    }
+}
+
 /// Convert a Join relation to QueryParts.
 unsafe fn convert_join_to_query_parts(
     join: &substrait::proto::JoinRel,
@@ -620,8 +737,8 @@ unsafe fn convert_join_to_query_parts(
     let left_input = join.left.as_ref().ok_or("Join has no left input")?;
     let right_input = join.right.as_ref().ok_or("Join has no right input")?;
 
-    let left_parts = convert_rel_to_query_parts(left_input, ctx)?;
-    let right_parts = convert_rel_to_query_parts(right_input, ctx)?;
+    let left_parts = convert_join_input(left_input, ctx)?;
+    let right_parts = convert_join_input(right_input, ctx)?;
 
     // Combine available columns from both sides
     let mut combined_columns = left_parts.available_columns.clone();
@@ -685,8 +802,8 @@ unsafe fn convert_cross_to_query_parts(
     let left_input = cross.left.as_ref().ok_or("Cross has no left input")?;
     let right_input = cross.right.as_ref().ok_or("Cross has no right input")?;
 
-    let left_parts = convert_rel_to_query_parts(left_input, ctx)?;
-    let right_parts = convert_rel_to_query_parts(right_input, ctx)?;
+    let left_parts = convert_join_input(left_input, ctx)?;
+    let right_parts = convert_join_input(right_input, ctx)?;
 
     // Combine available columns from both sides
     let mut combined_columns = left_parts.available_columns.clone();
