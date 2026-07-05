@@ -24,7 +24,11 @@ pub unsafe fn convert_expression_for_query(
         }
         Some(RexType::Selection(sel)) => {
             pgrx::info!("DEBUG: Converting Selection (field reference)");
-            convert_selection(sel, available_columns)
+            convert_selection(sel, available_columns, ctx)
+        }
+        Some(RexType::Subquery(subquery)) => {
+            pgrx::info!("DEBUG: Converting Subquery");
+            convert_subquery(subquery, available_columns, ctx)
         }
         Some(RexType::ScalarFunction(func)) => {
             pgrx::info!(
@@ -136,8 +140,10 @@ unsafe fn convert_literal(
 unsafe fn convert_selection(
     sel: &substrait::proto::expression::FieldReference,
     available_columns: &[AvailableColumn],
+    ctx: &QueryBuildContext,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::field_reference::ReferenceType;
+    use substrait::proto::expression::field_reference::RootType;
     use substrait::proto::expression::reference_segment::ReferenceType as SegRefType;
 
     // Get the field index from the selection
@@ -149,17 +155,49 @@ unsafe fn convert_selection(
         _ => return Err("Unsupported reference type".into()),
     };
 
-    // Look up the column in available columns
-    if field_idx >= available_columns.len() {
+    // Determine which query level the reference targets. An OuterReference
+    // resolves against an enclosing query's columns and becomes a Var with
+    // varlevelsup > 0; PostgreSQL's planner turns those into Params when it
+    // builds the SubPlan for the containing SubLink.
+    let (scope_columns, varlevelsup) = match &sel.root_type {
+        Some(RootType::OuterReference(outer)) => {
+            let steps_out = outer.steps_out as usize;
+            if steps_out == 0 {
+                return Err("OuterReference with steps_out=0".into());
+            }
+            let scope = ctx.outer_scopes.get(steps_out - 1).ok_or_else(|| {
+                format!(
+                    "OuterReference steps_out={} but only {} enclosing scopes available",
+                    steps_out,
+                    ctx.outer_scopes.len()
+                )
+            })?;
+            (scope.as_slice(), steps_out as pg_sys::Index)
+        }
+        _ => (available_columns, 0),
+    };
+
+    // Look up the column in the resolved scope
+    if field_idx >= scope_columns.len() {
         return Err(format!(
             "Field index {} out of range (available: {})",
             field_idx,
-            available_columns.len()
+            scope_columns.len()
         )
         .into());
     }
 
-    let col = &available_columns[field_idx];
+    let col = &scope_columns[field_idx];
+
+    // Computed outer columns would require rewriting varlevelsup inside the
+    // stored expression; not supported until a plan needs it.
+    if varlevelsup > 0 && col.varno == 0 {
+        return Err(format!(
+            "Outer reference to computed column '{}' is not supported",
+            col.name
+        )
+        .into());
+    }
 
     // For computed columns (varno=0), copy the stored expression instead of creating a Var
     if col.varno == 0 {
@@ -190,19 +228,187 @@ unsafe fn convert_selection(
     var.vartype = col.type_oid;
     var.vartypmod = col.typmod;
     var.varcollid = col.collation;
-    var.varlevelsup = 0;
+    var.varlevelsup = varlevelsup;
     // PG17 required fields
     var.varnosyn = col.varno as u32;
     var.varattnosyn = col.varattno;
 
     pgrx::info!(
-        "DEBUG: Created Var node: varno={}, varattno={}, name='{}'",
+        "DEBUG: Created Var node: varno={}, varattno={}, varlevelsup={}, name='{}'",
         col.varno,
         col.varattno,
+        varlevelsup,
         col.name
     );
 
     Ok(var.into_pg() as *mut pg_sys::Expr)
+}
+
+/// Check whether a converted expression tree contains any Aggref nodes.
+/// Used to route post-aggregation filters to HAVING instead of WHERE.
+pub(super) unsafe fn contains_aggref(node: *mut pg_sys::Node) -> bool {
+    unsafe extern "C-unwind" fn walker(
+        node: *mut pg_sys::Node,
+        context: *mut std::ffi::c_void,
+    ) -> bool {
+        if node.is_null() {
+            return false;
+        }
+        if (*node).type_ == pg_sys::NodeTag::T_Aggref {
+            return true;
+        }
+        pg_sys::expression_tree_walker_impl(node, Some(walker), context)
+    }
+    if node.is_null() {
+        return false;
+    }
+    if (*node).type_ == pg_sys::NodeTag::T_Aggref {
+        return true;
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(walker), std::ptr::null_mut())
+}
+
+/// Convert a Substrait subquery expression to a PostgreSQL SubLink.
+///
+/// SubLinks are the parse-tree representation of subqueries; the standard
+/// planner converts them to SubPlans (or pulls them up into joins) and wires
+/// up Params for any correlated Vars (varlevelsup > 0), so no manual Param
+/// management is needed here.
+unsafe fn convert_subquery(
+    subquery: &substrait::proto::expression::Subquery,
+    available_columns: &[AvailableColumn],
+    ctx: &QueryBuildContext,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    use substrait::proto::expression::subquery::SubqueryType;
+
+    match &subquery.subquery_type {
+        Some(SubqueryType::Scalar(scalar)) => {
+            let input = scalar
+                .input
+                .as_ref()
+                .ok_or("Scalar subquery has no input")?;
+            let subselect = super::relations::build_subquery(input, available_columns, ctx)?;
+            create_sublink(
+                pg_sys::SubLinkType::EXPR_SUBLINK,
+                std::ptr::null_mut(),
+                subselect,
+                ctx,
+            )
+        }
+        Some(SubqueryType::InPredicate(in_pred)) => {
+            let haystack = in_pred
+                .haystack
+                .as_ref()
+                .ok_or("InPredicate subquery has no haystack")?;
+            let subselect = super::relations::build_subquery(haystack, available_columns, ctx)?;
+
+            // Build the test expression: needle_i = Param(PARAM_SUBLINK, i).
+            // The Params stand in for the subquery's output columns; the
+            // planner substitutes the real values when building the SubPlan.
+            if in_pred.needles.is_empty() {
+                return Err("InPredicate subquery has no needles".into());
+            }
+            let mut op_exprs: Vec<*mut pg_sys::Expr> = Vec::new();
+            for (i, needle) in in_pred.needles.iter().enumerate() {
+                let needle_expr = convert_expression_for_query(needle, available_columns, ctx)?;
+                let param = create_sublink_param(subselect, i)?;
+                op_exprs.push(create_op_expr("=", &[needle_expr, param])?);
+            }
+            let testexpr = if op_exprs.len() == 1 {
+                op_exprs[0]
+            } else {
+                create_bool_expr(
+                    pg_sys::BoolExprType::AND_EXPR as pg_sys::BoolExprType::Type,
+                    &op_exprs,
+                )?
+            };
+            create_sublink(
+                pg_sys::SubLinkType::ANY_SUBLINK,
+                testexpr as *mut pg_sys::Node,
+                subselect,
+                ctx,
+            )
+        }
+        Some(SubqueryType::SetPredicate(set_pred)) => {
+            use substrait::proto::expression::subquery::set_predicate::PredicateOp;
+
+            let tuples = set_pred
+                .tuples
+                .as_ref()
+                .ok_or("SetPredicate subquery has no tuples")?;
+            match set_pred.predicate_op() {
+                PredicateOp::Exists => {
+                    let subselect =
+                        super::relations::build_subquery(tuples, available_columns, ctx)?;
+                    create_sublink(
+                        pg_sys::SubLinkType::EXISTS_SUBLINK,
+                        std::ptr::null_mut(),
+                        subselect,
+                        ctx,
+                    )
+                }
+                other => Err(format!("Unsupported set predicate op: {:?}", other).into()),
+            }
+        }
+        Some(SubqueryType::SetComparison(_)) => {
+            Err("SetComparison subqueries not yet supported".into())
+        }
+        None => Err("Subquery missing subquery_type".into()),
+    }
+}
+
+/// Create a SubLink node wrapping a sub-Query.
+unsafe fn create_sublink(
+    link_type: pg_sys::SubLinkType::Type,
+    testexpr: *mut pg_sys::Node,
+    subselect: *mut pg_sys::Query,
+    ctx: &QueryBuildContext,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let mut sublink = pgrx::PgBox::<pg_sys::SubLink>::alloc0();
+    sublink.xpr.type_ = pg_sys::NodeTag::T_SubLink;
+    sublink.subLinkType = link_type;
+    sublink.subLinkId = 0;
+    sublink.testexpr = testexpr;
+    // operName is only used for display of explicit ANY/ALL operators;
+    // IN and scalar subqueries use NIL just as the parser does.
+    sublink.operName = std::ptr::null_mut();
+    sublink.subselect = subselect as *mut pg_sys::Node;
+    sublink.location = -1;
+
+    // The Query containing this SubLink must have hasSubLinks set.
+    ctx.has_sublinks.set(true);
+
+    Ok(sublink.into_pg() as *mut pg_sys::Expr)
+}
+
+/// Create a PARAM_SUBLINK Param representing the idx-th (0-based) output
+/// column of a subquery, for use in a SubLink test expression.
+unsafe fn create_sublink_param(
+    subselect: *mut pg_sys::Query,
+    idx: usize,
+) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
+    let tlist = (*subselect).targetList;
+    if tlist.is_null() || idx >= (*tlist).length as usize {
+        return Err(format!(
+            "Subquery has {} output columns but needle {} requires more",
+            if tlist.is_null() { 0 } else { (*tlist).length },
+            idx + 1
+        )
+        .into());
+    }
+    let te = pg_sys::list_nth(tlist, idx as i32) as *mut pg_sys::TargetEntry;
+    let te_expr = (*te).expr as *const pg_sys::Node;
+
+    let mut param = pgrx::PgBox::<pg_sys::Param>::alloc0();
+    param.xpr.type_ = pg_sys::NodeTag::T_Param;
+    param.paramkind = pg_sys::ParamKind::PARAM_SUBLINK;
+    param.paramid = (idx + 1) as i32; // 1-based subquery column position
+    param.paramtype = pg_sys::exprType(te_expr);
+    param.paramtypmod = pg_sys::exprTypmod(te_expr);
+    param.paramcollid = pg_sys::exprCollation(te_expr);
+    param.location = -1;
+
+    Ok(param.into_pg() as *mut pg_sys::Expr)
 }
 
 /// Convert a Substrait scalar function to a PostgreSQL expression.
@@ -498,12 +704,32 @@ fn select_common_type(left: pg_sys::Oid, right: pg_sys::Oid) -> pg_sys::Oid {
     pg_sys::InvalidOid
 }
 
-/// Coerce an expression to a target type using CoerceViaIO.
+/// Coerce an expression to a target type.
+///
+/// Uses PostgreSQL's own coercion machinery so the registered cast path is
+/// applied. This matters for semantics: e.g. bpchar -> text goes through
+/// rtrim1() which strips the blank padding, whereas an I/O coercion would
+/// keep it and make 'EUROPE'::char(25) compare unequal to 'EUROPE'.
 unsafe fn coerce_to_type(
     expr: *mut pg_sys::Expr,
-    _from_type: pg_sys::Oid,
+    from_type: pg_sys::Oid,
     to_type: pg_sys::Oid,
 ) -> *mut pg_sys::Expr {
+    let coerced = pg_sys::coerce_to_target_type(
+        std::ptr::null_mut(), // pstate - only used for error reporting
+        expr as *mut pg_sys::Node,
+        from_type,
+        to_type,
+        -1, // typmod
+        pg_sys::CoercionContext::COERCION_IMPLICIT,
+        pg_sys::CoercionForm::COERCE_IMPLICIT_CAST,
+        -1, // location
+    );
+    if !coerced.is_null() {
+        return coerced as *mut pg_sys::Expr;
+    }
+
+    // No implicit cast path exists; fall back to an I/O coercion.
     let mut coerce = pgrx::PgBox::<pg_sys::CoerceViaIO>::alloc0();
     coerce.xpr.type_ = pg_sys::NodeTag::T_CoerceViaIO;
     coerce.arg = expr;
@@ -592,7 +818,13 @@ unsafe fn create_func_call(
     func_expr.funcretset = false;
     func_expr.funcvariadic = false;
     func_expr.funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
-    func_expr.funccollid = pg_sys::InvalidOid;
+    // The result collation: sorting or grouping on this expression needs it
+    // when the function returns a collatable type (e.g. substring -> text).
+    func_expr.funccollid = if pg_sys::type_is_collatable(result_type) {
+        pg_sys::DEFAULT_COLLATION_OID
+    } else {
+        pg_sys::InvalidOid
+    };
 
     // Set inputcollid from arguments if any are collatable
     let mut input_coll = pg_sys::InvalidOid;

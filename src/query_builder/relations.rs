@@ -60,6 +60,27 @@ pub unsafe fn build_query_from_substrait(
     Ok(query)
 }
 
+/// Build a sub-Query for a SubLink from a Substrait relation.
+///
+/// The subquery gets its own build context (and thus its own range table),
+/// since each Query level in PostgreSQL has an independent rtable. The
+/// enclosing query levels' columns are pushed onto the outer scope stack so
+/// OuterReference field references resolve to Vars with varlevelsup > 0.
+pub(super) unsafe fn build_subquery(
+    rel: &Rel,
+    outer_columns: &[AvailableColumn],
+    outer_ctx: &QueryBuildContext,
+) -> Result<*mut pg_sys::Query, Box<dyn std::error::Error + Send + Sync>> {
+    let mut sub_ctx = QueryBuildContext::new(outer_ctx.function_map.clone());
+    sub_ctx.outer_scopes.push(outer_columns.to_vec());
+    sub_ctx
+        .outer_scopes
+        .extend(outer_ctx.outer_scopes.iter().cloned());
+
+    let parts = convert_rel_to_query_parts(rel, &mut sub_ctx)?;
+    build_query_from_parts(&parts, &mut sub_ctx)
+}
+
 /// Extract the root relation from a Substrait plan.
 fn get_root_relation(plan: &Plan) -> Result<&Rel, Box<dyn std::error::Error + Send + Sync>> {
     let plan_rel = plan.relations.first().ok_or("Plan has no relations")?;
@@ -195,6 +216,7 @@ unsafe fn convert_read_to_query_parts(
         from_item: rtref_ptr,
         available_columns,
         where_quals: None,
+        having_qual: None,
         target_list: None,
         group_clause: None,
         aggregates: Vec::new(),
@@ -329,8 +351,19 @@ unsafe fn convert_filter_to_query_parts(
         let qual_expr = convert_expression_for_query(condition, &parts.available_columns, ctx)?;
         pgrx::info!("DEBUG: Filter - filter condition converted");
 
-        // Combine with any existing quals (AND them together)
-        if let Some(existing) = parts.where_quals {
+        // A Filter above an Aggregate operates on aggregated rows: that is a
+        // HAVING clause. Putting it in the jointree quals would evaluate any
+        // Aggrefs in a scan node ("Aggref found in non-Agg plan node").
+        if parts.has_aggs {
+            pgrx::info!("DEBUG: Filter - input has aggregates, routing to HAVING");
+            if let Some(existing) = parts.having_qual {
+                let and_expr = create_and_expr(existing, qual_expr)?;
+                parts.having_qual = Some(and_expr);
+            } else {
+                parts.having_qual = Some(qual_expr);
+            }
+        } else if let Some(existing) = parts.where_quals {
+            // Combine with any existing quals (AND them together)
             pgrx::info!("DEBUG: Filter - combining with existing quals");
             let and_expr = create_and_expr(existing, qual_expr)?;
             parts.where_quals = Some(and_expr);
@@ -415,12 +448,46 @@ unsafe fn convert_project_to_query_parts(
     for (i, expr) in project.expressions.iter().enumerate() {
         let pg_expr = convert_expression_for_query(expr, &parts.available_columns, ctx)?;
 
+        // For field references, preserve ressortgroupref from the source
+        // column so a groupClause carried up from an Aggregate below still
+        // finds its grouping columns in this new target list.
+        let ressortgroupref =
+            if let Some(substrait::proto::expression::RexType::Selection(sel)) = &expr.rex_type {
+                if let Some(
+                    substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                        direct,
+                    ),
+                ) = &sel.reference_type
+                {
+                    if let Some(
+                        substrait::proto::expression::reference_segment::ReferenceType::StructField(
+                            field,
+                        ),
+                    ) = &direct.reference_type
+                    {
+                        let field_idx = field.field as usize;
+                        if field_idx < parts.available_columns.len() {
+                            parts.available_columns[field_idx].ressortgroupref
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
         // Create TargetEntry
         let mut te = pgrx::PgBox::<pg_sys::TargetEntry>::alloc0();
         te.xpr.type_ = pg_sys::NodeTag::T_TargetEntry;
         te.expr = pg_expr;
         te.resno = (i + 1) as i16;
         te.resname = create_cstring(&format!("col{}", i + 1));
+        te.ressortgroupref = ressortgroupref;
         te.resjunk = false;
         let te = te.into_pg();
 
@@ -486,37 +553,6 @@ unsafe fn convert_project_to_query_parts(
             expr_coll = pg_sys::DEFAULT_COLLATION_OID;
         }
 
-        // For field references, preserve ressortgroupref from source column
-        let ressortgroupref =
-            if let Some(substrait::proto::expression::RexType::Selection(sel)) = &expr.rex_type {
-                if let Some(
-                    substrait::proto::expression::field_reference::ReferenceType::DirectReference(
-                        direct,
-                    ),
-                ) = &sel.reference_type
-                {
-                    if let Some(
-                        substrait::proto::expression::reference_segment::ReferenceType::StructField(
-                            field,
-                        ),
-                    ) = &direct.reference_type
-                    {
-                        let field_idx = field.field as usize;
-                        if field_idx < parts.available_columns.len() {
-                            parts.available_columns[field_idx].ressortgroupref
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-
         new_available_columns.push(AvailableColumn {
             varno,
             varattno,
@@ -527,6 +563,46 @@ unsafe fn convert_project_to_query_parts(
             computed_expr,
             ressortgroupref,
         });
+    }
+
+    // Grouping/sorting columns the projection dropped must stay in the
+    // target list as junk entries: the group and sort clauses reference
+    // them by ressortgroupref.
+    let mut needed_refs: Vec<u32> = Vec::new();
+    for clause in [parts.group_clause, parts.sort_clause]
+        .into_iter()
+        .flatten()
+    {
+        for k in 0..pg_sys::list_length(clause) {
+            let sgc = pg_sys::list_nth(clause, k) as *mut pg_sys::SortGroupClause;
+            needed_refs.push((*sgc).tleSortGroupRef);
+        }
+    }
+    if let Some(child_tlist) = parts.target_list {
+        for needed in needed_refs {
+            let mut present = false;
+            for k in 0..pg_sys::list_length(target_list) {
+                let te = pg_sys::list_nth(target_list, k) as *mut pg_sys::TargetEntry;
+                if (*te).ressortgroupref == needed {
+                    present = true;
+                    break;
+                }
+            }
+            if present {
+                continue;
+            }
+            for k in 0..pg_sys::list_length(child_tlist) {
+                let te = pg_sys::list_nth(child_tlist, k) as *mut pg_sys::TargetEntry;
+                if (*te).ressortgroupref == needed {
+                    let copy = pg_sys::copyObjectImpl(te as *const std::ffi::c_void)
+                        as *mut pg_sys::TargetEntry;
+                    (*copy).resno = (pg_sys::list_length(target_list) + 1) as i16;
+                    (*copy).resjunk = true;
+                    target_list = pg_sys::lappend(target_list, copy as *mut std::ffi::c_void);
+                    break;
+                }
+            }
+        }
     }
 
     parts.target_list = Some(target_list);
@@ -588,6 +664,7 @@ unsafe fn convert_join_to_query_parts(
         from_item: join_expr,
         available_columns: combined_columns,
         where_quals,
+        having_qual: combine_quals(left_parts.having_qual, right_parts.having_qual)?,
         target_list: None,
         group_clause: None,
         aggregates: Vec::new(),
@@ -633,6 +710,7 @@ unsafe fn convert_cross_to_query_parts(
         from_item: join_expr,
         available_columns: combined_columns,
         where_quals,
+        having_qual: combine_quals(left_parts.having_qual, right_parts.having_qual)?,
         target_list: None,
         group_clause: None,
         aggregates: Vec::new(),
@@ -643,13 +721,134 @@ unsafe fn convert_cross_to_query_parts(
     })
 }
 
+/// Check whether a Substrait relation subtree contains an Aggregate.
+fn rel_contains_aggregate(rel: &Rel) -> bool {
+    match &rel.rel_type {
+        Some(RelType::Aggregate(_)) => true,
+        Some(RelType::Filter(f)) => f.input.as_deref().is_some_and(rel_contains_aggregate),
+        Some(RelType::Project(p)) => p.input.as_deref().is_some_and(rel_contains_aggregate),
+        Some(RelType::Sort(s)) => s.input.as_deref().is_some_and(rel_contains_aggregate),
+        Some(RelType::Fetch(f)) => f.input.as_deref().is_some_and(rel_contains_aggregate),
+        Some(RelType::Join(j)) => {
+            j.left.as_deref().is_some_and(rel_contains_aggregate)
+                || j.right.as_deref().is_some_and(rel_contains_aggregate)
+        }
+        Some(RelType::Cross(c)) => {
+            c.left.as_deref().is_some_and(rel_contains_aggregate)
+                || c.right.as_deref().is_some_and(rel_contains_aggregate)
+        }
+        _ => false,
+    }
+}
+
+/// Convert a relation subtree into an RTE_SUBQUERY (derived table).
+///
+/// Needed when a subtree cannot be flattened into the enclosing Query level,
+/// e.g. an Aggregate whose input is itself aggregated (TPC-H Q13). The
+/// subtree becomes its own Query with its own range table; the enclosing
+/// query sees its output columns through a subquery RTE.
+unsafe fn convert_rel_as_subquery_rte(
+    rel: &Rel,
+    ctx: &mut QueryBuildContext,
+) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
+    let mut sub_ctx = QueryBuildContext::new(ctx.function_map.clone());
+    sub_ctx.outer_scopes = ctx.outer_scopes.clone();
+    let sub_parts = convert_rel_to_query_parts(rel, &mut sub_ctx)?;
+    let subquery = build_query_from_parts(&sub_parts, &mut sub_ctx)?;
+
+    // Collect output column names and build the eref column list.
+    let tlist = (*subquery).targetList;
+    let mut colnames: *mut pg_sys::List = std::ptr::null_mut();
+    let n_cols = pg_sys::list_length(tlist);
+    for k in 0..n_cols {
+        let te = pg_sys::list_nth(tlist, k) as *mut pg_sys::TargetEntry;
+        let name = if (*te).resname.is_null() {
+            format!("col{}", k + 1)
+        } else {
+            std::ffi::CStr::from_ptr((*te).resname)
+                .to_string_lossy()
+                .to_string()
+        };
+        let name_val = pg_sys::makeString(create_cstring(&name));
+        colnames = pg_sys::lappend(colnames, name_val as *mut std::ffi::c_void);
+    }
+
+    // Build the subquery RTE.
+    let alias_name = ctx.next_alias();
+    let rte = pgrx::PgBox::<pg_sys::RangeTblEntry>::alloc0();
+    let rte = rte.into_pg();
+    (*rte).type_ = pg_sys::NodeTag::T_RangeTblEntry;
+    (*rte).rtekind = pg_sys::RTEKind::RTE_SUBQUERY;
+    (*rte).subquery = subquery;
+    (*rte).lateral = false;
+    (*rte).inFromCl = true;
+    let eref = pgrx::PgBox::<pg_sys::Alias>::alloc0();
+    let eref = eref.into_pg();
+    (*eref).type_ = pg_sys::NodeTag::T_Alias;
+    (*eref).aliasname = create_cstring(&alias_name);
+    (*eref).colnames = colnames;
+    (*rte).eref = eref;
+    (*rte).alias = std::ptr::null_mut();
+
+    let rtindex = ctx.add_non_table_rte(rte, &alias_name);
+
+    // Expose the subquery's output columns to the enclosing query.
+    let mut available_columns = Vec::new();
+    for k in 0..n_cols {
+        let te = pg_sys::list_nth(tlist, k) as *mut pg_sys::TargetEntry;
+        let te_expr = (*te).expr as *const pg_sys::Node;
+        let name = if (*te).resname.is_null() {
+            format!("col{}", k + 1)
+        } else {
+            std::ffi::CStr::from_ptr((*te).resname)
+                .to_string_lossy()
+                .to_string()
+        };
+        available_columns.push(AvailableColumn {
+            varno: rtindex,
+            varattno: (k + 1) as i16,
+            name,
+            type_oid: pg_sys::exprType(te_expr),
+            typmod: pg_sys::exprTypmod(te_expr),
+            collation: pg_sys::exprCollation(te_expr),
+            computed_expr: None,
+            ressortgroupref: 0,
+        });
+    }
+
+    let mut rtref = pgrx::PgBox::<pg_sys::RangeTblRef>::alloc0();
+    rtref.type_ = pg_sys::NodeTag::T_RangeTblRef;
+    rtref.rtindex = rtindex;
+    let rtref_ptr = rtref.into_pg() as *mut pg_sys::Node;
+
+    Ok(QueryParts {
+        from_item: rtref_ptr,
+        available_columns,
+        where_quals: None,
+        having_qual: None,
+        target_list: None,
+        group_clause: None,
+        aggregates: Vec::new(),
+        sort_clause: None,
+        limit_count: None,
+        limit_offset: None,
+        has_aggs: false,
+    })
+}
+
 /// Convert an Aggregate relation to QueryParts.
 unsafe fn convert_aggregate_to_query_parts(
     agg: &substrait::proto::AggregateRel,
     ctx: &mut QueryBuildContext,
 ) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
     let input = agg.input.as_ref().ok_or("Aggregate has no input")?;
-    let parts = convert_rel_to_query_parts(input, ctx)?;
+    // An already-aggregated input cannot share this Query level (its Aggrefs
+    // would leak into scan nodes); make it a derived table instead.
+    let parts = if rel_contains_aggregate(input) {
+        convert_rel_as_subquery_rte(input, ctx)?
+    } else {
+        convert_rel_to_query_parts(input, ctx)?
+    };
 
     // Build target list with grouping columns and aggregate functions
     let mut target_list: *mut pg_sys::List = std::ptr::null_mut();
@@ -846,6 +1045,7 @@ unsafe fn convert_aggregate_to_query_parts(
         from_item: parts.from_item,
         available_columns: new_available_columns,
         where_quals: parts.where_quals,
+        having_qual: parts.having_qual,
         target_list: if target_list.is_null() {
             None
         } else {
@@ -869,12 +1069,120 @@ unsafe fn convert_sort_to_query_parts(
     sort: &substrait::proto::SortRel,
     ctx: &mut QueryBuildContext,
 ) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
-    let input = sort.input.as_ref().ok_or("Sort has no input")?;
-    let parts = convert_rel_to_query_parts(input, ctx)?;
+    use substrait::proto::sort_field::{SortDirection, SortKind};
 
-    // TODO: Build sortClause from sort.sorts
-    // For now, just pass through - the planner will handle ordering
+    let input = sort.input.as_ref().ok_or("Sort has no input")?;
+    let mut parts = convert_rel_to_query_parts(input, ctx)?;
+
+    if sort.sorts.is_empty() {
+        return Ok(parts);
+    }
+
+    // Sort keys reference target list entries via ressortgroupref, so
+    // materialize the implicit SELECT * list if the input didn't build one.
+    let target_list = match parts.target_list {
+        Some(tl) => tl,
+        None => {
+            let tl = build_select_star_target_list(&parts.available_columns)?;
+            parts.target_list = Some(tl);
+            tl
+        }
+    };
+
+    // Continue numbering after any refs already assigned (e.g. by GROUP BY).
+    let mut next_ref: u32 = 1;
+    for k in 0..pg_sys::list_length(target_list) {
+        let te = pg_sys::list_nth(target_list, k) as *mut pg_sys::TargetEntry;
+        if (*te).ressortgroupref >= next_ref {
+            next_ref = (*te).ressortgroupref + 1;
+        }
+    }
+
+    let mut sort_clause: *mut pg_sys::List = std::ptr::null_mut();
+
+    for field in &sort.sorts {
+        // Sort keys index the input relation's output columns, which map
+        // 1:1 onto the target list built by the input conversion.
+        let field_idx = extract_field_index(field.expr.as_ref().ok_or("Sort field has no expr")?)
+            .ok_or("Sort key must be a direct field reference")?;
+        if field_idx >= pg_sys::list_length(target_list) as usize {
+            return Err(format!(
+                "Sort field index {} out of range ({} target entries)",
+                field_idx,
+                pg_sys::list_length(target_list)
+            )
+            .into());
+        }
+        let te = pg_sys::list_nth(target_list, field_idx as i32) as *mut pg_sys::TargetEntry;
+        if (*te).ressortgroupref == 0 {
+            (*te).ressortgroupref = next_ref;
+            next_ref += 1;
+        }
+
+        // Look up the ordering operators for the sort key's type.
+        let expr_type = pg_sys::exprType((*te).expr as *const pg_sys::Node);
+        let mut ltop: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut eqop: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut gtop: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut hashable: bool = false;
+        pg_sys::get_sort_group_operators(
+            expr_type,
+            true, // needLT
+            true, // needEQ
+            true, // needGT
+            &mut ltop,
+            &mut eqop,
+            &mut gtop,
+            &mut hashable,
+        );
+
+        let direction = match &field.sort_kind {
+            Some(SortKind::Direction(d)) => {
+                SortDirection::try_from(*d).map_err(|_| format!("Unknown sort direction: {}", d))?
+            }
+            Some(SortKind::ComparisonFunctionReference(_)) => {
+                return Err("Sort by comparison function is not supported".into());
+            }
+            None => return Err("Sort field has no sort_kind".into()),
+        };
+        let (sortop, nulls_first) = match direction {
+            SortDirection::AscNullsFirst => (ltop, true),
+            SortDirection::AscNullsLast | SortDirection::Unspecified => (ltop, false),
+            SortDirection::DescNullsFirst => (gtop, true),
+            SortDirection::DescNullsLast => (gtop, false),
+            SortDirection::Clustered => {
+                return Err("Clustered sort direction is not supported".into());
+            }
+        };
+
+        let mut sgc = pgrx::PgBox::<pg_sys::SortGroupClause>::alloc0();
+        sgc.type_ = pg_sys::NodeTag::T_SortGroupClause;
+        sgc.tleSortGroupRef = (*te).ressortgroupref;
+        sgc.eqop = eqop;
+        sgc.sortop = sortop;
+        sgc.nulls_first = nulls_first;
+        sgc.hashable = hashable;
+        sort_clause = pg_sys::lappend(sort_clause, sgc.into_pg() as *mut std::ffi::c_void);
+    }
+
+    parts.sort_clause = Some(sort_clause);
     Ok(parts)
+}
+
+/// Extract the field index from a direct StructField reference expression.
+fn extract_field_index(expr: &substrait::proto::Expression) -> Option<usize> {
+    use substrait::proto::expression::field_reference::ReferenceType;
+    use substrait::proto::expression::reference_segment::ReferenceType as SegRefType;
+    use substrait::proto::expression::RexType;
+
+    if let Some(RexType::Selection(sel)) = &expr.rex_type {
+        if let Some(ReferenceType::DirectReference(direct)) = &sel.reference_type {
+            if let Some(SegRefType::StructField(sf)) = &direct.reference_type {
+                return Some(sf.field as usize);
+            }
+        }
+    }
+    None
 }
 
 /// Convert a Fetch relation (LIMIT/OFFSET) to QueryParts.
@@ -977,6 +1285,11 @@ unsafe fn build_query_from_parts(
         (*query).groupClause = gc;
     }
 
+    // Set HAVING
+    if let Some(hq) = parts.having_qual {
+        (*query).havingQual = hq as *mut pg_sys::Node;
+    }
+
     // Set ORDER BY
     if let Some(sc) = parts.sort_clause {
         (*query).sortClause = sc;
@@ -992,7 +1305,7 @@ unsafe fn build_query_from_parts(
 
     // Set flags
     (*query).hasAggs = parts.has_aggs;
-    (*query).hasSubLinks = false; // TODO: detect subqueries
+    (*query).hasSubLinks = ctx.has_sublinks.get();
 
     Ok(query)
 }
