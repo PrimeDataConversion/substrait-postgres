@@ -740,20 +740,14 @@ fn extract_column_index_from_expression(expr: &substrait::proto::Expression) -> 
         Some(RexType::Selection(selection)) => {
             // FieldReference has reference_type: DirectReference or MaskedReference
             if let Some(ref_type) = &selection.reference_type {
-                match ref_type {
-                    FieldRefType::DirectReference(ref_seg) => {
-                        // ReferenceSegment has reference_type with StructField
-                        if let Some(seg_type) = &ref_seg.reference_type {
-                            match seg_type {
-                                SegmentRefType::StructField(sf) => {
-                                    // Substrait uses 0-based indices, PostgreSQL uses 1-based
-                                    return (sf.field + 1) as i16;
-                                }
-                                _ => {}
-                            }
+                if let FieldRefType::DirectReference(ref_seg) = ref_type {
+                    // ReferenceSegment has reference_type with StructField
+                    if let Some(seg_type) = &ref_seg.reference_type {
+                        if let SegmentRefType::StructField(sf) = seg_type {
+                            // Substrait uses 0-based indices, PostgreSQL uses 1-based
+                            return (sf.field + 1) as i16;
                         }
                     }
-                    _ => {}
                 }
             }
             1 // Default to first column if extraction fails

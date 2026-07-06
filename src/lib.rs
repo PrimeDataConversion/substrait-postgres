@@ -11,70 +11,14 @@ use executor::execute_postgres_plan;
 
 pgrx::pg_module_magic!();
 
-/// Validates that the AS clause types match the plan's output types
-unsafe fn validate_as_clause_against_plan(
-    expected_tupdesc: *mut pg_sys::TupleDescData,
-    plan_targetlist: *mut pg_sys::List,
-) -> Result<(), String> {
-    // Get the plan's output types from its targetlist
-    let plan_tupdesc = pg_sys::ExecTypeFromTL(plan_targetlist);
-    if plan_tupdesc.is_null() {
-        return Err("Failed to get tuple descriptor from plan targetlist".to_string());
-    }
-
-    let expected_natts = (*expected_tupdesc).natts;
-    let plan_natts = (*plan_tupdesc).natts;
-
-    // Check column count
-    if expected_natts != plan_natts {
-        pg_sys::FreeTupleDesc(plan_tupdesc);
-        return Err(format!(
-            "Column count mismatch: AS clause expects {expected_natts} columns but plan generates {plan_natts} columns"
-        ));
-    }
-
-    // Check each column type
-    for i in 0..expected_natts {
-        let expected_attr = (*expected_tupdesc).attrs.as_ptr().add(i as usize);
-        let plan_attr = (*plan_tupdesc).attrs.as_ptr().add(i as usize);
-
-        let expected_type = (*expected_attr).atttypid;
-        let plan_type = (*plan_attr).atttypid;
-
-        if expected_type != plan_type {
-            // Get type names for error message
-            let expected_name = pg_sys::format_type_be(expected_type);
-            let plan_name = pg_sys::format_type_be(plan_type);
-
-            let expected_str = if !expected_name.is_null() {
-                std::ffi::CStr::from_ptr(expected_name).to_string_lossy()
-            } else {
-                format!("OID {}", expected_type.to_u32()).into()
-            };
-
-            let plan_str = if !plan_name.is_null() {
-                std::ffi::CStr::from_ptr(plan_name).to_string_lossy()
-            } else {
-                format!("OID {}", plan_type.to_u32()).into()
-            };
-
-            pg_sys::FreeTupleDesc(plan_tupdesc);
-            return Err(format!(
-                "Type mismatch at column {i}: AS clause expects {expected_str} but plan generates {plan_str}"
-            ));
-        }
-    }
-
-    // Clean up the temporary descriptor before returning
-    pg_sys::FreeTupleDesc(plan_tupdesc);
-
-    Ok(())
-}
-
 // Static variable to store the previous planner hook
 static PREV_PLANNER_HOOK: Mutex<pg_sys::planner_hook_type> = Mutex::new(None);
 
 /// Custom planner function that intercepts calls to from_substrait functions
+///
+/// # Safety
+/// Called by PostgreSQL as a planner hook; all pointer arguments must be the
+/// ones PostgreSQL passes to planner hooks.
 #[no_mangle]
 pub unsafe extern "C-unwind" fn substrait_planner_hook(
     parse: *mut pg_sys::Query,
@@ -167,7 +111,7 @@ fn debug_postgresql_execution() -> Result<String, Box<dyn std::error::Error + Se
         pgrx::info!("DEBUG: Query parsed, about to analyze");
 
         // Get the first statement
-        let stmt_list = raw_parse_tree as *mut pg_sys::List;
+        let stmt_list = raw_parse_tree;
         let raw_stmt = pg_sys::list_nth(stmt_list, 0) as *mut pg_sys::RawStmt;
 
         // Analyze the statement
@@ -560,7 +504,7 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                     fcinfo,
                     postgres_plan,
                     column_names,
-                    range_table as *mut pg_sys::List,
+                    range_table,
                     subplans,
                 )
             });
@@ -577,199 +521,6 @@ unsafe fn execute_substrait_as_srf(fcinfo: pg_sys::FunctionCallInfo, plan: Plan)
                     pgrx::error!("SRF call panicked");
                 }
             }
-        }
-        Err(e) => {
-            pgrx::error!("Failed to translate Substrait plan: {}", e);
-        }
-    }
-}
-
-/// Fixed handler for literal results that preserves type information
-unsafe fn handle_literal_result_properly(
-    fcinfo: pg_sys::FunctionCallInfo,
-    postgres_plan: *mut pg_sys::Plan,
-    column_names: Vec<String>,
-    range_table: *mut pg_sys::List,
-) -> pg_sys::Datum {
-    pgrx::info!("DEBUG: handle_literal_result_properly ENTRY");
-    pgrx::info!("DEBUG: handle_literal_result_properly: fcinfo={:p}, postgres_plan={:p}, column_names={:?}, range_table={:p}",
-                fcinfo, postgres_plan, column_names, range_table);
-
-    // Get the result info and expected tuple descriptor
-    let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-    if result_info.is_null() || (*result_info).expectedDesc.is_null() {
-        pgrx::error!("SETOF RECORD function requires AS clause");
-    }
-
-    let expected_tupdesc = (*result_info).expectedDesc;
-    pgrx::info!("DEBUG: AS clause has {} attrs", (*expected_tupdesc).natts);
-
-    // Execute the plan to get the actual result
-    pgrx::info!("DEBUG: Calling execute_postgres_plan from handle_literal_result_properly");
-    let execution_result =
-        match execute_postgres_plan(postgres_plan, column_names.clone(), range_table, vec![]) {
-            Ok(result) => result,
-            Err(e) => {
-                pgrx::error!("Failed to execute plan for literal result: {}", e);
-            }
-        };
-    pgrx::info!("DEBUG: execute_postgres_plan returned successfully");
-
-    // For single result functions, we can return the value directly using ValuePerCall mode
-    (*result_info).returnMode = pg_sys::SetFunctionReturnMode::SFRM_ValuePerCall;
-    (*result_info).isDone = pg_sys::ExprDoneCond::ExprSingleResult;
-
-    // Extract the actual computed value from the execution result
-    // Use pgrx safe memory allocation for Datum and null arrays
-    let values =
-        unsafe { pgrx::PgMemoryContexts::CurrentMemoryContext.palloc0_struct::<pg_sys::Datum>() };
-    let nulls = unsafe { pgrx::PgMemoryContexts::CurrentMemoryContext.palloc0_struct::<bool>() };
-
-    if execution_result.rows.is_empty() || execution_result.rows[0].is_empty() {
-        // No results - return NULL
-        *nulls = true;
-        *values = pg_sys::Datum::from(0);
-    } else {
-        // Use the actual computed value from the first row, first column
-        *values = execution_result.rows[0][0];
-        *nulls = execution_result.nulls[0][0];
-    }
-
-    pgrx::info!("DEBUG: Using actual computed value from plan execution");
-
-    // Use the expected tuple descriptor directly without blessing
-    let tuple = pg_sys::heap_form_tuple(expected_tupdesc, values, nulls);
-    pgrx::info!("DEBUG: Created tuple with actual computed value");
-
-    // Return as HeapTupleHeader datum (not HeapTuple pointer)
-    let tuple_data = (*tuple).t_data;
-    pg_sys::Datum::from(tuple_data as usize)
-}
-
-/// Handler for multi-column table scan results
-unsafe fn handle_table_scan_properly(
-    fcinfo: pg_sys::FunctionCallInfo,
-    postgres_plan: *mut pg_sys::Plan,
-    column_names: Vec<String>,
-    range_table: *mut pg_sys::List,
-) -> pg_sys::Datum {
-    pgrx::info!(
-        "DEBUG: handle_table_scan_properly ENTRY with {} columns",
-        column_names.len()
-    );
-
-    // Get the result info and expected tuple descriptor
-    let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-    if result_info.is_null() || (*result_info).expectedDesc.is_null() {
-        pgrx::error!("SETOF RECORD function requires AS clause");
-    }
-
-    let expected_tupdesc = (*result_info).expectedDesc;
-    pgrx::info!("DEBUG: AS clause has {} attrs", (*expected_tupdesc).natts);
-
-    // Switch to the correct memory context for the tuplestore
-    let old_context = pg_sys::MemoryContextSwitchTo((*(*fcinfo).flinfo).fn_mcxt);
-
-    // Use Materialized mode for multi-row results
-    (*result_info).returnMode = pg_sys::SetFunctionReturnMode::SFRM_Materialize;
-
-    pgrx::info!("DEBUG: About to call execute_simple_table_scan");
-    pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
-    pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
-
-    // Execute the full PostgreSQL plan to get actual computed results
-    let execution_result =
-        match execute_postgres_plan(postgres_plan, column_names, range_table, vec![]) {
-            Ok(result) => result,
-            Err(e) => {
-                pg_sys::MemoryContextSwitchTo(old_context);
-                pgrx::error!("Plan execution failed: {}", e);
-            }
-        };
-
-    // Convert the execution result to a tuplestore
-    let tuplestore = convert_execution_result_to_tuplestore(&execution_result, expected_tupdesc)
-        .unwrap_or_else(|e| {
-            pg_sys::MemoryContextSwitchTo(old_context);
-            pgrx::error!("Failed to convert execution result to tuplestore: {}", e);
-        });
-
-    pgrx::info!("DEBUG: execute_simple_table_scan returned successfully");
-
-    pgrx::info!("DEBUG: Got tuplestore from plan execution");
-
-    // Set the required fields for Materialize mode
-    (*result_info).setResult = tuplestore;
-    (*result_info).setDesc = pg_sys::BlessTupleDesc(expected_tupdesc);
-    (*result_info).allowedModes = pg_sys::SetFunctionReturnMode::SFRM_Materialize_Random as i32
-        | pg_sys::SetFunctionReturnMode::SFRM_Materialize as i32;
-
-    // Switch back to the original context
-    pg_sys::MemoryContextSwitchTo(old_context);
-
-    pgrx::info!("DEBUG: About to return from handle_table_scan_properly");
-
-    pg_sys::Datum::from(0) // Return value is ignored in Materialize mode
-}
-
-unsafe fn execute_substrait_as_srf_with_function_map(
-    fcinfo: pg_sys::FunctionCallInfo,
-    plan: Plan,
-    function_map: std::collections::HashMap<u32, String>,
-) -> pg_sys::Datum {
-    pgrx::info!("Starting execute_substrait_as_srf_with_function_map");
-    // Use translation with pre-built function map to avoid memory context issues
-    match plan_translator::translate_substrait_plan_with_function_map(&plan, function_map) {
-        Ok((postgres_plan, column_names, range_table, subplans)) => {
-            pgrx::info!("Translation successful, calling executor SRF");
-            pgrx::info!(
-                "DEBUG: About to call executor with {} column names",
-                column_names.len()
-            );
-            for (i, name) in column_names.iter().enumerate() {
-                pgrx::info!("DEBUG: Column {}: {}", i, name);
-            }
-
-            // CRITICAL: Validate AS clause types match our plan output BEFORE execution
-            pgrx::info!("DEBUG: Validating AS clause against plan output types");
-
-            // Get the AS clause descriptor
-            let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
-            if !result_info.is_null() && !(*result_info).expectedDesc.is_null() {
-                let expected_tupdesc = (*result_info).expectedDesc;
-
-                // Validate that AS clause matches plan output
-                match validate_as_clause_against_plan(expected_tupdesc, (*postgres_plan).targetlist)
-                {
-                    Ok(()) => {
-                        pgrx::info!("DEBUG: AS clause validation passed - all types match!");
-                    }
-                    Err(err) => {
-                        pgrx::error!("{}", err);
-                    }
-                }
-            }
-
-            // Execute plan using proper SRF mechanism
-            pgrx::info!(
-                "DEBUG: Executing plan with {} columns: {:?}",
-                column_names.len(),
-                column_names
-            );
-            pgrx::info!("DEBUG: postgres_plan pointer: {:p}", postgres_plan);
-            pgrx::info!("DEBUG: range_table pointer: {:p}", range_table);
-
-            pgrx::info!("DEBUG: About to call execute_postgres_plan_as_srf");
-            pgrx::info!("DEBUG: Passing {} subplans to executor", subplans.len());
-            let result = crate::executor::execute_postgres_plan_as_srf(
-                fcinfo,
-                postgres_plan,
-                column_names,
-                range_table as *mut pg_sys::List,
-                subplans,
-            );
-            pgrx::info!("DEBUG: execute_postgres_plan_as_srf completed");
-            result
         }
         Err(e) => {
             pgrx::error!("Failed to translate Substrait plan: {}", e);
@@ -4153,229 +3904,6 @@ pub mod pg_test {
     }
 }
 
-/// Simple table scan execution that avoids complex executor setup
-/// This directly scans the table without using PostgreSQL's complex executor
-unsafe fn execute_simple_table_scan(
-    postgres_plan: *mut pg_sys::Plan,
-    _column_names: &[String],
-    expected_tupdesc: *mut pg_sys::TupleDescData,
-    range_table: *mut pg_sys::List,
-) -> Result<*mut pg_sys::Tuplestorestate, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!("DEBUG: execute_simple_table_scan ENTRY");
-
-    // Extract table OID from the plan tree - need to find SeqScan nodes and get their scanrelid
-    let table_oid = extract_table_oid_from_plan_tree(postgres_plan, range_table)?;
-    pgrx::info!("DEBUG: Table OID from plan: {}", table_oid);
-
-    // Create tuplestore for results
-    let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
-    if tuplestore.is_null() {
-        return Err("Failed to create tuplestore".into());
-    }
-
-    // Open the table for reading
-    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
-    if relation.is_null() {
-        return Err(format!("Could not open relation with OID {table_oid}").into());
-    }
-
-    pgrx::info!("DEBUG: Opened table successfully");
-
-    // Get tuple descriptor from relation
-    let _rel_tupdesc = (*relation).rd_att;
-
-    // Create a simple table scan using PostgreSQL's heap scan
-    let scan_desc = pg_sys::table_beginscan(
-        relation,
-        pg_sys::GetActiveSnapshot(),
-        0,
-        std::ptr::null_mut(),
-    );
-    if scan_desc.is_null() {
-        pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
-        return Err("Failed to begin table scan".into());
-    }
-
-    pgrx::info!("DEBUG: Started table scan");
-
-    // Scan through all tuples
-    let mut tuple_count = 0;
-    loop {
-        let tuple = pg_sys::heap_getnext(scan_desc, pg_sys::ScanDirection::ForwardScanDirection);
-        if tuple.is_null() {
-            break; // No more tuples
-        }
-
-        // Create a tuple table slot for this tuple - use HeapTuple ops for heap tuples
-        let slot = pg_sys::MakeTupleTableSlot(expected_tupdesc, &pg_sys::TTSOpsHeapTuple);
-
-        // Store the tuple in the slot (convert from heap tuple to slot)
-        pg_sys::ExecStoreHeapTuple(tuple, slot, false);
-
-        // Add to tuplestore
-        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
-
-        // Clean up slot
-        pg_sys::ExecDropSingleTupleTableSlot(slot);
-
-        tuple_count += 1;
-
-        // Safety limit
-        if tuple_count > 10000 {
-            pgrx::warning!("Table scan limit reached, stopping at 10000 tuples");
-            break;
-        }
-    }
-
-    pgrx::info!("DEBUG: Scanned {} tuples", tuple_count);
-
-    // Clean up scan
-    pg_sys::table_endscan(scan_desc);
-    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
-
-    pgrx::info!("DEBUG: Table scan completed successfully");
-
-    Ok(tuplestore)
-}
-
-/// Convert ExecutionResult to a PostgreSQL tuplestore
-unsafe fn convert_execution_result_to_tuplestore(
-    execution_result: &crate::plan_translator::ExecutionResult,
-    expected_tupdesc: *mut pg_sys::TupleDescData,
-) -> Result<*mut pg_sys::Tuplestorestate, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!("DEBUG: Converting ExecutionResult to tuplestore");
-
-    // Create tuplestore for results
-    let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
-    if tuplestore.is_null() {
-        return Err("Failed to create tuplestore".into());
-    }
-
-    pgrx::info!(
-        "DEBUG: Created tuplestore, processing {} rows",
-        execution_result.rows.len()
-    );
-
-    // Process each row in the execution result
-    for (row_idx, row_data) in execution_result.rows.iter().enumerate() {
-        let row_nulls = &execution_result.nulls[row_idx];
-
-        // Create arrays for this row's data
-        // Use pgrx safe memory allocation for row arrays
-        let values = unsafe {
-            pgrx::PgMemoryContexts::CurrentMemoryContext
-                .palloc0_slice::<pg_sys::Datum>(row_data.len())
-                .as_mut_ptr()
-        };
-        let nulls = unsafe {
-            pgrx::PgMemoryContexts::CurrentMemoryContext
-                .palloc0_slice::<bool>(row_data.len())
-                .as_mut_ptr()
-        };
-
-        // Copy the data and null flags
-        for (col_idx, &datum) in row_data.iter().enumerate() {
-            *values.add(col_idx) = datum;
-            *nulls.add(col_idx) = row_nulls[col_idx];
-        }
-
-        // Create a tuple and add it to the tuplestore
-        let tuple = pg_sys::heap_form_tuple(expected_tupdesc, values, nulls);
-        let slot = pg_sys::MakeTupleTableSlot(expected_tupdesc, &pg_sys::TTSOpsHeapTuple);
-        pg_sys::ExecStoreHeapTuple(tuple, slot, false);
-        pg_sys::tuplestore_puttupleslot(tuplestore, slot);
-        pg_sys::ExecDropSingleTupleTableSlot(slot);
-
-        // Clean up for this row
-        pg_sys::pfree(values as *mut std::ffi::c_void);
-        pg_sys::pfree(nulls as *mut std::ffi::c_void);
-    }
-
-    pgrx::info!(
-        "DEBUG: Successfully converted {} rows to tuplestore",
-        execution_result.rows.len()
-    );
-    Ok(tuplestore)
-}
-
-/// Extract table OID from PostgreSQL plan tree by finding SeqScan nodes
-unsafe fn extract_table_oid_from_plan_tree(
-    plan: *mut pg_sys::Plan,
-    range_table: *mut pg_sys::List,
-) -> Result<pg_sys::Oid, Box<dyn std::error::Error + Send + Sync>> {
-    if plan.is_null() {
-        return Err("Plan is null".into());
-    }
-
-    pgrx::info!(
-        "DEBUG: extract_table_oid_from_plan_tree - plan type: {:?}",
-        (*plan).type_
-    );
-
-    // Recursively traverse the plan tree to find SeqScan nodes
-    match (*plan).type_ {
-        pg_sys::NodeTag::T_SeqScan => {
-            let seqscan = plan as *mut pg_sys::SeqScan;
-            let scanrelid = (*seqscan).scan.scanrelid;
-            pgrx::info!("DEBUG: Found SeqScan with scanrelid: {}", scanrelid);
-
-            if scanrelid == 0 {
-                return Err("SeqScan scanrelid is 0".into());
-            }
-
-            // scanrelid is an index into the range table, we need to get the actual table OID
-            if range_table.is_null() {
-                return Err("Range table is null".into());
-            }
-
-            // scanrelid is 1-based, PostgreSQL lists are 0-based
-            let rt_index = (scanrelid - 1) as i32;
-            let rt_entry = pg_sys::list_nth(range_table, rt_index);
-
-            if rt_entry.is_null() {
-                return Err(format!("Range table entry {scanrelid} not found").into());
-            }
-
-            let rte = rt_entry as *mut pg_sys::RangeTblEntry;
-            if rte.is_null() {
-                return Err("Range table entry is null".into());
-            }
-
-            // Get the table OID from the RangeTblEntry
-            let table_oid = (*rte).relid;
-            pgrx::info!(
-                "DEBUG: Resolved scanrelid {} to table OID {}",
-                scanrelid,
-                table_oid
-            );
-
-            Ok(table_oid)
-        }
-        _ => {
-            // Check left and right subtrees
-            if !(*plan).lefttree.is_null() {
-                match extract_table_oid_from_plan_tree((*plan).lefttree, range_table) {
-                    Ok(oid) => return Ok(oid),
-                    Err(_) => {} // Continue searching
-                }
-            }
-
-            if !(*plan).righttree.is_null() {
-                match extract_table_oid_from_plan_tree((*plan).righttree, range_table) {
-                    Ok(oid) => return Ok(oid),
-                    Err(_) => {} // Continue searching
-                }
-            }
-
-            Err(format!(
-                "No SeqScan found in plan tree starting from node type {:?}",
-                (*plan).type_
-            )
-            .into())
-        }
-    }
-}
-
 /// Dummy function to register the SQL for the test function
 #[pg_extern(sql = r#"
 CREATE OR REPLACE FUNCTION test_minimal_srf()
@@ -4412,6 +3940,10 @@ AS 'MODULE_PATHNAME', 'test_result_seqscan_srf_direct';
 fn register_test_result_seqscan_srf() {}
 
 /// Test SRF with hardcoded minimal plan - bypasses all Substrait translation
+///
+/// # Safety
+/// Must be called by PostgreSQL as a set-returning function with a valid
+/// FunctionCallInfo.
 #[no_mangle]
 pub unsafe extern "C" fn test_minimal_srf_direct(
     fcinfo: pg_sys::FunctionCallInfo,
@@ -4801,11 +4333,8 @@ unsafe fn execute_plan_with_proper_initialization(
         }
 
         // Build composite datum using HeapTupleHeaderData
-        let heap_tuple = pg_sys::heap_form_tuple(
-            blessed_desc,
-            values.as_mut_ptr(),
-            nulls.as_mut_ptr() as *mut bool,
-        );
+        let heap_tuple =
+            pg_sys::heap_form_tuple(blessed_desc, values.as_mut_ptr(), nulls.as_mut_ptr());
 
         if !heap_tuple.is_null() {
             pgrx::info!(
@@ -5033,6 +4562,10 @@ unsafe fn create_result_seqscan_plan(
 }
 
 /// Test SRF with Result+SeqScan plan (matches Substrait structure) - projects column from table scan
+///
+/// # Safety
+/// Must be called by PostgreSQL as a set-returning function with a valid
+/// FunctionCallInfo.
 #[no_mangle]
 pub unsafe extern "C" fn test_result_seqscan_srf_direct(
     fcinfo: pg_sys::FunctionCallInfo,
@@ -5044,6 +4577,10 @@ pub unsafe extern "C" fn test_result_seqscan_srf_direct(
 }
 
 /// Test SRF with SeqScan plan - scans an actual table
+///
+/// # Safety
+/// Must be called by PostgreSQL as a set-returning function with a valid
+/// FunctionCallInfo.
 #[no_mangle]
 pub unsafe extern "C" fn test_seqscan_srf_direct(
     fcinfo: pg_sys::FunctionCallInfo,
@@ -5142,9 +4679,9 @@ unsafe fn execute_result_seqscan_with_proper_initialization(
 
         // Lock tables in range table.
         if !range_table.is_null() {
-            let rt_list = range_table as *mut pg_sys::List;
+            let rt_list = range_table;
             for i in 0..(*rt_list).length {
-                let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
+                let rte_ptr = pg_sys::list_nth(rt_list, i);
                 let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
                 if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                     pg_sys::LockRelationOid((*rte).relid, pg_sys::AccessShareLock as i32);
@@ -5604,11 +5141,8 @@ unsafe fn execute_seqscan_with_proper_initialization(
         }
 
         // Build composite datum using HeapTupleHeaderData
-        let heap_tuple = pg_sys::heap_form_tuple(
-            blessed_desc,
-            values.as_mut_ptr(),
-            nulls.as_mut_ptr() as *mut bool,
-        );
+        let heap_tuple =
+            pg_sys::heap_form_tuple(blessed_desc, values.as_mut_ptr(), nulls.as_mut_ptr());
 
         if !heap_tuple.is_null() {
             pgrx::info!(
@@ -5642,6 +5176,10 @@ unsafe fn execute_seqscan_with_proper_initialization(
 }
 
 /// Test SRF using the working Substrait SeqScan creation functions
+///
+/// # Safety
+/// Must be called by PostgreSQL as a set-returning function with a valid
+/// FunctionCallInfo.
 #[no_mangle]
 pub unsafe extern "C" fn test_working_seqscan_srf_direct(
     fcinfo: pg_sys::FunctionCallInfo,
@@ -5738,8 +5276,8 @@ pub unsafe extern "C" fn test_working_seqscan_srf_direct(
 
         // If we get here, the working method succeeded where hardcoded failed
         // Continue with standard execution...
-        let estate = query_desc.estate;
-        let planstate = query_desc.planstate;
+        let _estate = query_desc.estate;
+        let _planstate = query_desc.planstate;
 
         // Store QueryDesc in function context for subsequent calls
         (*funcctx).user_fctx = query_desc.into_pg() as *mut std::ffi::c_void;

@@ -1,4 +1,16 @@
-// Module declarations for the plan translator components
+// Module declarations for the plan translator components.
+//
+// This module is being replaced by query_builder and is slated for removal;
+// suppress lints rather than polishing code that is about to be deleted.
+#![allow(
+    dead_code,
+    deprecated,
+    non_snake_case,
+    unused_doc_comments,
+    unexpected_cfgs,
+    clippy::all
+)]
+
 mod aggregate;
 pub mod constants;
 pub mod expressions;

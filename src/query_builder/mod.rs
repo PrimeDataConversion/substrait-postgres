@@ -152,11 +152,6 @@ impl QueryBuildContext {
     pub fn set_columns(&mut self, rtindex: i32, columns: Vec<ColumnRef>) {
         self.rtable_columns.insert(rtindex, columns);
     }
-
-    /// Get column information for an rtable entry.
-    pub fn get_columns(&self, rtindex: i32) -> Option<&Vec<ColumnRef>> {
-        self.rtable_columns.get(&rtindex)
-    }
 }
 
 /// Result of converting a Substrait relation subtree.
@@ -179,9 +174,6 @@ pub struct QueryParts {
 
     /// GROUP BY clause (from Aggregate relations).
     pub group_clause: Option<*mut pg_sys::List>,
-
-    /// Aggregate expressions that need to be in targetList.
-    pub aggregates: Vec<*mut pg_sys::Aggref>,
 
     /// ORDER BY clause (from Sort relations).
     pub sort_clause: Option<*mut pg_sys::List>,
@@ -228,7 +220,6 @@ impl QueryParts {
             having_qual: None,
             target_list: None,
             group_clause: None,
-            aggregates: Vec::new(),
             sort_clause: None,
             limit_count: None,
             limit_offset: None,

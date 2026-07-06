@@ -82,9 +82,7 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      # Informational until existing warnings are cleaned up; add
-      # `-- -D warnings` once the crate is warning-free.
-      run: cargo clippy --all --features pg17
+      run: cargo clippy --all --features pg17 -- -D warnings
 
     - name: Run tests
       run: cargo pgrx test pg17
