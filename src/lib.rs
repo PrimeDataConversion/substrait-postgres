@@ -1,6 +1,7 @@
 use pgrx::{pg_extern, pg_guard, pg_sys};
 
 mod pg_compat;
+mod schema;
 use prost::Message;
 use substrait::proto::Plan;
 
@@ -166,8 +167,12 @@ unsafe fn execute_substrait_via_query(
         pgrx::error!("standard_planner returned NULL");
     }
 
+    // Derive the schema the plan produces so we can tell the caller the exact
+    // AS clause to write when theirs is missing or has the wrong shape.
+    let expected_schema = schema::extract_schema(plan);
+
     // Execute the planned statement
-    execute_planned_stmt_as_srf(fcinfo, planned_stmt)
+    execute_planned_stmt_as_srf(fcinfo, planned_stmt, expected_schema.as_ref())
 }
 
 /// Coerce a datum to the expected type, preferring the registered cast over
@@ -227,6 +232,7 @@ unsafe fn coerce_datum(
 unsafe fn execute_planned_stmt_as_srf(
     fcinfo: pg_sys::FunctionCallInfo,
     planned_stmt: *mut pg_sys::PlannedStmt,
+    expected_schema: Option<&schema::DerivedSchema>,
 ) -> pg_sys::Datum {
     // Get result info from function call context
     let result_info = (*fcinfo).resultinfo as *mut pg_sys::ReturnSetInfo;
@@ -242,7 +248,28 @@ unsafe fn execute_planned_stmt_as_srf(
     // Get expected tuple descriptor from AS clause
     let expected_tupdesc = (*result_info).expectedDesc;
     if expected_tupdesc.is_null() {
-        pgrx::error!("No expected tuple descriptor - AS clause required");
+        // Point the caller at the exact signature when we can derive it.
+        match expected_schema {
+            Some(s) if !s.is_empty() => {
+                pgrx::error!("AS clause required; expected: AS t({})", s.as_clause())
+            }
+            _ => pgrx::error!("No expected tuple descriptor - AS clause required"),
+        }
+    }
+
+    // Reject a mismatched column count up front (a wrong signature) rather than
+    // silently NULL-filling or dropping columns. Only enforced when we could
+    // fully derive the plan's schema.
+    if let Some(s) = expected_schema {
+        let declared = (*expected_tupdesc).natts as usize;
+        if declared != s.len() {
+            pgrx::error!(
+                "AS clause declares {} column(s) but the plan produces {}; expected: AS t({})",
+                declared,
+                s.len(),
+                s.as_clause()
+            );
+        }
     }
 
     // Create a tuplestore for results
@@ -938,245 +965,10 @@ mod tests {
     fn extract_schema_from_substrait(
         plan: &substrait::proto::Plan,
     ) -> (Vec<String>, Vec<String>, String) {
-        let (column_names, input) = plan
-            .relations
-            .first()
-            .and_then(|rel| {
-                if let Some(substrait::proto::plan_rel::RelType::Root(root)) = &rel.rel_type {
-                    Some((root.names.clone(), root.input.as_ref()))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        let column_types = input.map(derive_rel_output_types).unwrap_or_default();
-        assert_eq!(
-            column_names.len(),
-            column_types.len(),
-            "Root names ({:?}) do not match derived output types ({:?})",
-            column_names,
-            column_types
-        );
-
-        let as_clause = column_names
-            .iter()
-            .zip(column_types.iter())
-            .map(|(name, pg_type)| format!("{} {}", name, pg_type))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        (column_names, column_types, as_clause)
-    }
-
-    /// Map a Substrait type to a PostgreSQL type name.
-    fn substrait_type_to_pg_name(t: &substrait::proto::Type) -> String {
-        use substrait::proto::r#type::Kind;
-        match &t.kind {
-            Some(Kind::Bool(_)) => "boolean",
-            Some(Kind::I8(_)) | Some(Kind::I16(_)) => "smallint",
-            Some(Kind::I32(_)) => "integer",
-            Some(Kind::I64(_)) => "bigint",
-            Some(Kind::Fp32(_)) => "real",
-            Some(Kind::Fp64(_)) => "double precision",
-            Some(Kind::Decimal(_)) => "numeric",
-            Some(Kind::String(_)) | Some(Kind::FixedChar(_)) | Some(Kind::Varchar(_)) => "text",
-            Some(Kind::Date(_)) => "date",
-            Some(Kind::Timestamp(_)) | Some(Kind::PrecisionTimestamp(_)) => "timestamp",
-            Some(Kind::IntervalYear(_)) | Some(Kind::IntervalDay(_)) => "interval",
-            other => panic!("Unsupported Substrait type in schema derivation: {other:?}"),
-        }
-        .to_string()
-    }
-
-    /// Compute the output column types of a Substrait relation tree from the
-    /// types the plan declares.
-    fn derive_rel_output_types(rel: &substrait::proto::Rel) -> Vec<String> {
-        use substrait::proto::rel::RelType;
-        use substrait::proto::rel_common::EmitKind;
-
-        // Apply an emit remapping (if any) to a relation's direct output.
-        fn apply_emit(
-            common: Option<&substrait::proto::RelCommon>,
-            types: Vec<String>,
-        ) -> Vec<String> {
-            if let Some(common) = common {
-                if let Some(EmitKind::Emit(emit)) = &common.emit_kind {
-                    return emit
-                        .output_mapping
-                        .iter()
-                        .map(|&i| types[i as usize].clone())
-                        .collect();
-                }
-            }
-            types
-        }
-
-        match &rel.rel_type {
-            Some(RelType::Read(read)) => {
-                let types = read
-                    .base_schema
-                    .as_ref()
-                    .and_then(|s| s.r#struct.as_ref())
-                    .map(|st| st.types.iter().map(substrait_type_to_pg_name).collect())
-                    .unwrap_or_default();
-                apply_emit(read.common.as_ref(), types)
-            }
-            Some(RelType::Filter(filter)) => {
-                let types = filter
-                    .input
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                apply_emit(filter.common.as_ref(), types)
-            }
-            Some(RelType::Sort(sort)) => {
-                let types = sort
-                    .input
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                apply_emit(sort.common.as_ref(), types)
-            }
-            Some(RelType::Fetch(fetch)) => {
-                let types = fetch
-                    .input
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                apply_emit(fetch.common.as_ref(), types)
-            }
-            Some(RelType::Project(project)) => {
-                let input_types = project
-                    .input
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                let mut types = input_types.clone();
-                for expr in &project.expressions {
-                    types.push(derive_expr_type(expr, &input_types));
-                }
-                apply_emit(project.common.as_ref(), types)
-            }
-            Some(RelType::Cross(cross)) => {
-                let mut types = cross
-                    .left
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                types.extend(
-                    cross
-                        .right
-                        .as_ref()
-                        .map(|i| derive_rel_output_types(i))
-                        .unwrap_or_default(),
-                );
-                apply_emit(cross.common.as_ref(), types)
-            }
-            Some(RelType::Join(join)) => {
-                let mut types = join
-                    .left
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                types.extend(
-                    join.right
-                        .as_ref()
-                        .map(|i| derive_rel_output_types(i))
-                        .unwrap_or_default(),
-                );
-                apply_emit(join.common.as_ref(), types)
-            }
-            Some(RelType::Aggregate(agg)) => {
-                let input_types = agg
-                    .input
-                    .as_ref()
-                    .map(|i| derive_rel_output_types(i))
-                    .unwrap_or_default();
-                let mut types = Vec::new();
-                if let Some(grouping) = agg.groupings.first() {
-                    #[allow(deprecated)]
-                    for group_expr in &grouping.grouping_expressions {
-                        types.push(derive_expr_type(group_expr, &input_types));
-                    }
-                }
-                for measure in &agg.measures {
-                    let t = measure
-                        .measure
-                        .as_ref()
-                        .and_then(|m| m.output_type.as_ref())
-                        .map(substrait_type_to_pg_name)
-                        .unwrap_or_else(|| panic!("Aggregate measure missing output_type"));
-                    types.push(t);
-                }
-                apply_emit(agg.common.as_ref(), types)
-            }
-            other => panic!("Unsupported relation type in schema derivation: {other:?}"),
-        }
-    }
-
-    /// Compute an expression's output type from the types the plan declares.
-    fn derive_expr_type(expr: &substrait::proto::Expression, input_types: &[String]) -> String {
-        use substrait::proto::expression::literal::LiteralType;
-        use substrait::proto::expression::RexType;
-
-        match &expr.rex_type {
-            Some(RexType::Literal(lit)) => match &lit.literal_type {
-                Some(LiteralType::Boolean(_)) => "boolean".to_string(),
-                Some(LiteralType::I8(_)) | Some(LiteralType::I16(_)) => "smallint".to_string(),
-                Some(LiteralType::I32(_)) => "integer".to_string(),
-                Some(LiteralType::I64(_)) => "bigint".to_string(),
-                Some(LiteralType::Fp32(_)) => "real".to_string(),
-                Some(LiteralType::Fp64(_)) => "double precision".to_string(),
-                Some(LiteralType::Decimal(_)) => "numeric".to_string(),
-                Some(LiteralType::String(_))
-                | Some(LiteralType::FixedChar(_))
-                | Some(LiteralType::VarChar(_)) => "text".to_string(),
-                Some(LiteralType::Date(_)) => "date".to_string(),
-                other => panic!("Unsupported literal type in schema derivation: {other:?}"),
-            },
-            Some(RexType::Selection(sel)) => {
-                use substrait::proto::expression::field_reference::ReferenceType;
-                use substrait::proto::expression::reference_segment::ReferenceType as SegRefType;
-                if let Some(ReferenceType::DirectReference(direct)) = &sel.reference_type {
-                    if let Some(SegRefType::StructField(sf)) = &direct.reference_type {
-                        return input_types[sf.field as usize].clone();
-                    }
-                }
-                panic!("Unsupported field reference in schema derivation")
-            }
-            Some(RexType::ScalarFunction(func)) => func
-                .output_type
-                .as_ref()
-                .map(substrait_type_to_pg_name)
-                .unwrap_or_else(|| panic!("Scalar function missing output_type")),
-            Some(RexType::Cast(cast)) => cast
-                .r#type
-                .as_ref()
-                .map(substrait_type_to_pg_name)
-                .unwrap_or_else(|| panic!("Cast missing target type")),
-            Some(RexType::IfThen(if_then)) => {
-                let branch = if_then
-                    .ifs
-                    .first()
-                    .and_then(|c| c.then.as_ref())
-                    .or(if_then.r#else.as_deref())
-                    .unwrap_or_else(|| panic!("IfThen has no branches"));
-                derive_expr_type(branch, input_types)
-            }
-            Some(RexType::Subquery(subquery)) => {
-                use substrait::proto::expression::subquery::SubqueryType;
-                match &subquery.subquery_type {
-                    Some(SubqueryType::Scalar(scalar)) => scalar
-                        .input
-                        .as_ref()
-                        .map(|rel| derive_rel_output_types(rel)[0].clone())
-                        .unwrap_or_else(|| panic!("Scalar subquery has no input")),
-                    _ => "boolean".to_string(),
-                }
-            }
-            other => panic!("Unsupported expression in schema derivation: {other:?}"),
-        }
+        let derived = crate::schema::extract_schema(plan)
+            .expect("could not derive output schema from Substrait plan");
+        let as_clause = derived.as_clause();
+        (derived.names, derived.types, as_clause)
     }
 
     macro_rules! tpch_test_body {
@@ -1754,6 +1546,35 @@ mod tests {
             "Query with AS clause should succeed: {:?}",
             result.err()
         );
+    }
+
+    /// A plan that produces a single `result integer` column, used to check the
+    /// error message emitted when the AS clause has the wrong column count.
+    const SINGLE_INT_COLUMN_PLAN: &str = r#"{
+        "version": {"minorNumber": 54},
+        "relations": [{
+            "root": {
+                "names": ["result"],
+                "input": {
+                    "project": {
+                        "expressions": [{"literal": {"i32": 99}}]
+                    }
+                }
+            }
+        }]
+    }"#;
+
+    #[pg_test]
+    #[should_panic(
+        expected = "AS clause declares 2 column(s) but the plan produces 1; expected: AS t(result integer)"
+    )]
+    fn test_wrong_column_count_reports_expected_signature() {
+        // The plan produces one column but the AS clause declares two; the
+        // error should name the exact signature the caller should have written.
+        let escaped_plan = SINGLE_INT_COLUMN_PLAN.replace("'", "''");
+        let _ = Spi::get_one::<i32>(&format!(
+            "SELECT * FROM from_substrait_json('{escaped_plan}') AS t(a int, b int)"
+        ));
     }
 
     /// Test plan execution without collecting results - just checks if executor setup works
