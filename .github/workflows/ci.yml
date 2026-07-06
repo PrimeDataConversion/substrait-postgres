@@ -13,7 +13,10 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # The project supports PostgreSQL 17 only (see Cargo.toml features).
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
     steps:
     - uses: actions/checkout@v4
 
@@ -37,7 +40,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.pgrx
-        key: ${{ runner.os }}-pgrx-pg17-${{ env.PGRX_VERSION }}
+        key: ${{ runner.os }}-pgrx-pg${{ matrix.pg }}-${{ env.PGRX_VERSION }}
 
     - name: Install build dependencies
       run: |
@@ -73,7 +76,7 @@ jobs:
     - name: Initialize pgrx
       run: |
         if [ ! -e ~/.pgrx/config.toml ]; then
-          cargo pgrx init --pg17 download
+          cargo pgrx init --pg${{ matrix.pg }} download
         else
           echo "pgrx already initialized from cache"
         fi
@@ -82,10 +85,10 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy
-      run: cargo clippy --all --features pg17 -- -D warnings
+      run: cargo clippy --all --no-default-features --features pg${{ matrix.pg }} -- -D warnings
 
     - name: Run tests
-      run: cargo pgrx test pg17
+      run: cargo pgrx test pg${{ matrix.pg }} --no-default-features
 
   pre-commit:
     runs-on: ubuntu-latest

@@ -11,18 +11,18 @@ A PostgreSQL extension written in Rust that enables executing Substrait query pl
 
 ### Prerequisites
 
-- PostgreSQL 13-17
+- PostgreSQL 16-18
 - Rust toolchain
 - cargo-pgrx
 
 ### Building
 
 ```bash
-# Install cargo-pgrx
-cargo install cargo-pgrx
+# Install cargo-pgrx (must match the pgrx version in Cargo.toml)
+cargo install cargo-pgrx --version "=0.19.1"
 
-# Initialize pgrx (replace pg16 with your PostgreSQL version)
-cargo pgrx init --pg16 download
+# Initialize pgrx (replace pg17 with your PostgreSQL version)
+cargo pgrx init --pg17 download
 
 # Build and install the extension
 cargo pgrx install --release
@@ -34,16 +34,16 @@ cargo pgrx install --release
 
 ```bash
 # Install cargo-pgrx if not already installed
-cargo install cargo-pgrx --version "=0.14.3"
+cargo install cargo-pgrx --version "=0.19.1"
 
 # Initialize pgrx with your PostgreSQL version
-cargo pgrx init --pg15 download  # or --pg16, --pg17
+cargo pgrx init --pg17 download  # or --pg16, --pg18
 
 # Start PostgreSQL with the extension loaded
 cargo pgrx run
 
-# In another terminal, connect to the database
-psql -h localhost -p 28815 -d pg_substrait
+# In another terminal, connect to the database (port is 28800 + pg major)
+psql -h localhost -p 28817 -d pg_substrait
 ```
 
 #### Option 2: Using System PostgreSQL

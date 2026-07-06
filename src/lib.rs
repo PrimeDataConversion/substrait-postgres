@@ -1,4 +1,6 @@
 use pgrx::{pg_extern, pg_guard, pg_sys};
+
+mod pg_compat;
 use prost::Message;
 use std::sync::Mutex;
 use substrait::proto::Plan;
@@ -328,25 +330,12 @@ unsafe fn execute_planned_stmt_as_srf(
 
     let tuplestore = pg_sys::tuplestore_begin_heap(true, false, 1024);
 
-    // Push an active snapshot for the executor
+    // Push an active snapshot for the executor. We use it directly rather
+    // than through CreateQueryDesc: CreateQueryDesc registers its own
+    // snapshot copy that only FreeQueryDesc would release, and we drive the
+    // plan state manually without a QueryDesc.
     pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
-
-    // Create QueryDesc for execution
-    let query_desc = pg_sys::CreateQueryDesc(
-        planned_stmt,
-        std::ptr::null(), // sourceText
-        pg_sys::GetActiveSnapshot(),
-        std::ptr::null_mut(), // crosscheck snapshot
-        std::ptr::null_mut(), // dest
-        std::ptr::null_mut(), // params
-        std::ptr::null_mut(), // queryEnv
-        0,                    // instrument_options
-    );
-
-    if query_desc.is_null() {
-        pg_sys::PopActiveSnapshot();
-        pgrx::error!("Failed to create QueryDesc");
-    }
+    let snapshot = pg_sys::GetActiveSnapshot();
 
     // Skip ExecutorStart and manually initialize (PG17 has stricter requirements).
     let estate = pg_sys::CreateExecutorState();
@@ -358,11 +347,11 @@ unsafe fn execute_planned_stmt_as_srf(
     // Initialize range table from PlannedStmt (using permInfos from standard_planner)
     let rtable = (*planned_stmt).rtable;
     let perminfos = (*planned_stmt).permInfos;
-    pg_sys::ExecInitRangeTable(estate, rtable, perminfos);
+    pg_compat::exec_init_range_table(estate, rtable, perminfos);
 
     // Set up estate with PlannedStmt and snapshot
     (*estate).es_plannedstmt = planned_stmt;
-    (*estate).es_snapshot = (*query_desc).snapshot;
+    (*estate).es_snapshot = snapshot;
 
     // Allocate PARAM_EXEC slots used by SubPlans and InitPlans.
     // This mirrors InitPlan() in the standard executor.
@@ -406,9 +395,6 @@ unsafe fn execute_planned_stmt_as_srf(
         pgrx::error!("ExecInitNode failed to create plan state");
     }
 
-    (*query_desc).estate = estate;
-    (*query_desc).planstate = plan_state;
-
     // Get tuples by calling ExecProcNode on the plan state
     loop {
         let slot = pg_sys::ExecProcNode(plan_state);
@@ -439,25 +425,18 @@ unsafe fn execute_planned_stmt_as_srf(
 
         pg_sys::slot_getallattrs(slot);
 
-        let slot_attrs = if !slot_desc.is_null() {
-            (*slot_desc).attrs.as_ptr()
-        } else {
-            std::ptr::null()
-        };
-        let expected_attrs = (*expected_tupdesc).attrs.as_ptr();
-
         for i in 0..natts_to_copy {
             if (*slot).tts_isnull.add(i as usize).read() {
                 nulls[i as usize] = true;
                 values[i as usize] = pg_sys::Datum::from(0);
             } else {
                 let src_value = (*slot).tts_values.add(i as usize).read();
-                let expected_attr = &*expected_attrs.add(i as usize);
+                let expected_attr = &*pg_compat::tupdesc_attr(expected_tupdesc, i as usize);
                 let expected_type = expected_attr.atttypid;
 
                 // Check if type coercion is needed
-                let src_type = if !slot_attrs.is_null() {
-                    (*slot_attrs.add(i as usize)).atttypid
+                let src_type = if !slot_desc.is_null() {
+                    (*pg_compat::tupdesc_attr(slot_desc, i as usize)).atttypid
                 } else {
                     expected_type // Assume same type if no slot descriptor
                 };
@@ -480,9 +459,14 @@ unsafe fn execute_planned_stmt_as_srf(
         );
     }
 
-    // Cleanup manually since we bypassed ExecutorStart
-    // ExecutorFinish/ExecutorEnd expect structures set up by ExecutorStart
+    // Cleanup manually since we bypassed ExecutorStart. Mirror ExecEndPlan:
+    // end the plan node, drop the tuple table (unpinning scan-slot tuple
+    // descriptors), then close the range-table relations. Without the last
+    // two steps the descriptors and relations leak (pg18 reports "resource
+    // was not closed" warnings at portal shutdown).
     pg_sys::ExecEndNode(plan_state);
+    pg_sys::ExecResetTupleTable((*estate).es_tupleTable, false);
+    pg_sys::ExecCloseRangeTableRelations(estate);
     pg_sys::FreeExecutorState(estate);
     pg_sys::PopActiveSnapshot();
 
@@ -2369,7 +2353,7 @@ mod tests {
 
             // Initialize range table (empty for Result node)
             let empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
-            pg_sys::ExecInitRangeTable(estate, std::ptr::null_mut(), empty_perminfos);
+            crate::pg_compat::exec_init_range_table(estate, std::ptr::null_mut(), empty_perminfos);
 
             // Set planned statement reference
             (*estate).es_plannedstmt = (*query_desc).plannedstmt;
@@ -2566,7 +2550,11 @@ mod tests {
             // Use CreateExecutorState + ExecInitNode instead of ExecutorStart
             let manual_estate = pg_sys::CreateExecutorState();
             let manual_empty_perminfos: *mut pg_sys::List = std::ptr::null_mut();
-            pg_sys::ExecInitRangeTable(manual_estate, std::ptr::null_mut(), manual_empty_perminfos);
+            crate::pg_compat::exec_init_range_table(
+                manual_estate,
+                std::ptr::null_mut(),
+                manual_empty_perminfos,
+            );
             (*manual_estate).es_plannedstmt = manual_planned_stmt;
             (*manual_estate).es_snapshot = (*manual_query_desc).snapshot;
             (*manual_estate).es_crosscheck_snapshot = std::ptr::null_mut();

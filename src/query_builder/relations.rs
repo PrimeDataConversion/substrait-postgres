@@ -291,7 +291,7 @@ unsafe fn create_range_table_entry(
         let natts = (*tupdesc).natts;
         let mut colnames: *mut pg_sys::List = std::ptr::null_mut();
         for i in 0..natts {
-            let attr = (*tupdesc).attrs.as_ptr().add(i as usize);
+            let attr = crate::pg_compat::tupdesc_attr(tupdesc, i as usize);
             if !(*attr).attisdropped {
                 let name_ptr = (*attr).attname.data.as_ptr();
                 let name_cstr = std::ffi::CStr::from_ptr(name_ptr);
@@ -340,7 +340,7 @@ unsafe fn get_table_columns(
 
     let mut columns = Vec::new();
     for i in 0..natts {
-        let attr = (*tupdesc).attrs.as_ptr().add(i as usize);
+        let attr = crate::pg_compat::tupdesc_attr(tupdesc, i as usize);
         if (*attr).attisdropped {
             continue;
         }
@@ -1267,11 +1267,14 @@ unsafe fn convert_sort_to_query_parts(
             }
             None => return Err("Sort field has no sort_kind".into()),
         };
-        let (sortop, nulls_first) = match direction {
-            SortDirection::AscNullsFirst => (ltop, true),
-            SortDirection::AscNullsLast | SortDirection::Unspecified => (ltop, false),
-            SortDirection::DescNullsFirst => (gtop, true),
-            SortDirection::DescNullsLast => (gtop, false),
+        // `reverse` marks a descending sort, where `sortop` is a "greater
+        // than" operator. PostgreSQL 18 needs this recorded in a separate
+        // SortGroupClause field; earlier versions encode it in sortop alone.
+        let (sortop, nulls_first, reverse) = match direction {
+            SortDirection::AscNullsFirst => (ltop, true, false),
+            SortDirection::AscNullsLast | SortDirection::Unspecified => (ltop, false, false),
+            SortDirection::DescNullsFirst => (gtop, true, true),
+            SortDirection::DescNullsLast => (gtop, false, true),
             SortDirection::Clustered => {
                 return Err("Clustered sort direction is not supported".into());
             }
@@ -1284,7 +1287,9 @@ unsafe fn convert_sort_to_query_parts(
         sgc.sortop = sortop;
         sgc.nulls_first = nulls_first;
         sgc.hashable = hashable;
-        sort_clause = pg_sys::lappend(sort_clause, sgc.into_pg() as *mut std::ffi::c_void);
+        let sgc = sgc.into_pg();
+        crate::pg_compat::set_sort_reverse(sgc, reverse);
+        sort_clause = pg_sys::lappend(sort_clause, sgc as *mut std::ffi::c_void);
     }
 
     parts.sort_clause = Some(sort_clause);
