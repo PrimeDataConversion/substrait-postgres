@@ -19,6 +19,16 @@ pub struct QueryBuildContext {
     /// Maps Substrait function reference IDs to function names.
     pub function_map: HashMap<u32, String>,
 
+    /// Available columns of the enclosing query levels, innermost first.
+    /// Used to resolve OuterReference field references in subqueries:
+    /// steps_out=1 refers to outer_scopes[0], steps_out=2 to outer_scopes[1], etc.
+    pub outer_scopes: Vec<Vec<AvailableColumn>>,
+
+    /// Set when a SubLink is created at this query level so the Query's
+    /// hasSubLinks flag can be set. Cell because expression conversion
+    /// only has shared access to the context.
+    pub has_sublinks: std::cell::Cell<bool>,
+
     /// The range table - list of all tables referenced in the query.
     /// Each entry is a RangeTblEntry pointer.
     pub rtable: Vec<*mut pg_sys::RangeTblEntry>,
@@ -53,6 +63,8 @@ impl QueryBuildContext {
     pub fn new(function_map: HashMap<u32, String>) -> Self {
         Self {
             function_map,
+            outer_scopes: Vec::new(),
+            has_sublinks: std::cell::Cell::new(false),
             rtable: Vec::new(),
             rteperminfos: Vec::new(),
             table_to_rtindex: HashMap::new(),
@@ -159,6 +171,9 @@ pub struct QueryParts {
     /// Additional WHERE conditions from Filter relations.
     pub where_quals: Option<*mut pg_sys::Expr>,
 
+    /// HAVING conditions from Filter relations above an Aggregate.
+    pub having_qual: Option<*mut pg_sys::Expr>,
+
     /// Target list entries (from Project relations).
     pub target_list: Option<*mut pg_sys::List>,
 
@@ -210,6 +225,7 @@ impl QueryParts {
             from_item: std::ptr::null_mut(),
             available_columns: Vec::new(),
             where_quals: None,
+            having_qual: None,
             target_list: None,
             group_clause: None,
             aggregates: Vec::new(),
