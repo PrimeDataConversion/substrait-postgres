@@ -808,7 +808,7 @@ pub unsafe fn execute_plan_directly_raw(
         );
 
         // Get the current length of the main range table
-        let main_rt_len = if range_table.is_null() {
+        let _main_rt_len = if range_table.is_null() {
             0
         } else {
             (*range_table).length
@@ -995,13 +995,13 @@ pub unsafe fn execute_plan_directly_raw(
     // This includes both main plan tables and subplan tables.
     // Store the relation handles in es_relations for scan nodes to use.
     if !actual_range_table.is_null() {
-        let rt_list = actual_range_table as *mut pg_sys::List;
+        let rt_list = actual_range_table;
         pgrx::info!(
             "DEBUG: Opening {} relations from merged range table",
             (*rt_list).length
         );
         for i in 0..(*rt_list).length {
-            let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
+            let rte_ptr = pg_sys::list_nth(rt_list, i);
             let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
             if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                 pgrx::info!(
@@ -1243,10 +1243,7 @@ pub unsafe fn execute_plan_directly_raw(
                                 "QUAL_DUMP: Result.resconstantqual at {:p}",
                                 (*result).resconstantqual
                             );
-                            debug_dump_expr(
-                                (*result).resconstantqual as *mut pg_sys::Node,
-                                (depth + 1) as usize,
-                            );
+                            debug_dump_expr((*result).resconstantqual, (depth + 1) as usize);
                         }
                     }
                     dump_all_quals((*plan).lefttree, depth + 1);
@@ -1882,11 +1879,7 @@ unsafe fn _execute_plan_directly_old(
     pgrx::info!("DEBUG: About to create tuplestore");
 
     // Create a tuplestore to collect results using the correct tuple descriptor
-    let tuplestore_desc = if expected_tupdesc.is_some() {
-        expected_tupdesc.unwrap()
-    } else {
-        tupdesc
-    };
+    let tuplestore_desc = expected_tupdesc.unwrap_or(tupdesc);
 
     let tuplestore = pg_sys::tuplestore_begin_heap(true, false, pg_sys::work_mem);
     if tuplestore.is_null() {
@@ -2116,13 +2109,13 @@ unsafe fn _execute_plan_directly_old(
     // This includes both main plan tables and subplan tables.
     // Store the relation handles in es_relations for scan nodes to use.
     if !actual_range_table.is_null() {
-        let rt_list = actual_range_table as *mut pg_sys::List;
+        let rt_list = actual_range_table;
         pgrx::info!(
             "DEBUG: Opening {} relations from merged range table",
             (*rt_list).length
         );
         for i in 0..(*rt_list).length {
-            let rte_ptr = pg_sys::list_nth(rt_list, i as i32);
+            let rte_ptr = pg_sys::list_nth(rt_list, i);
             let rte = rte_ptr as *mut pg_sys::RangeTblEntry;
             if !rte.is_null() && (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION {
                 pgrx::info!(
@@ -2364,10 +2357,7 @@ unsafe fn _execute_plan_directly_old(
                                 "QUAL_DUMP: Result.resconstantqual at {:p}",
                                 (*result).resconstantqual
                             );
-                            debug_dump_expr(
-                                (*result).resconstantqual as *mut pg_sys::Node,
-                                (depth + 1) as usize,
-                            );
+                            debug_dump_expr((*result).resconstantqual, (depth + 1) as usize);
                         }
                     }
                     dump_all_quals((*plan).lefttree, depth + 1);
@@ -2709,55 +2699,6 @@ pub unsafe fn execute_postgres_plan(
     })
 }
 
-/// Create a range table from plan tree by finding SeqScan nodes
-unsafe fn create_range_table_from_plan_tree(
-    plan_tree: &pg_sys::Plan,
-) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!(
-        "DEBUG: create_range_table_from_plan_tree called with plan type: {:?}",
-        plan_tree.type_
-    );
-
-    let mut range_table: *mut pg_sys::List = std::ptr::null_mut();
-    collect_seqscan_nodes_for_range_table(plan_tree, &mut range_table)?;
-
-    Ok(range_table)
-}
-
-/// Recursively collect SeqScan nodes and create range table entries
-unsafe fn collect_seqscan_nodes_for_range_table(
-    plan: &pg_sys::Plan,
-    range_table: &mut *mut pg_sys::List,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!("DEBUG: Checking plan node type: {:?}", plan.type_);
-
-    // Check if this is a SeqScan node
-    if plan.type_ == pg_sys::NodeTag::T_SeqScan {
-        eprintln!("DEBUG: Found SeqScan node, creating range table entry");
-
-        // Extract table OID from plan_node_id (where we stored it during translation)
-        let table_oid = pg_sys::Oid::from(plan.plan_node_id as u32);
-        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {table_oid}");
-
-        if table_oid != pg_sys::InvalidOid {
-            // Create a range table entry for this table
-            let rte = create_range_table_entry_from_oid(table_oid)?;
-            *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
-            eprintln!("DEBUG: Added range table entry for table OID: {table_oid}");
-        }
-    }
-
-    // Recursively check child nodes
-    if !plan.lefttree.is_null() {
-        collect_seqscan_nodes_for_range_table(&*plan.lefttree, range_table)?;
-    }
-    if !plan.righttree.is_null() {
-        collect_seqscan_nodes_for_range_table(&*plan.righttree, range_table)?;
-    }
-
-    Ok(())
-}
-
 /// Execute PostgreSQL plan as SRF directly without unpacking/repacking
 /// This function directly interfaces with PostgreSQL's SRF mechanism
 pub unsafe fn execute_postgres_plan_as_srf(
@@ -3008,114 +2949,6 @@ unsafe fn execute_postgres_plan_as_srf_inner(
         (*fcinfo).isnull = true;
         pg_sys::Datum::from(0)
     }
-}
-
-/// Create a range table entry from a table OID
-unsafe fn create_range_table_entry_from_oid(
-    table_oid: pg_sys::Oid,
-) -> Result<*mut pg_sys::RangeTblEntry, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!("DEBUG: create_range_table_entry_from_oid called for OID: {table_oid}");
-
-    // Get table name from OID for the alias
-    let relation = pg_sys::relation_open(table_oid, pg_sys::AccessShareLock as i32);
-    if relation.is_null() {
-        return Err(format!("Could not open relation with OID {table_oid}").into());
-    }
-
-    let rel_name = std::ffi::CStr::from_ptr((*(*relation).rd_rel).relname.data.as_ptr())
-        .to_string_lossy()
-        .to_string();
-
-    pg_sys::relation_close(relation, pg_sys::AccessShareLock as i32);
-
-    // Create RangeTblEntry using safe pgrx allocation
-    let mut rte = pgrx::PgBox::<pg_sys::RangeTblEntry>::alloc0();
-
-    rte.type_ = pg_sys::NodeTag::T_RangeTblEntry;
-    rte.rtekind = pg_sys::RTEKind::RTE_RELATION;
-    rte.relid = table_oid;
-    rte.relkind = pg_sys::RELKIND_RELATION as i8;
-    rte.rellockmode = pg_sys::AccessShareLock as i32;
-    rte.lateral = false;
-    rte.inh = true; // Include inheritance
-    rte.inFromCl = true; // This table is in the FROM clause
-
-    // Create an alias for the table using safe pgrx allocation
-    let mut alias = pgrx::PgBox::<pg_sys::Alias>::alloc0();
-    alias.type_ = pg_sys::NodeTag::T_Alias;
-    let aliasname = unsafe {
-        pgrx::PgMemoryContexts::CurrentMemoryContext.palloc_slice::<u8>(rel_name.len() + 1)
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(rel_name.as_ptr(), aliasname.as_mut_ptr(), rel_name.len());
-        *aliasname.as_mut_ptr().add(rel_name.len()) = 0; // null terminate
-    }
-    alias.aliasname = aliasname.as_mut_ptr() as *mut std::os::raw::c_char;
-    alias.colnames = std::ptr::null_mut(); // Will be filled in by planner if needed
-    let alias_ptr = alias.into_pg();
-    rte.eref = alias_ptr;
-    rte.alias = std::ptr::null_mut(); // No explicit alias
-
-    // Initialize other fields
-    rte.securityQuals = std::ptr::null_mut();
-
-    eprintln!("DEBUG: Range table entry created successfully for table: {rel_name}");
-
-    let final_rte_ptr = rte.into_pg();
-    Ok(final_rte_ptr)
-}
-
-/// Create a range table from plan tree by finding SeqScan nodes - raw pointer version
-unsafe fn create_range_table_from_plan_tree_raw(
-    plan_tree: *mut pg_sys::Plan,
-) -> Result<*mut pg_sys::List, Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!(
-        "DEBUG: create_range_table_from_plan_tree_raw called with plan type: {:?}",
-        (*plan_tree).type_
-    );
-
-    let mut range_table: *mut pg_sys::List = std::ptr::null_mut();
-    collect_seqscan_nodes_for_range_table_raw(plan_tree, &mut range_table)?;
-
-    Ok(range_table)
-}
-
-/// Recursively collect SeqScan nodes and create range table entries - raw pointer version
-unsafe fn collect_seqscan_nodes_for_range_table_raw(
-    plan: *mut pg_sys::Plan,
-    range_table: &mut *mut pg_sys::List,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if plan.is_null() {
-        return Ok(());
-    }
-
-    eprintln!("DEBUG: Checking plan node type: {:?}", (*plan).type_);
-
-    // Check if this is a SeqScan node
-    if (*plan).type_ == pg_sys::NodeTag::T_SeqScan {
-        eprintln!("DEBUG: Found SeqScan node, creating range table entry");
-
-        // Extract table OID from plan_node_id (where we stored it during translation)
-        let table_oid = pg_sys::Oid::from((*plan).plan_node_id as u32);
-        eprintln!("DEBUG: SeqScan table OID from plan_node_id: {table_oid}");
-
-        if table_oid != pg_sys::InvalidOid {
-            // Create a range table entry for this table
-            let rte = create_range_table_entry_from_oid(table_oid)?;
-            *range_table = pg_sys::lappend(*range_table, rte as *mut std::ffi::c_void);
-            eprintln!("DEBUG: Added range table entry for table OID: {table_oid}");
-        }
-    }
-
-    // Recursively check child nodes
-    if !(*plan).lefttree.is_null() {
-        collect_seqscan_nodes_for_range_table_raw((*plan).lefttree, range_table)?;
-    }
-    if !(*plan).righttree.is_null() {
-        collect_seqscan_nodes_for_range_table_raw((*plan).righttree, range_table)?;
-    }
-
-    Ok(())
 }
 
 /// Recursively validate all node types in a plan tree to catch corruption early

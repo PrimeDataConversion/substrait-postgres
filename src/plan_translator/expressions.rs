@@ -16,7 +16,7 @@ use substrait::proto::{r#type::Kind, Type};
 /// This allows nested expression conversion functions to register subplans
 /// without threading the ConversionContext through all function signatures.
 thread_local! {
-    static SUBPLAN_COLLECTOR: RefCell<Option<SubplanCollector>> = RefCell::new(None);
+    static SUBPLAN_COLLECTOR: RefCell<Option<SubplanCollector>> = const { RefCell::new(None) };
 }
 
 /// Collector for subplans during expression conversion.
@@ -386,7 +386,7 @@ pub unsafe fn lookup_function_oid(
 /// Get the comparison function name for a given type and operation.
 /// PostgreSQL uses type-specific function names like int4eq, texteq, etc.
 fn get_comparison_func_name(type_oid: pg_sys::Oid, operation: &str) -> String {
-    let type_prefix = match type_oid.into() {
+    let type_prefix = match type_oid {
         pg_sys::INT2OID => "int2",
         pg_sys::INT4OID => "int4",
         pg_sys::INT8OID => "int8",

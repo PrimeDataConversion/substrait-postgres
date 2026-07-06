@@ -14,10 +14,11 @@ pub fn build_function_extension_map(plan: &Plan) -> HashMap<u32, String> {
     let mut function_map = HashMap::new();
 
     for extension in &plan.extensions {
-        if let Some(mapping_type) = &extension.mapping_type {
-            if let substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(func) = mapping_type {
-                function_map.insert(func.function_anchor, func.name.clone());
-            }
+        if let Some(
+            substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(func),
+        ) = &extension.mapping_type
+        {
+            function_map.insert(func.function_anchor, func.name.clone());
         }
     }
 
@@ -242,7 +243,6 @@ unsafe fn convert_read_to_query_parts(
         having_qual: None,
         target_list: None,
         group_clause: None,
-        aggregates: Vec::new(),
         sort_clause: None,
         limit_count: None,
         limit_offset: None,
@@ -272,7 +272,7 @@ unsafe fn create_range_table_entry(
         (*rte).relkind = (*relation)
             .rd_rel
             .as_ref()
-            .map_or(pg_sys::RELKIND_RELATION as i8, |rel| rel.relkind as i8);
+            .map_or(pg_sys::RELKIND_RELATION as i8, |rel| rel.relkind);
 
         // Build column names list for eref
         let tupdesc = (*relation).rd_att;
@@ -784,7 +784,6 @@ unsafe fn convert_join_to_query_parts(
         having_qual: combine_quals(left_parts.having_qual, right_parts.having_qual)?,
         target_list: None,
         group_clause: None,
-        aggregates: Vec::new(),
         sort_clause: None,
         limit_count: None,
         limit_offset: None,
@@ -830,7 +829,6 @@ unsafe fn convert_cross_to_query_parts(
         having_qual: combine_quals(left_parts.having_qual, right_parts.having_qual)?,
         target_list: None,
         group_clause: None,
-        aggregates: Vec::new(),
         sort_clause: None,
         limit_count: None,
         limit_offset: None,
@@ -945,7 +943,6 @@ unsafe fn convert_rel_as_subquery_rte(
         having_qual: None,
         target_list: None,
         group_clause: None,
-        aggregates: Vec::new(),
         sort_clause: None,
         limit_count: None,
         limit_offset: None,
@@ -1116,11 +1113,8 @@ unsafe fn convert_aggregate_to_query_parts(
     }
 
     // Add aggregate functions
-    let mut aggregates: Vec<*mut pg_sys::Aggref> = Vec::new();
-
     for (i, measure) in agg.measures.iter().enumerate() {
         let aggref = convert_aggregate_measure(measure, &parts.available_columns, ctx, i)?;
-        aggregates.push(aggref);
 
         // Get aggregate return type
         let agg_type = (*aggref).aggtype;
@@ -1173,7 +1167,6 @@ unsafe fn convert_aggregate_to_query_parts(
         } else {
             Some(group_clause)
         },
-        aggregates,
         sort_clause: None,
         limit_count: None,
         limit_offset: None,
@@ -1303,6 +1296,9 @@ fn extract_field_index(expr: &substrait::proto::Expression) -> Option<usize> {
 }
 
 /// Convert a Fetch relation (LIMIT/OFFSET) to QueryParts.
+// The plain Count/Offset variants are deprecated in the Substrait proto but
+// still appear on the wire; keep handling them.
+#[allow(deprecated)]
 unsafe fn convert_fetch_to_query_parts(
     fetch: &substrait::proto::FetchRel,
     ctx: &mut QueryBuildContext,

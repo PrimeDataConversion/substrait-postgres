@@ -14,7 +14,7 @@ pub unsafe fn convert_expression_for_query(
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     pgrx::info!(
         "DEBUG: convert_expression_for_query - rex_type: {:?}",
-        expr.rex_type.as_ref().map(|r| std::mem::discriminant(r))
+        expr.rex_type.as_ref().map(std::mem::discriminant)
     );
 
     match &expr.rex_type {
@@ -57,7 +57,7 @@ unsafe fn convert_literal(
 
     pgrx::info!(
         "DEBUG: convert_literal - literal_type discriminant: {:?}",
-        lit.literal_type.as_ref().map(|l| std::mem::discriminant(l))
+        lit.literal_type.as_ref().map(std::mem::discriminant)
     );
 
     match &lit.literal_type {
@@ -103,7 +103,7 @@ unsafe fn convert_literal(
                 d.precision,
                 d.scale
             );
-            let c = create_numeric_const(&d.value, d.precision as i32, d.scale as i32)?;
+            let c = create_numeric_const(&d.value, d.precision, d.scale)?;
             pgrx::info!("DEBUG: decimal const created");
             Ok(c as *mut pg_sys::Expr)
         }
@@ -242,30 +242,6 @@ unsafe fn convert_selection(
     );
 
     Ok(var.into_pg() as *mut pg_sys::Expr)
-}
-
-/// Check whether a converted expression tree contains any Aggref nodes.
-/// Used to route post-aggregation filters to HAVING instead of WHERE.
-pub(super) unsafe fn contains_aggref(node: *mut pg_sys::Node) -> bool {
-    unsafe extern "C-unwind" fn walker(
-        node: *mut pg_sys::Node,
-        context: *mut std::ffi::c_void,
-    ) -> bool {
-        if node.is_null() {
-            return false;
-        }
-        if (*node).type_ == pg_sys::NodeTag::T_Aggref {
-            return true;
-        }
-        pg_sys::expression_tree_walker_impl(node, Some(walker), context)
-    }
-    if node.is_null() {
-        return false;
-    }
-    if (*node).type_ == pg_sys::NodeTag::T_Aggref {
-        return true;
-    }
-    pg_sys::expression_tree_walker_impl(node, Some(walker), std::ptr::null_mut())
 }
 
 /// Convert a Substrait subquery expression to a PostgreSQL SubLink.
@@ -655,7 +631,6 @@ fn select_common_type(left: pg_sys::Oid, right: pg_sys::Oid) -> pg_sys::Oid {
     const NUMERIC: pg_sys::Oid = pg_sys::Oid::from_u32(1700); // numeric
     const INT8: pg_sys::Oid = pg_sys::Oid::from_u32(20); // int8
     const INT4: pg_sys::Oid = pg_sys::Oid::from_u32(23); // int4
-    const INT2: pg_sys::Oid = pg_sys::Oid::from_u32(21); // int2
     const TEXT: pg_sys::Oid = pg_sys::Oid::from_u32(25); // text
     const BPCHAR: pg_sys::Oid = pg_sys::Oid::from_u32(1042); // bpchar (char(n))
     const VARCHAR: pg_sys::Oid = pg_sys::Oid::from_u32(1043); // varchar
