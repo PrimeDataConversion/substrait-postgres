@@ -30,7 +30,9 @@ pgrx-tests = "0.19.1"
 
 [features]
 default = ["pg17"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = ["pgrx-tests/pg_test"]
 
 [package.metadata.pgrx]

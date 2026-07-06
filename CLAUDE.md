@@ -26,7 +26,7 @@
 ## Technical Notes
 - Use manual `ExecInitNode` initialization instead of `ExecutorStart` when constructing plans programmatically.
 - Use PostgreSQL API calls instead of hardcoded values when constructing plan nodes.
-- Support only PostgreSQL 17 (pg17), not multiple versions.
+- Support PostgreSQL 16 through 18 (pg16, pg17, pg18). Older versions are deliberately unsupported: RTEPermissionInfo only exists in PG16+, and PG15 would need a second permission-handling path.
 - After fixing crashes, verify OID handling is still correct - these issues are related.
 - Crashes during execution are caused by improper plan construction - debug the plan construction code.
 - AGGREF.args must be a list of TargetEntry nodes in PostgreSQL 14+, not raw Var nodes.
