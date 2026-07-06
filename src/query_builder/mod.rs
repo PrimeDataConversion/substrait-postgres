@@ -4,8 +4,8 @@
 //! passed to `standard_planner()` for optimization. This allows PostgreSQL's
 //! optimizer to choose join strategies, push down predicates, and select indexes.
 
-mod expressions;
-mod relations;
+pub(crate) mod expressions;
+pub(crate) mod relations;
 
 use pgrx::pg_sys;
 use std::collections::HashMap;

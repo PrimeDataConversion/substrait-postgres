@@ -990,7 +990,7 @@ unsafe fn substrait_type_to_pg_oid(
 
 // Helper functions to create constants
 
-unsafe fn create_int4_const(
+pub(crate) unsafe fn create_int4_const(
     value: i32,
 ) -> Result<*mut pg_sys::Const, Box<dyn std::error::Error + Send + Sync>> {
     let mut c = pgrx::PgBox::<pg_sys::Const>::alloc0();
@@ -1038,7 +1038,7 @@ unsafe fn create_float8_const(
     Ok(c.into_pg())
 }
 
-unsafe fn create_text_const(
+pub(crate) unsafe fn create_text_const(
     value: &str,
 ) -> Result<*mut pg_sys::Const, Box<dyn std::error::Error + Send + Sync>> {
     let cstr = std::ffi::CString::new(value)?;
@@ -1059,7 +1059,7 @@ unsafe fn create_text_const(
     Ok(c.into_pg())
 }
 
-unsafe fn create_bool_const(
+pub(crate) unsafe fn create_bool_const(
     value: bool,
 ) -> Result<*mut pg_sys::Const, Box<dyn std::error::Error + Send + Sync>> {
     let mut c = pgrx::PgBox::<pg_sys::Const>::alloc0();
@@ -1122,7 +1122,7 @@ unsafe fn create_interval_const(
     Ok(c.into_pg())
 }
 
-unsafe fn create_numeric_const(
+pub(crate) unsafe fn create_numeric_const(
     value_bytes: &[u8],
     _precision: i32,
     scale: i32,

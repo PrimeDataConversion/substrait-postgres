@@ -82,6 +82,18 @@ pub(super) unsafe fn build_subquery(
     build_query_from_parts(&parts, &mut sub_ctx)
 }
 
+/// Extract the table name from a NamedTable (the last name in the
+/// catalog/schema/table hierarchy).
+pub(crate) fn extract_table_name_from_named_table(
+    named_table: &substrait::proto::read_rel::NamedTable,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    named_table
+        .names
+        .last()
+        .cloned()
+        .ok_or_else(|| "NamedTable has no names".into())
+}
+
 /// Extract the root relation from a Substrait plan.
 fn get_root_relation(plan: &Plan) -> Result<&Rel, Box<dyn std::error::Error + Send + Sync>> {
     let plan_rel = plan.relations.first().ok_or("Plan has no relations")?;
@@ -153,7 +165,7 @@ unsafe fn convert_read_to_query_parts(
 
     let table_name = match &read.read_type {
         Some(ReadType::NamedTable(named)) => {
-            let name = named.names.last().ok_or("NamedTable has no names")?.clone();
+            let name = extract_table_name_from_named_table(named)?;
             pgrx::info!("DEBUG: Table name from NamedTable: {}", name);
             name
         }
