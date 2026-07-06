@@ -2,56 +2,11 @@ use pgrx::{pg_extern, pg_guard, pg_sys};
 
 mod pg_compat;
 use prost::Message;
-use std::sync::Mutex;
 use substrait::proto::Plan;
 
 mod query_builder;
 
 pgrx::pg_module_magic!();
-
-// Static variable to store the previous planner hook
-static PREV_PLANNER_HOOK: Mutex<pg_sys::planner_hook_type> = Mutex::new(None);
-
-/// Custom planner function that intercepts calls to from_substrait functions
-///
-/// # Safety
-/// Called by PostgreSQL as a planner hook; all pointer arguments must be the
-/// ones PostgreSQL passes to planner hooks.
-#[no_mangle]
-pub unsafe extern "C-unwind" fn substrait_planner_hook(
-    parse: *mut pg_sys::Query,
-    query_string: *const std::os::raw::c_char,
-    cursor_options: std::os::raw::c_int,
-    bound_params: pg_sys::ParamListInfo,
-) -> *mut pg_sys::PlannedStmt {
-    pgrx::info!("DEBUG: substrait_planner_hook called");
-
-    // For now, just call the previous planner
-    // TODO: Add logic to detect from_substrait function calls and generate custom plans
-    let prev_planner = PREV_PLANNER_HOOK.lock().unwrap();
-    if let Some(prev_hook) = *prev_planner {
-        pgrx::info!("DEBUG: Calling previous planner hook");
-        prev_hook(parse, query_string, cursor_options, bound_params)
-    } else {
-        pgrx::info!("DEBUG: Calling standard planner");
-        pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
-    }
-}
-
-/// Extension initialization function
-#[no_mangle]
-pub extern "C" fn _PG_init() {
-    unsafe {
-        // Store the previous planner hook
-        let mut prev_planner = PREV_PLANNER_HOOK.lock().unwrap();
-        *prev_planner = pg_sys::planner_hook;
-
-        // Install our custom planner hook
-        pg_sys::planner_hook = Some(substrait_planner_hook);
-
-        pgrx::info!("Substrait PostgreSQL extension loaded with planner hook");
-    }
-}
 
 /// Primary Substrait execution function for protobuf plans
 /// Usage: SELECT * FROM from_substrait(plan_bytes) AS t(col1 type1, col2 type2, ...)
@@ -85,31 +40,6 @@ pub extern "C" fn pg_finfo_from_substrait_wrapper() -> &'static pg_sys::Pg_finfo
 )]
 fn from_substrait_placeholder() {}
 
-/// Simple safe test that returns a single integer to verify safe approach works
-#[pg_extern]
-fn substrait_simple_test() -> i32 {
-    pgrx::info!("substrait_simple_test: Testing safe approach");
-    42
-}
-
-/// Safe JSON parser that validates the plan but returns success/failure
-#[pg_extern]
-fn substrait_parse_test(
-    json_plan: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!("substrait_parse_test: Testing JSON parsing safety");
-
-    // Parse the JSON plan
-    let plan: substrait::proto::Plan =
-        serde_json::from_str(json_plan).map_err(|e| format!("Failed to parse JSON: {e}"))?;
-
-    // If we get here, parsing succeeded - return plan summary
-    Ok(format!(
-        "Parsed plan with {} relations",
-        plan.relations.len()
-    ))
-}
-
 /// JSON version of Substrait execution function
 /// Usage: SELECT * FROM from_substrait_json(json_plan) AS t(col1 type1, col2 type2, ...)
 /// The AS clause column definitions must match the plan's output schema
@@ -118,11 +48,8 @@ fn substrait_parse_test(
 pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
-    pgrx::info!("Starting from_substrait_json_wrapper");
-
     // Extract the JSON string argument
     if i32::from((*fcinfo).nargs) <= 0 {
-        pgrx::info!("No arguments provided");
         return pg_sys::Datum::null();
     }
 
@@ -136,14 +63,12 @@ pub unsafe extern "C-unwind" fn from_substrait_json_wrapper(
     let datum = arg.value;
     let text_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
     if text_ptr.is_null() {
-        pgrx::info!("Text pointer is null");
         return pg_sys::Datum::null();
     }
 
     // Convert text datum to Rust string
     let text_cstring = pg_sys::text_to_cstring(text_ptr);
     let json_str = std::ffi::CStr::from_ptr(text_cstring).to_string_lossy();
-    pgrx::info!("Parsed JSON string: {}", json_str);
 
     // Parse the Substrait plan from JSON
     match serde_json::from_str::<Plan>(&json_str) {
@@ -481,63 +406,9 @@ unsafe fn execute_planned_stmt_as_srf(
     pg_sys::Datum::from(0)
 }
 
-/// JSON version using Query builder (for testing the new approach).
-/// Usage: SELECT * FROM from_substrait_query(json_plan) AS t(col1 type1, ...)
-///
-/// This function converts the Substrait plan to a PostgreSQL Query object,
-/// then calls standard_planner() to let PostgreSQL optimize it.
-#[no_mangle]
-#[pg_guard]
-pub unsafe extern "C-unwind" fn from_substrait_query_wrapper(
-    fcinfo: pg_sys::FunctionCallInfo,
-) -> pg_sys::Datum {
-    // Extract the JSON string argument
-    if i32::from((*fcinfo).nargs) <= 0 {
-        pgrx::error!("No arguments provided");
-    }
-
-    let arg_ptr = (*fcinfo).args.as_ptr().offset(0);
-    let arg = &*arg_ptr;
-
-    if arg.isnull {
-        return pg_sys::Datum::null();
-    }
-
-    let datum = arg.value;
-    let text_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
-    if text_ptr.is_null() {
-        pgrx::error!("Text pointer is null");
-    }
-
-    // Convert text datum to Rust string
-    let text_cstring = pg_sys::text_to_cstring(text_ptr);
-    let json_str = std::ffi::CStr::from_ptr(text_cstring).to_string_lossy();
-
-    // Parse the Substrait plan from JSON and execute via Query builder
-    match serde_json::from_str::<Plan>(&json_str) {
-        Ok(plan) => execute_substrait_via_query(fcinfo, &plan),
-        Err(e) => {
-            pgrx::error!("Failed to parse JSON: {}", e);
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn pg_finfo_from_substrait_query_wrapper() -> &'static pg_sys::Pg_finfo_record {
-    const V1_API: pg_sys::Pg_finfo_record = pg_sys::Pg_finfo_record { api_version: 1 };
-    &V1_API
-}
-
-#[pg_extern(
-    sql = "CREATE OR REPLACE FUNCTION from_substrait_query(json_plan text) RETURNS SETOF RECORD AS 'MODULE_PATHNAME', 'from_substrait_query_wrapper' LANGUAGE c STRICT;"
-)]
-fn from_substrait_query_placeholder() {}
-
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-
-    // Note: plan_translator is being removed. Schema info now comes from Substrait plan directly.
     use pgrx::{pg_sys, pg_test, prelude::*, AnyNumeric};
 
     // Helper function to convert a numeric datum to a string for comparison
@@ -956,44 +827,6 @@ mod tests {
             "from_substrait_json should succeed with valid plan: {:?}",
             result.err()
         );
-    }
-
-    #[pg_test]
-    fn test_from_substrait_query_simple() {
-        // Test the Query builder path - this uses standard_planner for optimization
-        let json_plan = r#"{
-            "version": {"minorNumber": 54},
-            "relations": [{
-                "root": {
-                    "names": ["test_column"],
-                    "input": {
-                        "project": {
-                            "expressions": [{
-                                "literal": {
-                                    "i32": 42
-                                }
-                            }]
-                        }
-                    }
-                }
-            }]
-        }"#;
-
-        let escaped_plan = json_plan.replace("'", "''");
-        let query =
-            format!("SELECT * FROM from_substrait_query('{escaped_plan}') AS t(test_column int)");
-
-        let result = Spi::get_one::<i32>(&query);
-        assert!(
-            result.is_ok(),
-            "from_substrait_query should succeed with valid plan: {:?}",
-            result.err()
-        );
-
-        // Verify the actual value is 42
-        if let Ok(Some(value)) = result {
-            assert_eq!(value, 42, "Query builder path should return correct value");
-        }
     }
 
     #[pg_test]
