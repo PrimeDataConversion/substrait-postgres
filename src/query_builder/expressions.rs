@@ -12,39 +12,15 @@ pub unsafe fn convert_expression_for_query(
     available_columns: &[AvailableColumn],
     ctx: &QueryBuildContext,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!(
-        "DEBUG: convert_expression_for_query - rex_type: {:?}",
-        expr.rex_type.as_ref().map(std::mem::discriminant)
-    );
-
     match &expr.rex_type {
-        Some(RexType::Literal(lit)) => {
-            pgrx::info!("DEBUG: Converting Literal");
-            convert_literal(lit)
-        }
-        Some(RexType::Selection(sel)) => {
-            pgrx::info!("DEBUG: Converting Selection (field reference)");
-            convert_selection(sel, available_columns, ctx)
-        }
-        Some(RexType::Subquery(subquery)) => {
-            pgrx::info!("DEBUG: Converting Subquery");
-            convert_subquery(subquery, available_columns, ctx)
-        }
+        Some(RexType::Literal(lit)) => convert_literal(lit),
+        Some(RexType::Selection(sel)) => convert_selection(sel, available_columns, ctx),
+        Some(RexType::Subquery(subquery)) => convert_subquery(subquery, available_columns, ctx),
         Some(RexType::ScalarFunction(func)) => {
-            pgrx::info!(
-                "DEBUG: Converting ScalarFunction, function_reference: {}",
-                func.function_reference
-            );
             convert_scalar_function(func, available_columns, ctx)
         }
-        Some(RexType::Cast(cast)) => {
-            pgrx::info!("DEBUG: Converting Cast");
-            convert_cast(cast, available_columns, ctx)
-        }
-        Some(RexType::IfThen(if_then)) => {
-            pgrx::info!("DEBUG: Converting IfThen (CASE WHEN)");
-            convert_if_then(if_then, available_columns, ctx)
-        }
+        Some(RexType::Cast(cast)) => convert_cast(cast, available_columns, ctx),
+        Some(RexType::IfThen(if_then)) => convert_if_then(if_then, available_columns, ctx),
         other => Err(format!("Unsupported expression type: {:?}", other).into()),
     }
 }
@@ -55,81 +31,48 @@ unsafe fn convert_literal(
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::expression::literal::LiteralType;
 
-    pgrx::info!(
-        "DEBUG: convert_literal - literal_type discriminant: {:?}",
-        lit.literal_type.as_ref().map(std::mem::discriminant)
-    );
-
     match &lit.literal_type {
         Some(LiteralType::I32(v)) => {
-            pgrx::info!("DEBUG: Creating i32 const: {}", v);
             let c = create_int4_const(*v)?;
-            pgrx::info!("DEBUG: i32 const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::I64(v)) => {
-            pgrx::info!("DEBUG: Creating i64 const: {}", v);
             let c = create_int8_const(*v)?;
-            pgrx::info!("DEBUG: i64 const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::Fp64(v)) => {
-            pgrx::info!("DEBUG: Creating fp64 const: {}", v);
             let c = create_float8_const(*v)?;
-            pgrx::info!("DEBUG: fp64 const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::String(s)) => {
-            pgrx::info!("DEBUG: Creating string const: {}", s);
             let c = create_text_const(s)?;
-            pgrx::info!("DEBUG: string const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::Boolean(b)) => {
-            pgrx::info!("DEBUG: Creating bool const: {}", b);
             let c = create_bool_const(*b)?;
-            pgrx::info!("DEBUG: bool const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::Date(days)) => {
-            pgrx::info!("DEBUG: Creating date const from days: {}", days);
             let c = create_date_const(*days)?;
-            pgrx::info!("DEBUG: date const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::Decimal(d)) => {
-            pgrx::info!(
-                "DEBUG: Creating decimal const: precision={}, scale={}",
-                d.precision,
-                d.scale
-            );
             let c = create_numeric_const(&d.value, d.precision, d.scale)?;
-            pgrx::info!("DEBUG: decimal const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::FixedChar(s)) => {
-            pgrx::info!("DEBUG: Creating fixed char const: {}", s);
             let c = create_text_const(s)?;
-            pgrx::info!("DEBUG: fixed char const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::VarChar(vc)) => {
-            pgrx::info!("DEBUG: Creating varchar const: {}", vc.value);
             let c = create_text_const(&vc.value)?;
-            pgrx::info!("DEBUG: varchar const created");
             Ok(c as *mut pg_sys::Expr)
         }
         Some(LiteralType::IntervalYearToMonth(interval)) => {
-            pgrx::info!(
-                "DEBUG: Creating interval const: {} years, {} months",
-                interval.years,
-                interval.months
-            );
             // Convert years and months to total months
             let total_months = interval.years * 12 + interval.months;
             // Create an interval constant - PostgreSQL interval is stored as months + days + microseconds
             let c = create_interval_const(total_months, 0, 0)?;
-            pgrx::info!("DEBUG: interval const created");
             Ok(c as *mut pg_sys::Expr)
         }
         other => Err(format!("Unsupported literal type: {:?}", other).into()),
@@ -202,11 +145,6 @@ unsafe fn convert_selection(
     // For computed columns (varno=0), copy the stored expression instead of creating a Var
     if col.varno == 0 {
         if let Some(expr_ptr) = col.computed_expr {
-            pgrx::info!(
-                "DEBUG: Using computed expression for column '{}' (field_idx={})",
-                col.name,
-                field_idx
-            );
             // Copy the expression so we don't share mutable nodes
             let copied =
                 pg_sys::copyObjectImpl(expr_ptr as *const std::ffi::c_void) as *mut pg_sys::Expr;
@@ -232,14 +170,6 @@ unsafe fn convert_selection(
     // PG17 required fields
     var.varnosyn = col.varno as u32;
     var.varattnosyn = col.varattno;
-
-    pgrx::info!(
-        "DEBUG: Created Var node: varno={}, varattno={}, varlevelsup={}, name='{}'",
-        col.varno,
-        col.varattno,
-        varlevelsup,
-        col.name
-    );
 
     Ok(var.into_pg() as *mut pg_sys::Expr)
 }
@@ -417,11 +347,6 @@ unsafe fn convert_scalar_function(
     }
 
     // Map function name to PostgreSQL operator/function
-    pgrx::info!(
-        "DEBUG: create_function_expr for '{}' with {} args",
-        func_name,
-        args.len()
-    );
     create_function_expr(func_name, &args)
 }
 
@@ -860,37 +785,19 @@ unsafe fn convert_cast(
     available_columns: &[AvailableColumn],
     ctx: &QueryBuildContext,
 ) -> Result<*mut pg_sys::Expr, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!("DEBUG: convert_cast - starting");
-
     let input_expr = cast.input.as_ref().ok_or("Cast has no input")?;
-    pgrx::info!("DEBUG: convert_cast - converting input expression");
     let pg_input = convert_expression_for_query(input_expr, available_columns, ctx)?;
-    pgrx::info!(
-        "DEBUG: convert_cast - input converted, pg_input: {:p}",
-        pg_input
-    );
 
     let target_type = cast.r#type.as_ref().ok_or("Cast has no target type")?;
-    pgrx::info!("DEBUG: convert_cast - getting target OID");
     let target_oid = substrait_type_to_pg_oid(target_type)?;
-    pgrx::info!("DEBUG: convert_cast - target_oid: {}", target_oid.to_u32());
 
     // Create a cast using CoerceViaIO or RelabelType
-    pgrx::info!("DEBUG: convert_cast - calling exprType");
     let input_type = pg_sys::exprType(pg_input as *const pg_sys::Node);
-    pgrx::info!("DEBUG: convert_cast - input_type: {}", input_type.to_u32());
 
     if input_type == target_oid {
         // No cast needed
-        pgrx::info!("DEBUG: convert_cast - types match, no cast needed");
         return Ok(pg_input);
     }
-
-    pgrx::info!(
-        "DEBUG: convert_cast - types differ (input={}, target={}), using CoerceViaIO",
-        input_type.to_u32(),
-        target_oid.to_u32()
-    );
 
     // Use CoerceViaIO for all type conversions - it works via I/O functions
     // which are always available. This avoids catalog lookups that might crash.
@@ -901,7 +808,6 @@ unsafe fn convert_cast(
     coerce.resultcollid = pg_sys::InvalidOid;
     coerce.coerceformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CAST;
     coerce.location = -1;
-    pgrx::info!("DEBUG: convert_cast - CoerceViaIO created");
 
     Ok(coerce.into_pg() as *mut pg_sys::Expr)
 }

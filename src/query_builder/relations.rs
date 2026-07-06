@@ -29,34 +29,20 @@ pub fn build_function_extension_map(plan: &Plan) -> HashMap<u32, String> {
 pub unsafe fn build_query_from_substrait(
     plan: &Plan,
 ) -> Result<*mut pg_sys::Query, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!("DEBUG: build_query_from_substrait - starting");
-
     // Build function map from extensions
-    pgrx::info!("DEBUG: Building function map from extensions");
     let function_map = build_function_extension_map(plan);
-    pgrx::info!(
-        "DEBUG: Function map built with {} functions",
-        function_map.len()
-    );
 
     // Create context
     let mut ctx = QueryBuildContext::new(function_map);
-    pgrx::info!("DEBUG: QueryBuildContext created");
 
     // Get the root relation from the plan
-    pgrx::info!("DEBUG: Getting root relation");
     let root_rel = get_root_relation(plan)?;
-    pgrx::info!("DEBUG: Got root relation");
 
     // Convert the relation tree to query parts
-    pgrx::info!("DEBUG: Converting relation tree to query parts");
     let parts = convert_rel_to_query_parts(root_rel, &mut ctx)?;
-    pgrx::info!("DEBUG: Relation tree converted successfully");
 
     // Build the Query object
-    pgrx::info!("DEBUG: Building Query object from parts");
     let query = build_query_from_parts(&parts, &mut ctx)?;
-    pgrx::info!("DEBUG: Query object built successfully");
 
     Ok(query)
 }
@@ -114,24 +100,7 @@ unsafe fn convert_rel_to_query_parts(
     rel: &Rel,
     ctx: &mut QueryBuildContext,
 ) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
-    // Get the relation type name for logging
-    let rel_type_name = match &rel.rel_type {
-        Some(RelType::Read(_)) => "Read",
-        Some(RelType::Filter(_)) => "Filter",
-        Some(RelType::Project(_)) => "Project",
-        Some(RelType::Join(_)) => "Join",
-        Some(RelType::Cross(_)) => "Cross",
-        Some(RelType::Aggregate(_)) => "Aggregate",
-        Some(RelType::Sort(_)) => "Sort",
-        Some(RelType::Fetch(_)) => "Fetch",
-        _ => "Unknown",
-    };
-    pgrx::info!(
-        "DEBUG: >>> ENTERING convert_rel_to_query_parts - {}",
-        rel_type_name
-    );
-
-    let result = match &rel.rel_type {
+    match &rel.rel_type {
         Some(RelType::Read(read)) => convert_read_to_query_parts(read, ctx),
         Some(RelType::Filter(filter)) => convert_filter_to_query_parts(filter, ctx),
         Some(RelType::Project(project)) => convert_project_to_query_parts(project, ctx),
@@ -141,18 +110,7 @@ unsafe fn convert_rel_to_query_parts(
         Some(RelType::Sort(sort)) => convert_sort_to_query_parts(sort, ctx),
         Some(RelType::Fetch(fetch)) => convert_fetch_to_query_parts(fetch, ctx),
         other => Err(format!("Unsupported relation type: {:?}", other).into()),
-    };
-
-    if let Ok(ref parts) = result {
-        pgrx::info!(
-            "DEBUG: <<< LEAVING {} - available_columns={}, has_aggs={}",
-            rel_type_name,
-            parts.available_columns.len(),
-            parts.has_aggs
-        );
     }
-
-    result
 }
 
 /// Convert a Read relation (table scan) to QueryParts.
@@ -161,14 +119,9 @@ unsafe fn convert_read_to_query_parts(
     ctx: &mut QueryBuildContext,
 ) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
     use substrait::proto::read_rel::ReadType;
-    pgrx::info!("DEBUG: convert_read_to_query_parts - starting");
 
     let table_name = match &read.read_type {
-        Some(ReadType::NamedTable(named)) => {
-            let name = extract_table_name_from_named_table(named)?;
-            pgrx::info!("DEBUG: Table name from NamedTable: {}", name);
-            name
-        }
+        Some(ReadType::NamedTable(named)) => extract_table_name_from_named_table(named)?,
         Some(ReadType::VirtualTable(_)) => {
             return Err("VirtualTable not yet supported in Query builder".into());
         }
@@ -176,27 +129,19 @@ unsafe fn convert_read_to_query_parts(
     };
 
     // Look up the table in PostgreSQL catalog
-    pgrx::info!("DEBUG: Looking up table OID for: {}", table_name);
     let table_name_cstr = std::ffi::CString::new(table_name.clone())?;
     let table_oid = pg_sys::RelnameGetRelid(table_name_cstr.as_ptr());
-    pgrx::info!("DEBUG: Table OID: {}", table_oid.to_u32());
     if table_oid == pg_sys::InvalidOid {
         return Err(format!("relation \"{}\" does not exist", table_name).into());
     }
 
     // Create RangeTblEntry for this table
-    pgrx::info!("DEBUG: Creating RangeTblEntry");
     let rte = create_range_table_entry(table_oid, &table_name)?;
-    pgrx::info!("DEBUG: RangeTblEntry created, adding to context");
     let rtindex = ctx.add_table(rte, &table_name, table_oid);
-    pgrx::info!("DEBUG: Table added with rtindex: {}", rtindex);
 
     // Get column information from the table
-    pgrx::info!("DEBUG: Getting table columns");
     let columns = get_table_columns(table_oid, rtindex)?;
-    pgrx::info!("DEBUG: Got {} columns", columns.len());
 
-    pgrx::info!("DEBUG: Building available_columns Vec");
     let mut available_columns: Vec<AvailableColumn> = columns
         .iter()
         .map(|c| AvailableColumn {
@@ -233,21 +178,15 @@ unsafe fn convert_read_to_query_parts(
                 .collect::<Result<Vec<_>, _>>()?;
         }
     }
-    pgrx::info!("DEBUG: Built {} available_columns", available_columns.len());
 
-    pgrx::info!("DEBUG: Setting columns in context");
     ctx.set_columns(rtindex, columns);
-    pgrx::info!("DEBUG: Columns set in context");
 
     // Create RangeTblRef pointing to this entry
-    pgrx::info!("DEBUG: Creating RangeTblRef");
     let mut rtref = pgrx::PgBox::<pg_sys::RangeTblRef>::alloc0();
     rtref.type_ = pg_sys::NodeTag::T_RangeTblRef;
     rtref.rtindex = rtindex;
     let rtref_ptr = rtref.into_pg() as *mut pg_sys::Node;
-    pgrx::info!("DEBUG: RangeTblRef created");
 
-    pgrx::info!("DEBUG: Returning QueryParts from convert_read_to_query_parts");
     Ok(QueryParts {
         from_item: rtref_ptr,
         available_columns,
@@ -369,28 +308,18 @@ unsafe fn convert_filter_to_query_parts(
     filter: &substrait::proto::FilterRel,
     ctx: &mut QueryBuildContext,
 ) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!("DEBUG: convert_filter_to_query_parts - starting");
-
     // First, convert the child relation
     let input = filter.input.as_ref().ok_or("Filter has no input")?;
-    pgrx::info!("DEBUG: Filter - converting child relation");
     let mut parts = convert_rel_to_query_parts(input, ctx)?;
-    pgrx::info!(
-        "DEBUG: Filter - child relation converted, {} available_columns",
-        parts.available_columns.len()
-    );
 
     // Convert the filter condition
     if let Some(condition) = &filter.condition {
-        pgrx::info!("DEBUG: Filter - converting filter condition expression");
         let qual_expr = convert_expression_for_query(condition, &parts.available_columns, ctx)?;
-        pgrx::info!("DEBUG: Filter - filter condition converted");
 
         // A Filter above an Aggregate operates on aggregated rows: that is a
         // HAVING clause. Putting it in the jointree quals would evaluate any
         // Aggrefs in a scan node ("Aggref found in non-Agg plan node").
         if parts.has_aggs {
-            pgrx::info!("DEBUG: Filter - input has aggregates, routing to HAVING");
             if let Some(existing) = parts.having_qual {
                 let and_expr = create_and_expr(existing, qual_expr)?;
                 parts.having_qual = Some(and_expr);
@@ -399,16 +328,13 @@ unsafe fn convert_filter_to_query_parts(
             }
         } else if let Some(existing) = parts.where_quals {
             // Combine with any existing quals (AND them together)
-            pgrx::info!("DEBUG: Filter - combining with existing quals");
             let and_expr = create_and_expr(existing, qual_expr)?;
             parts.where_quals = Some(and_expr);
         } else {
-            pgrx::info!("DEBUG: Filter - setting as first qual");
             parts.where_quals = Some(qual_expr);
         }
     }
 
-    pgrx::info!("DEBUG: Filter - returning QueryParts");
     Ok(parts)
 }
 
@@ -417,11 +343,6 @@ unsafe fn convert_project_to_query_parts(
     project: &substrait::proto::ProjectRel,
     ctx: &mut QueryBuildContext,
 ) -> Result<QueryParts, Box<dyn std::error::Error + Send + Sync>> {
-    pgrx::info!(
-        "DEBUG: convert_project_to_query_parts - {} expressions",
-        project.expressions.len()
-    );
-
     // Handle case where Project has no input (SELECT literal)
     let mut parts = if let Some(input) = project.input.as_ref() {
         convert_rel_to_query_parts(input, ctx)?
@@ -431,18 +352,10 @@ unsafe fn convert_project_to_query_parts(
         QueryParts::empty()
     };
 
-    pgrx::info!(
-        "DEBUG: Project child has {} available_columns, has_aggs={}",
-        parts.available_columns.len(),
-        parts.has_aggs
-    );
-
     // If parent has aggregates and would create Var nodes with varno=0,
     // we need to handle this specially
     let has_computed_columns = parts.available_columns.iter().any(|c| c.varno == 0);
     if has_computed_columns {
-        pgrx::info!("DEBUG: Project has computed columns (varno=0) from child - checking if we can reuse target list");
-
         // Check if project expressions are simple field references that match the child's output
         // In that case, we can just use the child's target list
         let is_simple_passthrough = project.expressions.iter().enumerate().all(|(i, expr)| {
@@ -482,9 +395,6 @@ unsafe fn convert_project_to_query_parts(
             };
 
         if is_simple_passthrough && emit_is_expressions_in_order && n_exprs == n_input {
-            pgrx::info!(
-                "DEBUG: Project is simple passthrough - using child's target list directly"
-            );
             // Just return the child's parts unchanged
             return Ok(parts);
         }
